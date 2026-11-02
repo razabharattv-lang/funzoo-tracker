@@ -1,0 +1,27 @@
+name: 24h FunzooKids Bot
+
+on:
+  schedule:
+    # सुबह 8:30 AM IST (US रात का ट्रेंड और दिन का प्लान)
+    - cron: '0 3 * * *'
+    # दोपहर 1:30 PM IST (Europe पीक टाइम वीडियो)
+    - cron: '0 8 * * *'
+    # शाम 6:30 PM IST (US पीक टाइम वीडियो)
+    - cron: '0 13 * * *'
+  workflow_dispatch: # जब आपका मन करे तब बटन दबाकर भी तुरंत चला सकते हैं
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install requests google-generativeai
+      - env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python bot.py
