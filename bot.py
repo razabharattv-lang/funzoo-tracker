@@ -50,7 +50,8 @@ def generate_funzoo_package(viral_trends):
 
     🏷️ **VIRAL TAGS & HASHTAGS**
     """
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    # 3.5 Flash-Lite मॉडल
+    model = genai.GenerativeModel("gemini-3.5-flash-lite")
     response = model.generate_content(prompt)
     return response.text
 
