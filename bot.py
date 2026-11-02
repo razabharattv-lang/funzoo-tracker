@@ -57,15 +57,14 @@ def generate_funzoo_package(viral_trends):
 
     🏷️ **VIRAL TAGS & HASHTAGS**
     """
-  model = genai.GenerativeModel("gemini-2.5-flash")
+  # Google Cloud द्वारा सुझाया गया मॉडल
+  model = genai.GenerativeModel("gemini-3.0-flash")
   response = model.generate_content(prompt)
   return response.text
 
 
 def send_to_telegram(text):
   url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-  # Telegram की 4000 अक्षर की लिमिट का ध्यान रखते हुए टुकड़ों में भेजना
   for chunk in [text[i : i + 3500] for i in range(0, len(text), 3500)]:
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
     res = requests.post(url, json=payload)
