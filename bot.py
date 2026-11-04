@@ -6,13 +6,13 @@ from datetime import datetime, timezone, timedelta
 import google.generativeai as genai
 
 # ==============================================================================
-# 🔑 CREDENTIALS & CHANNEL BRIDGE
+# 🔑 CREDENTIALS & SECRETS
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID", "") # नया चैनल बनते ही यहाँ ID डालना
+MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID", "") 
 
 ORGANIC_TREND_THEMES = [
     "ORGANIC HARVEST SPRINT: Sneaking into a giant ripe watermelon farm, rolling a 100kg juicy melon downhill with comical bouncy slips.",
@@ -68,7 +68,6 @@ def scan_realtime_breakout_trends():
                     pass
             ranked.append((int(views / hours), views, title))
             
-            # Extract real-time tags
             for t in v.get("snippet", {}).get("tags", [])[:6]:
                 if t.lower() not in [x.lower() for x in tags]:
                     tags.append(t)
@@ -78,7 +77,6 @@ def scan_realtime_breakout_trends():
             return fallback_trends()
 
         trend_lines = [f"⚡ {t}... ({v:,} views | 🚀 {vph:,}/hr)" for vph, v, t in ranked[:3]]
-        # Pass harvested tags string
         return "\n".join(trend_lines), ", ".join(tags[:15])
     except Exception:
         return fallback_trends()
@@ -102,6 +100,9 @@ def generate_production_package(is_long_mode, trends_text, tags_text):
     genai.configure(api_key=GEMINI_API_KEY)
     theme = random.choice(ORGANIC_TREND_THEMES)
 
+    # वीडियो के साइज का डायनामिक लॉजिक
+    aspect_ratio = "16:9 Widescreen Landscape" if is_long_mode else "9:16 Vertical Portrait (For Shorts/Reels)"
+
     character_dna = (
         "Using the attached image STRICTLY for character visual likeness (Leo, Froggo, Shelly), completely IGNORE the white studio background. Seamlessly integrate the characters into [Organically Lit Environment].\n"
         "- Leo: Fluffy baby leopard cub, curious amber eyes, golden fur with black rosettes.\n"
@@ -109,95 +110,84 @@ def generate_production_package(is_long_mode, trends_text, tags_text):
         "- Shelly: Tiny calm baby turtle, polished metallic-blue shell that drifts like a turbo skateboard."
     )
 
-    safety_rules = (
-        "VEO SAFE RULES: Absolutely NO violence, NO realistic danger words (no hit, attack, weapon, blood).\n"
-        "Use ONLY soft cartoon physics: squishy fruit splash, cartoon slip, bouncy roll, dizzy wobble.\n"
-        "Style: 3D Pixar Disney CGI animation, 16:9 widescreen, 8K Octane render, bright sunlight, zero dialogue."
-    )
-
-    seo_instructions = (
-        "CRITICAL SEO RULE: Algorithms change frequently. You MUST integrate the exact words from 'Live Harvested Tags' into your generated Title, Description, Tags, and Hashtags to match current real-time trends."
+    prompting_rules = (
+        "CRITICAL DIRECTOR RULES FOR VEO PROMPTS:\n"
+        "1. DO NOT write short or brief prompts. Each scene prompt MUST be highly detailed, cinematic, and descriptive (at least 100-130 words per scene).\n"
+        f"2. Aspect Ratio: You MUST explicitly start every single scene prompt with '3D Pixar Disney CGI animation, {aspect_ratio}, 8K Octane render'.\n"
+        "3. Detail Everything: Describe the exact camera movement (e.g., fast low-angle tracking shot panning right), lighting (e.g., golden hour volumetric rays piercing through trees), exact character placements (Screen-Left/Right), and precise second-by-second physical actions and facial expressions.\n"
+        "4. VEO SAFE: No violent words (no hit, attack, weapon, blood). Use soft cartoon physics (squishy splash, comical slip, bouncy roll)."
     )
 
     if is_long_mode:
         prompt = f"""
-You are the Creative Director of 'FunzooKids' building an 8-10 Minute Watch-Time Magnet Episode.
+You are the Master Creative Director of 'FunzooKids'. Today you are writing a detailed 8-10 Minute Mega Episode.
 Theme: {theme}
-Breakout US Trends: {trends_text}
 Live Harvested Tags: {tags_text}
 {character_dna}
-{safety_rules}
-{seo_instructions}
+{prompting_rules}
 
-Structure the story into 4 connected Organic Chapters.
-Write concrete, Veo-safe 10-second prompt instructions.
-
-Use ONLY these exact markers:
+Write highly detailed prompts under the exact markers below:
 
 [THUMBNAIL_PROMPT]
-(Zero-Text 3D Pixar Image Prompt: Extreme close-up of Leo's massive shocked eyes and Froggo with puffed cheeks staring at a glowing giant cracked watermelon on farmland. 16:9, ultra-vivid colors, 8K Octane Render, no text.)
+(Write a highly descriptive 3D Pixar Image Prompt. {aspect_ratio}. Extreme close-up of Leo and Froggo with shocked expressions. Zero text.)
 
 [CHAPTER_1]
-(Chapter 1: The Farmland Discovery - 4 sequential 10s prompts with Camera, Start Positions (Left/Right/Center), 0-3s, 3-7s, 7-10s timeline action, SFX Cues. Harmless slapstick, 16:9.)
+(Write 4 sequential highly detailed 10-second prompts. For each, describe Camera Angle, Lighting, Screen Placement, and precise actions. Use {aspect_ratio}.)
 
 [CHAPTER_2]
-(Chapter 2: The Slippery Vegetable Chaos - 4 sequential 10s prompts with Camera, Start Positions, Action, SFX Cues. Harmless slapstick, 16:9.)
+(Write 4 sequential highly detailed 10-second prompts for the next sequence. Use {aspect_ratio}.)
 
 [CHAPTER_3]
-(Chapter 3: The Mud Slide Escalation - 4 sequential 10s prompts with Camera, Start Positions, Action, SFX Cues. Harmless slapstick, 16:9.)
+(Write 4 sequential highly detailed 10-second prompts for escalation. Use {aspect_ratio}.)
 
 [CHAPTER_4]
-(Chapter 4: The Grand Climax & Resolution - 4 sequential 10s prompts with Camera, Start Positions, Action, SFX Cues. Seamless loop reset, 16:9.)
+(Write 4 sequential highly detailed 10-second prompts for the climax and loop. Use {aspect_ratio}.)
 
 [TITLE]
-(1 High-CTR Viral Title for 10-Min Video with emojis. MUST use keywords from Live Harvested Tags.)
+(1 High-CTR Viral Title for a Long 10-Min Video with emojis using Live Harvested Tags)
 
 [DESCRIPTION]
-(SEO description + naturally weave in Live Harvested Tags + Chapter Timestamps 0:00, 2:15, 4:30, 6:45 + Mid-Roll Ad slots + Not Made for Kids notice + Subscribe CTA)
+(Detailed SEO description + Chapter Timestamps 0:00, 2:15, etc. + Mid-Roll Ad slots + Not Made for Kids notice + Subscribe CTA)
 
 [TAGS]
-(20 comma-separated tags. Prioritize the exact keywords from Live Harvested Tags, followed by high-CPM keywords.)
+(20 comma-separated tags prioritized from Live Harvested Tags)
 
 [HASHTAGS]
-(8 viral hashtags strictly derived from today's Live Harvested Tags and Theme.)
+(8 viral hashtags strictly derived from Live Harvested Tags)
 """
     else:
         prompt = f"""
-You are the Creative Director of 'FunzooKids' writing a 30-Second Viral Organic Short.
+You are the Master Creative Director of 'FunzooKids'. Today you are writing a highly detailed 30-Second Viral Short/Reel.
 Theme: {theme}
-Breakout US Trends: {trends_text}
 Live Harvested Tags: {tags_text}
 {character_dna}
-{safety_rules}
-{seo_instructions}
+{prompting_rules}
 
-Write 3 strict, choreographed 10-second scene prompts for YouTube Veo.
-
-Use ONLY these exact markers:
+Write highly detailed, rich, and choreographed prompts under the exact markers below:
 
 [THUMBNAIL_PROMPT]
-(Zero-Text 3D Pixar Image Prompt: Extreme close-up of shocked Leo and Froggo covered in ripe fruit juice, massive expressive eyes, bright organic farm background, 16:9, zero text.)
+(Write a highly descriptive 3D Pixar Image Prompt. {aspect_ratio}. Extreme close-up of Leo and Froggo reacting to the theme. Zero text.)
 
 [SCENE_1]
-(0-10s Prompt: 3D Pixar Disney CGI animation, 16:9. Starting positions, farm setup, 0-3s visual hook, 3-7s slapstick action, 7-10s reaction, SFX cues. Zero dialogue.)
+(Write the full, highly detailed 100+ word prompt for 0-10s. Start with: '3D Pixar Disney CGI animation, {aspect_ratio}...'. Describe lighting, camera tracking, character positions, and precise action hook.)
 
 [SCENE_2]
-(10-20s Prompt: 3D Pixar Disney CGI animation, 16:9. Escalating organic obstacle, Froggo tongue gag, Leo funny tumble on mud, SFX cues. Zero dialogue.)
+(Write the full, highly detailed 100+ word prompt for 10-20s. Start with: '3D Pixar Disney CGI animation, {aspect_ratio}...'. Describe escalating obstacle, funny physics, and camera motion.)
 
 [SCENE_3]
-(20-30s Prompt: 3D Pixar Disney CGI animation, 16:9. Climax, satisfying soft fruit splash, Shelly sliding past safely on shell, seamless loop reset, SFX cues. Zero dialogue.)
+(Write the full, highly detailed 100+ word prompt for 20-30s. Start with: '3D Pixar Disney CGI animation, {aspect_ratio}...'. Describe the funny climax, satisfying fruit splash, and seamless loop back to scene 1.)
 
 [TITLE]
-(1 High-CTR Viral Title with emojis. MUST use keywords from Live Harvested Tags.)
+(1 High-CTR Viral Title for Shorts/Reels with emojis using Live Harvested Tags)
 
 [DESCRIPTION]
-(2-line SEO description weaving in Live Harvested Tags + General audience notice + Subscribe CTA)
+(2-line SEO description weaving in Live Harvested Tags + Subscribe CTA)
 
 [TAGS]
-(15 comma-separated tags. Prioritize the exact keywords from Live Harvested Tags to beat current algorithms.)
+(15 comma-separated tags prioritized from Live Harvested Tags)
 
 [HASHTAGS]
-(6 viral hashtags strictly derived from today's Live Harvested Tags and Theme.)
+(6 viral hashtags strictly derived from Live Harvested Tags)
 """
 
     models = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
@@ -206,12 +196,12 @@ Use ONLY these exact markers:
             model = genai.GenerativeModel(m)
             res = model.generate_content(prompt)
             if res and res.text:
-                return theme, res.text
+                return theme, aspect_ratio, res.text
         except Exception:
             continue
-    return theme, ""
+    return theme, aspect_ratio, ""
 
-def send_telegram_package(is_long_mode, trends_text, theme, raw_text):
+def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_text):
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     time_str = ist_now.strftime("%d %b %Y | %I:%M %p IST")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -226,14 +216,13 @@ def send_telegram_package(is_long_mode, trends_text, theme, raw_text):
     hashtags = html.escape(extract_block(raw_text, "[HASHTAGS]"))
 
     header = (
-        f"⚡ <b>FUNZOOKIDS REAL-TIME TREND RADAR</b>\n"
-        f"🕒 <b>Delivered At:</b> {time_str}\n"
-        f"🎯 <b>Mode:</b> {'[LONG WATCH-TIME MODE - 10 MIN]' if is_long_mode else '[DAILY SHORTS SPRINT - 30S]'}\n"
-        f"🌙 <b>Veo Slot:</b> रात 12 से सुबह 6 बजे तक जनरेट करें\n"
+        f"⚡ <b>FUNZOOKIDS VEO-STUDIO ENGINE</b>\n"
+        f"🕒 <b>Time:</b> {time_str}\n"
+        f"🎯 <b>Format:</b> <b>{html.escape(aspect_ratio)}</b>\n"
         f"🌾 <b>Theme:</b> {html.escape(theme)}\n\n"
         f"📈 <b>FASTEST BREAKING US TRENDS:</b>\n{html.escape(trends_text)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🖼️ <b>ZERO-TEXT 3D THUMBNAIL PROMPT (Tap to Copy)</b>\n"
+        f"🖼️ <b>ZERO-TEXT THUMBNAIL PROMPT (Tap to Copy)</b>\n"
         f"<code>{thumb}</code>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
@@ -244,9 +233,9 @@ def send_telegram_package(is_long_mode, trends_text, theme, raw_text):
         ch3 = html.escape(extract_block(raw_text, "[CHAPTER_3]", "[CHAPTER_4]"))
         ch4 = html.escape(extract_block(raw_text, "[CHAPTER_4]", "[TITLE]"))
         body = (
-            f"🎬 <b>CHAPTER 1: THE DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
-            f"🎬 <b>CHAPTER 2: SLIPPERY CHAOS</b>\n<code>{ch2}</code>\n\n\n"
-            f"🎬 <b>CHAPTER 3: MUD & WATER ESCALATION</b>\n<code>{ch3}</code>\n\n\n"
+            f"🎬 <b>CHAPTER 1: DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
+            f"🎬 <b>CHAPTER 2: ESCALATION</b>\n<code>{ch2}</code>\n\n\n"
+            f"🎬 <b>CHAPTER 3: MUD & WATER</b>\n<code>{ch3}</code>\n\n\n"
             f"🎬 <b>CHAPTER 4: CLIMAX & WIN</b>\n<code>{ch4}</code>\n\n"
         )
     else:
@@ -254,9 +243,9 @@ def send_telegram_package(is_long_mode, trends_text, theme, raw_text):
         s2 = html.escape(extract_block(raw_text, "[SCENE_2]", "[SCENE_3]"))
         s3 = html.escape(extract_block(raw_text, "[SCENE_3]", "[TITLE]"))
         body = (
-            f"🎬 <b>SCENE 1 (0-10s | Setup)</b>\n<code>{s1}</code>\n\n\n"
-            f"🎬 <b>SCENE 2 (10-20s | Farmland Action)</b>\n<code>{s2}</code>\n\n\n"
-            f"🎬 <b>SCENE 3 (20-30s | Climax & Loop)</b>\n<code>{s3}</code>\n\n"
+            f"🎬 <b>SCENE 1 (0-10s | Action Setup)</b>\n<code>{s1}</code>\n\n\n"
+            f"🎬 <b>SCENE 2 (10-20s | Fun & Chaos)</b>\n<code>{s2}</code>\n\n\n"
+            f"🎬 <b>SCENE 3 (20-30s | Splash & Loop)</b>\n<code>{s3}</code>\n\n"
         )
 
     footer = (
@@ -276,9 +265,10 @@ def send_telegram_package(is_long_mode, trends_text, theme, raw_text):
 
 if __name__ == "__main__":
     now_utc = datetime.now(timezone.utc)
-    # अगर रन होने का समय UTC 14:00 (रात 7:30 IST) के बाद है, तो यह लॉन्ग वीडियो मोड चलाएगा।
+    # अगर रन होने का समय UTC 14:00 (रात 7:30 IST) के बाद है, तो यह लॉन्ग वीडियो मोड (16:9) चलाएगा।
+    # अगर सुबह चलेगा तो शॉर्ट्स मोड (9:16) चलाएगा।
     is_long_mode = (now_utc.hour >= 14)
 
     trends, tags = scan_realtime_breakout_trends()
-    theme, content = generate_production_package(is_long_mode, trends, tags)
-    send_telegram_package(is_long_mode, trends, theme, content)
+    theme, aspect_ratio, content = generate_production_package(is_long_mode, trends, tags)
+    send_telegram_package(is_long_mode, trends, theme, aspect_ratio, content)
