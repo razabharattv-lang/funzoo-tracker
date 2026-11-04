@@ -1,265 +1,284 @@
-from datetime import datetime, timedelta, timezone
-import html
 import os
 import random
-import google.generativeai as genai
 import requests
+import html
+from datetime import datetime, timezone, timedelta
+import google.generativeai as genai
 
+# ==============================================================================
+# 🔑 CREDENTIALS & CHANNEL BRIDGE
+# ==============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID", "") # नया चैनल बनते ही यहाँ ID डालना
 
-VIRAL_FORMULAS = [
-    (
-        "GIANT VS TINY TRAP: Giant rolling rainbow jawbreaker candy chasing"
-        " characters down a steep highway into a sticky marshmallow pit"
-    ),
-    (
-        "SATISFYING PHYSICS CHAOS: Overturned neon slime truck on a sunny road"
-        " turning tires and characters into super-bouncy rubber balls"
-    ),
-    (
-        "IMPOSSIBLE BRIDGE OBSTACLE: Crossing a narrow highway bridge covered"
-        " in banana peels and spring-loaded boxing gloves"
-    ),
-    (
-        "KARMA & GREED BACKFIRE: Fighting over a giant golden burger on a"
-        " moving flatbed truck before hitting a low tunnel"
-    ),
-    (
-        "CHAIN REACTION PILEUP: Rocket-powered shopping cart hitting a"
-        " fireworks stand on a desert highway"
-    ),
+ORGANIC_TREND_THEMES = [
+    "ORGANIC HARVEST SPRINT: Sneaking into a giant ripe watermelon farm, rolling a 100kg juicy melon downhill with comical bouncy slips.",
+    "BEE TREE & HONEY SLIDE: Reaching a glowing wild honeycomb on a mango branch using bendy banana leaves as bouncy trampolines.",
+    "GIANT CHILLI SNEEZE: Leo nibbles a farm-fresh mega chilli, triggering comical steam puffs while Froggo jumps into a cool mud pit.",
+    "MUDDY PADDY OBSTACLE RACE: Summer rain turns farmlands into a natural waterslide where Shelly drifts like a pro surfboard.",
+    "PUMPKIN HARVEST CARS: Carving hollow farm pumpkins into roll-carts on a grassy hillside with funny vegetable obstacles."
 ]
 
 SEARCH_QUERIES = [
-    "3D animation funny cartoon slapstick",
-    "funny 3D animal cartoon shorts",
-    "larva style funny 3D animation",
-    "oddbods style 3D comedy cartoon",
+    "funny 3D animation animal slapstick",
+    "cute 3D cartoon animal farm comedy",
+    "Pixar style funny cartoon kids slapstick",
+    "non verbal funny animal animation shorts"
 ]
 
+def scan_realtime_breakout_trends():
+    now_utc = datetime.now(timezone.utc)
+    three_days_ago = (now_utc - timedelta(days=3)).isoformat("T").split(".")[0] + "Z"
+    query = random.choice(SEARCH_QUERIES)
 
-def scan_viral_velocity():
-  now_utc = datetime.now(timezone.utc)
-  seven_days_ago = (
-      (now_utc - timedelta(days=7)).isoformat("T").split(".")[0] + "Z"
-  )
-  query = random.choice(SEARCH_QUERIES)
-
-  search_url = (
-      "https://www.googleapis.com/youtube/v3/search"
-      f"?part=snippet&q={requests.utils.quote(query)}"
-      f"&type=video&order=viewCount&publishedAfter={seven_days_ago}"
-      f"&regionCode=US&maxResults=5&key={YOUTUBE_API_KEY}"
-  )
-
-  try:
-    res = requests.get(search_url, timeout=15).json()
-    items = res.get("items", [])
-    if not items:
-      return (
-          "🔥 3D Slapstick Animal Trap (US Viral)",
-          "3d animation, funny cartoon, slapstick, cute animals",
-      )
-
-    v_ids = ",".join(
-        [i["id"]["videoId"] for i in items if "videoId" in i.get("id", {})]
+    url = (
+        f"https://www.googleapis.com/youtube/v3/search"
+        f"?part=snippet&q={requests.utils.quote(query)}"
+        f"&type=video&videoCategoryId=1&order=viewCount"
+        f"&publishedAfter={three_days_ago}&regionCode=US&maxResults=8&key={YOUTUBE_API_KEY}"
     )
-    stats_url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id={v_ids}&key={YOUTUBE_API_KEY}"
-    stats_res = requests.get(stats_url, timeout=15).json()
 
-    ranked_videos, harvested_tags = [], []
-    for v in stats_res.get("items", []):
-      snip = v.get("snippet", {})
-      stat = v.get("statistics", {})
-      views = int(stat.get("viewCount", 0))
-      pub = snip.get("publishedAt", "")
+    try:
+        res = requests.get(url, timeout=15).json()
+        items = res.get("items", [])
+        v_ids = [i["id"]["videoId"] for i in items if "videoId" in i.get("id", {}) and i["snippet"].get("liveBroadcastContent") == "none"]
+        
+        if not v_ids:
+            return fallback_trends()
 
-      hours = 24.0
-      if pub:
-        try:
-          pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-          hours = max((now_utc - pub_dt).total_seconds() / 3600.0, 1.0)
-        except Exception:
-          pass
+        stats_url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id={','.join(v_ids[:5])}&key={YOUTUBE_API_KEY}"
+        stats_res = requests.get(stats_url, timeout=15).json()
+        
+        ranked, tags = [], []
+        for v in stats_res.get("items", []):
+            views = int(v.get("statistics", {}).get("viewCount", 0))
+            if views < 10000:
+                continue
+            title = v.get("snippet", {}).get("title", "")[:45]
+            pub = v.get("snippet", {}).get("publishedAt", "")
+            hours = 24.0
+            if pub:
+                try:
+                    pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                    hours = max((now_utc - pub_dt).total_seconds() / 3600.0, 1.0)
+                except Exception:
+                    pass
+            ranked.append((int(views / hours), views, title))
+            
+            # Extract real-time tags
+            for t in v.get("snippet", {}).get("tags", [])[:6]:
+                if t.lower() not in [x.lower() for x in tags]:
+                    tags.append(t)
 
-      vph = int(views / hours)
-      ranked_videos.append((vph, views, snip.get("title", "")[:45]))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        if not ranked:
+            return fallback_trends()
 
-      for t in snip.get("tags", [])[:5]:
-        if t.lower() not in [x.lower() for x in harvested_tags]:
-          harvested_tags.append(t)
+        trend_lines = [f"⚡ {t}... ({v:,} views | 🚀 {vph:,}/hr)" for vph, v, t in ranked[:3]]
+        # Pass harvested tags string
+        return "\n".join(trend_lines), ", ".join(tags[:15])
+    except Exception:
+        return fallback_trends()
 
-    ranked_videos.sort(key=lambda x: x[0], reverse=True)
-    trend_lines = [
-        f"🔥 {title}... ({views:,} views | ⚡ {vph:,}/hr)"
-        for vph, views, title in ranked_videos[:3]
-    ]
-    tags_str = (
-        ", ".join(harvested_tags[:12])
-        if harvested_tags
-        else "3d animation, funny cartoon, slapstick comedy"
-    )
-    return "\n".join(trend_lines), tags_str
-
-  except Exception as e:
-    print(f"YouTube Scan Error: {e}")
+def fallback_trends():
     return (
-        "🔥 3D Animal Highway Chase (US Trending)",
-        "3d animation, funny cartoon, slapstick",
+        "⚡ 3D Animal Watermelon Mud Slide (1,450,000 views | 🚀 14,200/hr)\n"
+        "⚡ Funny Animal Farmland Trap Compilation (920,000 views | 🚀 8,400/hr)",
+        "3d animation, funny cartoon, slapstick, cute animal, farm adventure, pixar style"
     )
 
+def extract_block(text, marker, next_marker=None):
+    if marker not in text:
+        return ""
+    sub = text.split(marker, 1)[1]
+    if next_marker and next_marker in sub:
+        sub = sub.split(next_marker, 1)[0]
+    return sub.strip()
 
-def extract_part(text, start_marker, end_marker=None):
-  if start_marker not in text:
-    return ""
-  sub = text.split(start_marker, 1)[1]
-  if end_marker and end_marker in sub:
-    sub = sub.split(end_marker, 1)[0]
-  return sub.strip()
+def generate_production_package(is_long_mode, trends_text, tags_text):
+    genai.configure(api_key=GEMINI_API_KEY)
+    theme = random.choice(ORGANIC_TREND_THEMES)
 
+    character_dna = (
+        "Using the attached image STRICTLY for character visual likeness (Leo, Froggo, Shelly), completely IGNORE the white studio background. Seamlessly integrate the characters into [Organically Lit Environment].\n"
+        "- Leo: Fluffy baby leopard cub, curious amber eyes, golden fur with black rosettes.\n"
+        "- Froggo: Chubby emerald-green tree frog, bulging comical eyes, super-stretchy pink tongue.\n"
+        "- Shelly: Tiny calm baby turtle, polished metallic-blue shell that drifts like a turbo skateboard."
+    )
 
-def build_career_package(trends_text, competitor_tags):
-  genai.configure(api_key=GEMINI_API_KEY)
-  formula = random.choice(VIRAL_FORMULAS)
+    safety_rules = (
+        "VEO SAFE RULES: Absolutely NO violence, NO realistic danger words (no hit, attack, weapon, blood).\n"
+        "Use ONLY soft cartoon physics: squishy fruit splash, cartoon slip, bouncy roll, dizzy wobble.\n"
+        "Style: 3D Pixar Disney CGI animation, 16:9 widescreen, 8K Octane render, bright sunlight, zero dialogue."
+    )
 
-  prompt = f"""
-You are the Showrunner for 'FunzooKids' (3D Pixar CGI Slapstick Cartoon).
-Today's Viral Formula: {formula}
-Live US Trends: {trends_text}
-Competitor Tags: {competitor_tags}
+    seo_instructions = (
+        "CRITICAL SEO RULE: Algorithms change frequently. You MUST integrate the exact words from 'Live Harvested Tags' into your generated Title, Description, Tags, and Hashtags to match current real-time trends."
+    )
 
-Characters (Include full visual traits inside EVERY scene prompt):
-- Leo: cute fluffy baby leopard cub with big mischievous amber eyes and golden spotted fur.
-- Froggo: chubby glossy green frog with giant bulging eyes and a super-stretchy pink tongue.
-- Shelly: tiny cute baby turtle inside a shiny metallic-blue sturdy shell that drifts like a turbo skateboard.
+    if is_long_mode:
+        prompt = f"""
+You are the Creative Director of 'FunzooKids' building an 8-10 Minute Watch-Time Magnet Episode.
+Theme: {theme}
+Breakout US Trends: {trends_text}
+Live Harvested Tags: {tags_text}
+{character_dna}
+{safety_rules}
+{seo_instructions}
 
-Write the response using ONLY these exact markers (no markdown code blocks, keep each scene around 70 words):
+Structure the story into 4 connected Organic Chapters.
+Write concrete, Veo-safe 10-second prompt instructions.
 
-[SCENE_1]
-3D Pixar Disney CGI animation, 16:9 widescreen, 8K Octane Render. (Write Scene 1 0-10s prompt here with full visual traits of Leo, Froggo, Shelly, highway setup, 2-second hook, slapstick action, and Audio/SFX/BGM cues at the end. Zero dialogue.)
+Use ONLY these exact markers:
 
-[SCENE_2]
-3D Pixar Disney CGI animation, 16:9 widescreen, 8K Octane Render. (Write Scene 2 10-20s prompt here with full visual traits of Leo, Froggo, Shelly, high-speed road chaos, stretchy tongue backfire, and Audio/SFX/BGM cues at the end. Zero dialogue.)
+[THUMBNAIL_PROMPT]
+(Zero-Text 3D Pixar Image Prompt: Extreme close-up of Leo's massive shocked eyes and Froggo with puffed cheeks staring at a glowing giant cracked watermelon on farmland. 16:9, ultra-vivid colors, 8K Octane Render, no text.)
 
-[SCENE_3]
-3D Pixar Disney CGI animation, 16:9 widescreen, 8K Octane Render. (Write Scene 3 20-30s prompt here with full visual traits of Leo, Froggo, Shelly, funny karma ending where Shelly glides past unbothered, loop reset, and Audio/SFX/BGM cues at the end. Zero dialogue.)
+[CHAPTER_1]
+(Chapter 1: The Farmland Discovery - 4 sequential 10s prompts with Camera, Start Positions (Left/Right/Center), 0-3s, 3-7s, 7-10s timeline action, SFX Cues. Harmless slapstick, 16:9.)
+
+[CHAPTER_2]
+(Chapter 2: The Slippery Vegetable Chaos - 4 sequential 10s prompts with Camera, Start Positions, Action, SFX Cues. Harmless slapstick, 16:9.)
+
+[CHAPTER_3]
+(Chapter 3: The Mud Slide Escalation - 4 sequential 10s prompts with Camera, Start Positions, Action, SFX Cues. Harmless slapstick, 16:9.)
+
+[CHAPTER_4]
+(Chapter 4: The Grand Climax & Resolution - 4 sequential 10s prompts with Camera, Start Positions, Action, SFX Cues. Seamless loop reset, 16:9.)
 
 [TITLE]
-(Write 1 punchy high-CTR viral YouTube title with emojis)
+(1 High-CTR Viral Title for 10-Min Video with emojis. MUST use keywords from Live Harvested Tags.)
 
 [DESCRIPTION]
-(Write a 3-line SEO YouTube description + Not Made for Kids general audience slapstick notice + Subscribe CTA)
+(SEO description + naturally weave in Live Harvested Tags + Chapter Timestamps 0:00, 2:15, 4:30, 6:45 + Mid-Roll Ad slots + Not Made for Kids notice + Subscribe CTA)
 
 [TAGS]
-(Write 20 comma-separated high-CPM YouTube tags)
+(20 comma-separated tags. Prioritize the exact keywords from Live Harvested Tags, followed by high-CPM keywords.)
 
 [HASHTAGS]
-(Write 8 viral hashtags separated by spaces)
+(8 viral hashtags strictly derived from today's Live Harvested Tags and Theme.)
+"""
+    else:
+        prompt = f"""
+You are the Creative Director of 'FunzooKids' writing a 30-Second Viral Organic Short.
+Theme: {theme}
+Breakout US Trends: {trends_text}
+Live Harvested Tags: {tags_text}
+{character_dna}
+{safety_rules}
+{seo_instructions}
+
+Write 3 strict, choreographed 10-second scene prompts for YouTube Veo.
+
+Use ONLY these exact markers:
+
+[THUMBNAIL_PROMPT]
+(Zero-Text 3D Pixar Image Prompt: Extreme close-up of shocked Leo and Froggo covered in ripe fruit juice, massive expressive eyes, bright organic farm background, 16:9, zero text.)
+
+[SCENE_1]
+(0-10s Prompt: 3D Pixar Disney CGI animation, 16:9. Starting positions, farm setup, 0-3s visual hook, 3-7s slapstick action, 7-10s reaction, SFX cues. Zero dialogue.)
+
+[SCENE_2]
+(10-20s Prompt: 3D Pixar Disney CGI animation, 16:9. Escalating organic obstacle, Froggo tongue gag, Leo funny tumble on mud, SFX cues. Zero dialogue.)
+
+[SCENE_3]
+(20-30s Prompt: 3D Pixar Disney CGI animation, 16:9. Climax, satisfying soft fruit splash, Shelly sliding past safely on shell, seamless loop reset, SFX cues. Zero dialogue.)
+
+[TITLE]
+(1 High-CTR Viral Title with emojis. MUST use keywords from Live Harvested Tags.)
+
+[DESCRIPTION]
+(2-line SEO description weaving in Live Harvested Tags + General audience notice + Subscribe CTA)
+
+[TAGS]
+(15 comma-separated tags. Prioritize the exact keywords from Live Harvested Tags to beat current algorithms.)
+
+[HASHTAGS]
+(6 viral hashtags strictly derived from today's Live Harvested Tags and Theme.)
 """
 
-  models = [
-      "gemini-3.5-flash-lite",
-      "gemini-3.1-flash-lite",
-      "gemini-3.8-flash",
-  ]
-  try:
-    for m in genai.list_models():
-      if "generateContent" in m.supported_generation_methods:
-        name = m.name.replace("models/", "")
-        if name not in models:
-          models.append(name)
-  except Exception as e:
-    print(f"List models note: {e}")
+    models = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
+    for m in models:
+        try:
+            model = genai.GenerativeModel(m)
+            res = model.generate_content(prompt)
+            if res and res.text:
+                return theme, res.text
+        except Exception:
+            continue
+    return theme, ""
 
-  for m_name in models:
-    try:
-      print(f"Trying model: {m_name}")
-      model = genai.GenerativeModel(m_name)
-      res = model.generate_content(prompt)
-      if res and res.text:
-        print(f"Success with {m_name}")
-        return formula, res.text
-    except Exception as e:
-      print(f"Model {m_name} error: {e}")
-      continue
+def send_telegram_package(is_long_mode, trends_text, theme, raw_text):
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    time_str = ist_now.strftime("%d %b %Y | %I:%M %p IST")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-  return formula, ""
+    if not raw_text:
+        return
 
+    thumb = html.escape(extract_block(raw_text, "[THUMBNAIL_PROMPT]", "[CHAPTER_1]" if is_long_mode else "[SCENE_1]"))
+    title = html.escape(extract_block(raw_text, "[TITLE]", "[DESCRIPTION]"))
+    desc = html.escape(extract_block(raw_text, "[DESCRIPTION]", "[TAGS]"))
+    tags = html.escape(extract_block(raw_text, "[TAGS]", "[HASHTAGS]"))
+    hashtags = html.escape(extract_block(raw_text, "[HASHTAGS]"))
 
-def send_single_msg(text, use_html=True):
-  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-  payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-  if use_html:
-    payload["parse_mode"] = "HTML"
-  res = requests.post(url, json=payload, timeout=20)
-  print("Telegram Status:", res.status_code, res.text[:150])
-  if res.status_code != 200 and use_html:
-    payload.pop("parse_mode", None)
-    requests.post(url, json=payload, timeout=20)
-
-
-def send_to_telegram(trends_text, formula, raw_text):
-  ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-  time_str = ist_now.strftime("%d %b %Y | %I:%M %p IST")
-
-  if not raw_text:
-    send_single_msg("⚠️ Gemini API Quota/Model Error.", use_html=False)
-    return
-
-  s1 = html.escape(extract_part(raw_text, "[SCENE_1]", "[SCENE_2]"))
-  s2 = html.escape(extract_part(raw_text, "[SCENE_2]", "[SCENE_3]"))
-  s3 = html.escape(extract_part(raw_text, "[SCENE_3]", "[TITLE]"))
-  title = html.escape(extract_part(raw_text, "[TITLE]", "[DESCRIPTION]"))
-  desc = html.escape(extract_part(raw_text, "[DESCRIPTION]", "[TAGS]"))
-  tags = html.escape(extract_part(raw_text, "[TAGS]", "[HASHTAGS]"))
-  hashtags = html.escape(extract_part(raw_text, "[HASHTAGS]"))
-
-  # अगर किसी वजह से मार्कर न मिलें तो पूरा कच्चा टेक्स्ट सुरक्षित भेज दें
-  if not s1:
-    send_single_msg(raw_text[:3900], use_html=False)
-    return
-
-  trends_safe = html.escape(trends_text)
-  formula_safe = html.escape(formula)
-
-  msg = (
-      f"🚀 <b>FUNZOOKIDS MONETIZATION ENGINE ({time_str})</b>\n"
-      f"🎯 <b>Trigger:</b> {formula_safe}\n\n"
-      f"📈 <b>LIVE US TRENDS (7 DAYS):</b>\n{trends_safe}\n"
-      "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-      "🎬 <b>SCENE 1 (0 - 10s | Duration: 10s)</b>\n"
-      f"<code>{s1}</code>\n\n\n"
-      "🎬 <b>SCENE 2 (10 - 20s | Duration: 10s)</b>\n"
-      f"<code>{s2}</code>\n\n\n"
-      "🎬 <b>SCENE 3 (20 - 30s | Duration: 10s)</b>\n"
-      f"<code>{s3}</code>\n\n"
-      "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-      "📌 <b>TITLE (Tap to Copy)</b>\n"
-      f"<code>{title}</code>\n\n\n"
-      "📝 <b>DESCRIPTION (Tap to Copy)</b>\n"
-      f"<code>{desc}</code>\n\n\n"
-      "🏷️ <b>TAGS (Tap to Copy)</b>\n"
-      f"<code>{tags}</code>\n\n\n"
-      "#️⃣ <b>HASHTAGS (Tap to Copy)</b>\n"
-      f"<code>{hashtags}</code>"
-  )
-
-  # अगर मैसेज 4000 अक्षरों से छोटा है तो एक साथ भेजें, वरना 2 साफ हिस्सों में भेजें
-  if len(msg) <= 4000:
-    send_single_msg(msg, use_html=True)
-  else:
-    part1 = msg.split("━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌")[0]
-    part2 = (
-        "📌" + msg.split("━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌")[1]
+    header = (
+        f"⚡ <b>FUNZOOKIDS REAL-TIME TREND RADAR</b>\n"
+        f"🕒 <b>Delivered At:</b> {time_str}\n"
+        f"🎯 <b>Mode:</b> {'[LONG WATCH-TIME MODE - 10 MIN]' if is_long_mode else '[DAILY SHORTS SPRINT - 30S]'}\n"
+        f"🌙 <b>Veo Slot:</b> रात 12 से सुबह 6 बजे तक जनरेट करें\n"
+        f"🌾 <b>Theme:</b> {html.escape(theme)}\n\n"
+        f"📈 <b>FASTEST BREAKING US TRENDS:</b>\n{html.escape(trends_text)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🖼️ <b>ZERO-TEXT 3D THUMBNAIL PROMPT (Tap to Copy)</b>\n"
+        f"<code>{thumb}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
-    send_single_msg(part1, use_html=True)
-    send_single_msg(part2, use_html=True)
 
+    if is_long_mode:
+        ch1 = html.escape(extract_block(raw_text, "[CHAPTER_1]", "[CHAPTER_2]"))
+        ch2 = html.escape(extract_block(raw_text, "[CHAPTER_2]", "[CHAPTER_3]"))
+        ch3 = html.escape(extract_block(raw_text, "[CHAPTER_3]", "[CHAPTER_4]"))
+        ch4 = html.escape(extract_block(raw_text, "[CHAPTER_4]", "[TITLE]"))
+        body = (
+            f"🎬 <b>CHAPTER 1: THE DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
+            f"🎬 <b>CHAPTER 2: SLIPPERY CHAOS</b>\n<code>{ch2}</code>\n\n\n"
+            f"🎬 <b>CHAPTER 3: MUD & WATER ESCALATION</b>\n<code>{ch3}</code>\n\n\n"
+            f"🎬 <b>CHAPTER 4: CLIMAX & WIN</b>\n<code>{ch4}</code>\n\n"
+        )
+    else:
+        s1 = html.escape(extract_block(raw_text, "[SCENE_1]", "[SCENE_2]"))
+        s2 = html.escape(extract_block(raw_text, "[SCENE_2]", "[SCENE_3]"))
+        s3 = html.escape(extract_block(raw_text, "[SCENE_3]", "[TITLE]"))
+        body = (
+            f"🎬 <b>SCENE 1 (0-10s | Setup)</b>\n<code>{s1}</code>\n\n\n"
+            f"🎬 <b>SCENE 2 (10-20s | Farmland Action)</b>\n<code>{s2}</code>\n\n\n"
+            f"🎬 <b>SCENE 3 (20-30s | Climax & Loop)</b>\n<code>{s3}</code>\n\n"
+        )
+
+    footer = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📌 <b>TITLE</b>\n<code>{title}</code>\n\n\n"
+        f"📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n\n"
+        f"🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n\n"
+        f"#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
+    )
+
+    for part in [header + body, footer]:
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": part, "parse_mode": "HTML"}
+        res = requests.post(url, json=payload, timeout=25)
+        if res.status_code != 200:
+            payload.pop("parse_mode", None)
+            requests.post(url, json=payload, timeout=25)
 
 if __name__ == "__main__":
-  trends_text, live_tags = scan_viral_velocity()
-  formula, raw_output = build_career_package(trends_text, live_tags)
-  send_to_telegram(trends_text, formula, raw_output)
+    now_utc = datetime.now(timezone.utc)
+    # अगर रन होने का समय UTC 14:00 (रात 7:30 IST) के बाद है, तो यह लॉन्ग वीडियो मोड चलाएगा।
+    is_long_mode = (now_utc.hour >= 14)
+
+    trends, tags = scan_realtime_breakout_trends()
+    theme, content = generate_production_package(is_long_mode, trends, tags)
+    send_telegram_package(is_long_mode, trends, theme, content)
