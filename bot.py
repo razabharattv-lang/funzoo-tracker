@@ -6,6 +6,9 @@ import time
 from datetime import datetime, timezone, timedelta
 import google.generativeai as genai
 
+# ==============================================================================
+# 🔑 CREDENTIALS & SECRETS
+# ==============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
@@ -13,11 +16,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID", "")
 
 ORGANIC_THEMES = [
-    "ORGANIC WATERMELON HUNT: Rolling a giant ripe melon downhill into a bouncy mud puddle.",
-    "BEE TREE HONEY SLIDE: Reaching a wild honeycomb using banana leaves as trampolines.",
-    "MEGA CHILLI SNEEZE: Leo bites a mega farm chilli and rockets backwards with steam ears.",
-    "MUDDY PADDY OBSTACLE RUN: Summer rain turns farmland into a slide where Shelly surfs like a pro.",
-    "PUMPKIN HARVEST ROLLERS: Hollow giant pumpkins racing down a slope with soft vegetable obstacles."
+    "ORGANIC WATERMELON ROLL: Leo tries to steal a giant ripe watermelon, rolls down a muddy hill, and triggers a giant bouncy squash.",
+    "WILD HONEYCOMB AMBUSH: Leo aims a stone at a sweet honeycomb, accidentally knocks down a harmless berry cluster that covers Froggo in pink sticky juice.",
+    "MEGA CHILLI BITE: Leo bites a massive fiery farm chilli, shoots backward with comical smoke puffs, while Shelly drifts past like a rescue board.",
+    "MUDDY PADDY OBSTACLE SLIDE: A sudden downpour turns farmland into a natural mud slide where Shelly surfs and saves Leo and Froggo from a giant puddle.",
+    "HOLLOW PUMPKIN CAR CHASE: Carving hollow farm pumpkins into roll-carts, racing downhill until they pop harmlessly into a soft vegetable barrier."
 ]
 
 SEARCH_QUERIES = [
@@ -98,39 +101,47 @@ def generate_production_package(is_long_mode, trends_text, tags_text):
     theme = random.choice(ORGANIC_THEMES)
     aspect_ratio = "16:9 Widescreen" if is_long_mode else "9:16 Vertical Portrait"
 
-    dna = (
-        "Attached image reference: Leo (fluffy baby leopard cub), Froggo (green tree frog), Shelly (turtle with blue shell).\n"
-        "Ignore the white studio background. Seamlessly integrate them into an organic farm environment.\n"
-        "Rule: Only ONE character moves aggressively per shot to prevent AI glitches. Hyper-fast physical slapstick. Zero dialogue."
+    dna_and_rules = (
+        "VISUAL CONTINUITY RULES (STRICT):\n"
+        "- Attached Reference Image: Used STRICTLY for character likeness (Leo: leopard cub, Froggo: chubby green frog, Shelly: tiny blue turtle).\n"
+        "- Completely IGNORE the white studio background. Ground them in natural, sunlit organic farmland.\n"
+        "- CAUSE AND EFFECT CONTINUITY: Scene 2 MUST begin exactly where Scene 1 physically ends. Scene 3 MUST begin where Scene 2 ends.\n"
+        "- SINGLE ACTION RULE: Do NOT give multiple complex actions at once. Only ONE character drives the physical comedy; others react naturally.\n"
+        "- VEO SAFE: No violent words (no hit, punch, bleed). Use 'cartoon slip', 'squishy bounce', 'fruit splash', 'motion blur'."
     )
 
     if is_long_mode:
         prompt = f"""
-Act as Animation Director for 'FunzooKids' (8-10 Min Long Episode).
+Act as Master Storyboard Director for 'FunzooKids' (8-10 Min Long-Form Video).
 Theme: {theme}
-Trending Tags: {tags_text}
-{dna}
+Live Harvested Tags: {tags_text}
+{dna_and_rules}
 
-Structure 4 progressive Chapters (4 modular shots per chapter, 10s each). Format: {aspect_ratio}.
+STEP 1: Write a structured 4-Act Storyline Script (Hook -> Escalation -> Chaos -> Climax & Lesson).
+STEP 2: Write sequential 10s video prompts for each chapter in {aspect_ratio} format.
+
 Use ONLY these exact markers:
 
+[STORY_SCRIPT]
+(Write the 4-part continuous narrative story script explaining the exact cause-and-effect chain. Zero dialogue.)
+
 [THUMBNAIL_PROMPT]
-(High-CTR 3D Pixar Image Prompt, {aspect_ratio}, extreme shock expression, zero text)
+(High-CTR Zero-Text 3D Pixar Image Prompt, {aspect_ratio}, extreme close-up of Leo with massive shocked eyes, zero text)
 
 [CHAPTER_1]
-(Chapter 1 Discovery: 4 distinct 10s shots with high-speed slapstick and audio cues)
+(Chapter 1 Hook: 4 sequential 10s prompts with Camera, Start Coordinates, Action, SFX Cues. 16:9.)
 
 [CHAPTER_2]
-(Chapter 2 Escalation: 4 distinct 10s shots with fast motion and audio cues)
+(Chapter 2 Escalation: 4 sequential 10s prompts maintaining exact continuity from Chapter 1. 16:9.)
 
 [CHAPTER_3]
-(Chapter 3 Chaos: 4 distinct 10s shots with mud/water physics and audio cues)
+(Chapter 3 Chaos: 4 sequential 10s prompts with mud/fruit physics. 16:9.)
 
 [CHAPTER_4]
-(Chapter 4 Climax: 4 distinct 10s shots with grand splash and loop reset)
+(Chapter 4 Climax: 4 sequential 10s prompts with grand satisfying finish and loop back. 16:9.)
 
 [TITLE]
-(1 High-CTR Viral Title with emojis using {tags_text})
+(1 High-CTR Viral Title with emojis using keywords from {tags_text})
 
 [DESCRIPTION]
 (SEO description + Chapter Timestamps 0:00, 2:15, 4:30, 6:45 + Mid-Roll Ad slots + CTA)
@@ -143,28 +154,36 @@ Use ONLY these exact markers:
 """
     else:
         prompt = f"""
-Act as Animation Director for 'FunzooKids' (30-Sec Viral Short).
+Act as Master Storyboard Director for 'FunzooKids' (30-Sec Fast Viral Short).
 Theme: {theme}
-Trending Tags: {tags_text}
-{dna}
+Live Harvested Tags: {tags_text}
+{dna_and_rules}
 
-Write 3 fast-paced shots (10s each). Format: {aspect_ratio}.
+STEP 1: Write a tight 3-Beat Slapstick Script (Beat 1: Setup/Mistake -> Beat 2: Direct Blunder Reaction -> Beat 3: Climax & Loop).
+STEP 2: Convert that script into 3 seamless 10-second Veo prompts in {aspect_ratio} format.
+
 Use ONLY these exact markers:
 
+[STORY_SCRIPT]
+(Write the 3-beat script: 
+Beat 1 (0-10s): Who does what mistake?
+Beat 2 (10-20s): What direct physical reaction happens?
+Beat 3 (20-30s): How does it resolve into a satisfying loop?)
+
 [THUMBNAIL_PROMPT]
-(High-CTR 3D Pixar Image Prompt, {aspect_ratio}, extreme close-up shock, zero text)
+(High-CTR Zero-Text 3D Pixar Image Prompt, {aspect_ratio}, extreme close-up of shocked Leo and Froggo, zero text)
 
 [SCENE_1]
-(0-10s Hook: 3D Pixar CGI, {aspect_ratio}, locked shot, single fast action trigger, SFX cues)
+(0-10s: 3D Pixar CGI, {aspect_ratio}, hyper-fast action: Starts with setup. Leo executes Beat 1. Camera locked. Ends on exact pose. SFX cues.)
 
 [SCENE_2]
-(10-20s Reaction: 3D Pixar CGI, {aspect_ratio}, fast tracking, comical slapstick blunder, SFX cues)
+(10-20s: 3D Pixar CGI, {aspect_ratio}, hyper-fast action: Starts directly from Scene 1's end pose. Beat 2 execution. Fast tracking. Comical blunder. SFX cues.)
 
 [SCENE_3]
-(20-30s Climax & Loop: 3D Pixar CGI, {aspect_ratio}, satisfying soft splash, seamless loop reset, SFX cues)
+(20-30s: 3D Pixar CGI, {aspect_ratio}, hyper-fast action: Starts from Scene 2's end. Beat 3 execution. Satisfying fruit/mud splash, Shelly sliding past safely, seamless reset to Scene 1. SFX cues.)
 
 [TITLE]
-(1 High-CTR Viral Title with emojis using {tags_text})
+(1 High-CTR Viral Title with emojis using keywords from {tags_text})
 
 [DESCRIPTION]
 (2-line SEO description weaving in {tags_text} + CTA)
@@ -206,9 +225,10 @@ def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_te
     upload_str = upload_target.strftime("%I:%M %p IST")
 
     if not raw_text:
-        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, ["⚠️ API error. Check quota."])
+        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, ["⚠️ Gemini API Generation Error."])
         return
 
+    script = html.escape(extract_block(raw_text, "[STORY_SCRIPT]", "[THUMBNAIL_PROMPT]"))
     thumb = html.escape(extract_block(raw_text, "[THUMBNAIL_PROMPT]", "[CHAPTER_1]" if is_long_mode else "[SCENE_1]"))
     title = html.escape(extract_block(raw_text, "[TITLE]", "[DESCRIPTION]"))
     desc = html.escape(extract_block(raw_text, "[DESCRIPTION]", "[TAGS]"))
@@ -216,12 +236,15 @@ def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_te
     hashtags = html.escape(extract_block(raw_text, "[HASHTAGS]"))
 
     header = (
-        f"⚡ <b>FUNZOOKIDS PRODUCTION ENGINE</b>\n"
+        f"⚡ <b>FUNZOOKIDS SCRIPT-FIRST ENGINE</b>\n"
         f"🕒 <b>Alert Time:</b> {time_str}\n"
         f"⏰ <b>Target Upload Time:</b> <b>{upload_str}</b> (1 Hour Window)\n"
         f"🎯 <b>Format:</b> <b>{html.escape(aspect_ratio)}</b>\n"
         f"🌾 <b>Theme:</b> {html.escape(theme)}\n\n"
-        f"📈 <b>FASTEST BREAKING US TRENDS:</b>\n{html.escape(trends_text)}\n"
+        f"📈 <b>FAST BREAKOUT US TRENDS:</b>\n{html.escape(trends_text)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📜 <b>CORE STORY SCRIPT (Cause & Effect)</b>\n"
+        f"<i>{script}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🖼️ <b>ZERO-TEXT THUMBNAIL PROMPT (Tap to Copy)</b>\n"
         f"<code>{thumb}</code>\n\n"
@@ -234,9 +257,9 @@ def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_te
         ch3 = html.escape(extract_block(raw_text, "[CHAPTER_3]", "[CHAPTER_4]"))
         ch4 = html.escape(extract_block(raw_text, "[CHAPTER_4]", "[TITLE]"))
         
-        part1 = header + f"🎬 <b>CHAPTER 1: DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
-        part2 = f"🎬 <b>CHAPTER 2: ESCALATION</b>\n<code>{ch2}</code>\n\n\n🎬 <b>CHAPTER 3: CHAOS</b>\n<code>{ch3}</code>\n\n\n"
-        part3 = f"🎬 <b>CHAPTER 4: CLIMAX & WIN</b>\n<code>{ch4}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
+        part1 = header + f"🎬 <b>CHAPTER 1: HOOK & DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
+        part2 = f"🎬 <b>CHAPTER 2: ESCALATION</b>\n<code>{ch2}</code>\n\n\n🎬 <b>CHAPTER 3: CHAOS & TRAP</b>\n<code>{ch3}</code>\n\n\n"
+        part3 = f"🎬 <b>CHAPTER 4: CLIMAX & RESOLUTION</b>\n<code>{ch4}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
         
         send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, [part1, part2, part3])
     else:
@@ -244,8 +267,8 @@ def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_te
         s2 = html.escape(extract_block(raw_text, "[SCENE_2]", "[SCENE_3]"))
         s3 = html.escape(extract_block(raw_text, "[SCENE_3]", "[TITLE]"))
         
-        part1 = header + f"🎬 <b>SCENE 1 (0-10s Hook)</b>\n<code>{s1}</code>\n\n\n🎬 <b>SCENE 2 (10-20s Action)</b>\n<code>{s2}</code>\n\n\n"
-        part2 = f"🎬 <b>SCENE 3 (20-30s Loop)</b>\n<code>{s3}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
+        part1 = header + f"🎬 <b>SCENE 1 (0-10s Hook Setup)</b>\n<code>{s1}</code>\n\n\n🎬 <b>SCENE 2 (10-20s Reaction Blunder)</b>\n<code>{s2}</code>\n\n\n"
+        part2 = f"🎬 <b>SCENE 3 (20-30s Climax & Loop)</b>\n<code>{s3}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
         
         send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, [part1, part2])
 
