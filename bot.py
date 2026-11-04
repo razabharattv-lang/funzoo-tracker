@@ -2,6 +2,7 @@ import os
 import random
 import requests
 import html
+import time
 from datetime import datetime, timezone, timedelta
 import google.generativeai as genai
 
@@ -12,7 +13,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID", "") 
 
 ORGANIC_TREND_THEMES = [
     "ORGANIC HARVEST SPRINT: Sneaking into a giant ripe watermelon farm, rolling a 100kg juicy melon downhill with comical bouncy slips.",
@@ -100,7 +100,6 @@ def generate_production_package(is_long_mode, trends_text, tags_text):
     genai.configure(api_key=GEMINI_API_KEY)
     theme = random.choice(ORGANIC_TREND_THEMES)
 
-    # वीडियो के साइज का डायनामिक लॉजिक
     aspect_ratio = "16:9 Widescreen Landscape" if is_long_mode else "9:16 Vertical Portrait (For Shorts/Reels)"
 
     character_dna = (
@@ -201,12 +200,24 @@ Write highly detailed, rich, and choreographed prompts under the exact markers b
             continue
     return theme, aspect_ratio, ""
 
+def send_telegram_in_chunks(chat_id, token, text_parts):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for part in text_parts:
+        if not part.strip():
+            continue
+        payload = {"chat_id": chat_id, "text": part, "parse_mode": "HTML"}
+        res = requests.post(url, json=payload, timeout=25)
+        if res.status_code != 200:
+            payload.pop("parse_mode", None)
+            requests.post(url, json=payload, timeout=25)
+        time.sleep(1) # थोड़ा गैप ताकि टेलीग्राम ब्लॉक न करे
+
 def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_text):
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     time_str = ist_now.strftime("%d %b %Y | %I:%M %p IST")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
+    
     if not raw_text:
+        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, ["⚠️ Gemini API Generation Error. Please check limits."])
         return
 
     thumb = html.escape(extract_block(raw_text, "[THUMBNAIL_PROMPT]", "[CHAPTER_1]" if is_long_mode else "[SCENE_1]"))
@@ -232,41 +243,28 @@ def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_te
         ch2 = html.escape(extract_block(raw_text, "[CHAPTER_2]", "[CHAPTER_3]"))
         ch3 = html.escape(extract_block(raw_text, "[CHAPTER_3]", "[CHAPTER_4]"))
         ch4 = html.escape(extract_block(raw_text, "[CHAPTER_4]", "[TITLE]"))
-        body = (
-            f"🎬 <b>CHAPTER 1: DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
-            f"🎬 <b>CHAPTER 2: ESCALATION</b>\n<code>{ch2}</code>\n\n\n"
-            f"🎬 <b>CHAPTER 3: MUD & WATER</b>\n<code>{ch3}</code>\n\n\n"
-            f"🎬 <b>CHAPTER 4: CLIMAX & WIN</b>\n<code>{ch4}</code>\n\n"
-        )
+        
+        # 3 सुरक्षित हिस्से (Chunks) ताकि मैसेज कभी न कटे
+        part1 = header + f"🎬 <b>CHAPTER 1: DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
+        part2 = f"🎬 <b>CHAPTER 2: ESCALATION</b>\n<code>{ch2}</code>\n\n\n🎬 <b>CHAPTER 3: MUD & WATER</b>\n<code>{ch3}</code>\n\n\n"
+        part3 = f"🎬 <b>CHAPTER 4: CLIMAX & WIN</b>\n<code>{ch4}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
+        
+        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, [part1, part2, part3])
+
     else:
         s1 = html.escape(extract_block(raw_text, "[SCENE_1]", "[SCENE_2]"))
         s2 = html.escape(extract_block(raw_text, "[SCENE_2]", "[SCENE_3]"))
         s3 = html.escape(extract_block(raw_text, "[SCENE_3]", "[TITLE]"))
-        body = (
-            f"🎬 <b>SCENE 1 (0-10s | Action Setup)</b>\n<code>{s1}</code>\n\n\n"
-            f"🎬 <b>SCENE 2 (10-20s | Fun & Chaos)</b>\n<code>{s2}</code>\n\n\n"
-            f"🎬 <b>SCENE 3 (20-30s | Splash & Loop)</b>\n<code>{s3}</code>\n\n"
-        )
-
-    footer = (
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📌 <b>TITLE</b>\n<code>{title}</code>\n\n\n"
-        f"📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n\n"
-        f"🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n\n"
-        f"#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
-    )
-
-    for part in [header + body, footer]:
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": part, "parse_mode": "HTML"}
-        res = requests.post(url, json=payload, timeout=25)
-        if res.status_code != 200:
-            payload.pop("parse_mode", None)
-            requests.post(url, json=payload, timeout=25)
+        
+        # 2 सुरक्षित हिस्से (Chunks) ताकि शॉर्ट्स का मैसेज न कटे
+        part1 = header + f"🎬 <b>SCENE 1 (0-10s | Action Setup)</b>\n<code>{s1}</code>\n\n\n🎬 <b>SCENE 2 (10-20s | Fun & Chaos)</b>\n<code>{s2}</code>\n\n\n"
+        part2 = f"🎬 <b>SCENE 3 (20-30s | Splash & Loop)</b>\n<code>{s3}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
+        
+        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, [part1, part2])
 
 if __name__ == "__main__":
     now_utc = datetime.now(timezone.utc)
     # अगर रन होने का समय UTC 14:00 (रात 7:30 IST) के बाद है, तो यह लॉन्ग वीडियो मोड (16:9) चलाएगा।
-    # अगर सुबह चलेगा तो शॉर्ट्स मोड (9:16) चलाएगा।
     is_long_mode = (now_utc.hour >= 14)
 
     trends, tags = scan_realtime_breakout_trends()
