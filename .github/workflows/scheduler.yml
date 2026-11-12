@@ -1,16 +1,19 @@
-name: FunzooKids Auto Video Upgrader
+name: FunzooKids Pro Cloud Engine
 
 on:
   workflow_dispatch:
     inputs:
       file_id:
         description: 'Telegram Video File ID'
-        required: false
+        required: true
       chat_id:
         description: 'Telegram Chat ID'
-        required: false
+        required: true
       caption:
         description: 'User Hint'
+        required: false
+      status_msg_id:
+        description: 'Progress Message ID'
         required: false
 
 jobs:
@@ -31,7 +34,7 @@ jobs:
           sudo apt-get install -y ffmpeg fonts-dejavu-core
           pip install requests edge-tts
 
-      - name: Run Video Upgrader Bot
+      - name: Run 7GB Pro Video Upgrader
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -39,4 +42,5 @@ jobs:
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
           INPUT_CHAT_ID: ${{ github.event.inputs.chat_id }}
           INPUT_CAPTION: ${{ github.event.inputs.caption }}
-        run: python bot.py
+          STATUS_MSG_ID: ${{ github.event.inputs.status_msg_id }}
+        run: python process_video.py
