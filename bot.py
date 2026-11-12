@@ -1,22 +1,28 @@
 import os
+import re
 import json
 import wave
 import base64
 import asyncio
+import threading
 import requests
 import html
 import subprocess
 import edge_tts
+import imageio_ffmpeg
+from flask import Flask, request
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+app = Flask(__name__)
 
-INPUT_FILE_ID = os.getenv("INPUT_FILE_ID", "").strip()
-INPUT_CHAT_ID = os.getenv("INPUT_CHAT_ID", "").strip()
-INPUT_CAPTION = os.getenv("INPUT_CAPTION", "").strip()
+# Render के Environment Variables से चाबियां अपने आप उठेंगी
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+PROCESSED_UPDATES = set()
 
 def tg_send(chat_id, text):
     res = requests.post(
@@ -38,12 +44,22 @@ def tg_progress(chat_id, msg_id, percent, status_text):
         timeout=15
     )
 
+def get_audio_duration(audio_path):
+    if audio_path.endswith(".wav"):
+        with wave.open(audio_path, "rb") as wf:
+            return wf.getnframes() / float(wf.getframerate())
+    proc = subprocess.run([FFMPEG_EXE, "-i", audio_path], capture_output=True, text=True)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", proc.stderr)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    return 8.0
+
 def extract_frames_base64(video_path):
     frames_b64 = []
     for idx, sec in enumerate(["00:00:01", "00:00:03", "00:00:05"]):
         img_path = f"frame_{idx}.jpg"
         subprocess.run(
-            ["ffmpeg", "-y", "-ss", sec, "-i", video_path, "-vframes", "1", "-q:v", "2", img_path],
+            [FFMPEG_EXE, "-y", "-ss", sec, "-i", video_path, "-vframes", "1", "-q:v", "2", img_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         if os.path.exists(img_path):
@@ -129,11 +145,7 @@ def generate_human_voice(text, wav_out="vo.wav"):
         return mp3_out
 
 def build_stylish_ass_subtitles(text, audio_file, ass_out="viral_subs.ass"):
-    dur_cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", audio_file
-    ]
-    total_dur = float(subprocess.check_output(dur_cmd).decode().strip())
+    total_dur = get_audio_duration(audio_file)
     words = text.upper().replace('"', '').replace("'", "").split()
     chunks = [" ".join(words[i:i+3]) for i in range(0, len(words), 3)]
 
@@ -178,7 +190,7 @@ def upgrade_video_master(in_vid, vo_audio, ass_file, out_vid):
     af = "[1:a]volume=1.5,equalizer=f=120:t=q:w=1:g=3,equalizer=f=5000:t=q:w=1:g=2,loudnorm=I=-16:TP=-1.5:LRA=11[a_out]"
 
     cmd = [
-        "ffmpeg", "-y", "-i", in_vid, "-i", vo_audio,
+        FFMPEG_EXE, "-y", "-i", in_vid, "-i", vo_audio,
         "-filter_complex", vf + af,
         "-map", "[v_out]", "-map", "[a_out]",
         "-c:v", "libx264", "-preset", "fast", "-profile:v", "high", "-level", "4.2", "-b:v", "5M", "-crf", "18",
@@ -187,7 +199,7 @@ def upgrade_video_master(in_vid, vo_audio, ass_file, out_vid):
     ]
     subprocess.run(cmd, check=True)
 
-def process_single_video(chat_id, file_id, user_hint=""):
+def process_video_task(chat_id, file_id, user_hint=""):
     status_id = tg_send(chat_id, "⚡ <b>FUNZOOKIDS VIDEO UPGRADER</b>\n\n<code>[█░░░░░░░░░] 10%</code>\n📥 Video received! Downloading...")
     try:
         file_info = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=20).json()
@@ -233,7 +245,37 @@ def process_single_video(chat_id, file_id, user_hint=""):
             timeout=15
         )
 
+@app.route("/", methods=["GET"])
+def home():
+    if RENDER_URL and TELEGRAM_BOT_TOKEN:
+        requests.get(f"{TG_API}/setWebhook", params={"url": f"{RENDER_URL}/webhook"}, timeout=10)
+    return "FunzooKids Video Upgrader is Live!", 200
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    upd_id = data.get("update_id")
+    if upd_id in PROCESSED_UPDATES:
+        return "OK", 200
+    if upd_id:
+        PROCESSED_UPDATES.add(upd_id)
+
+    msg = data.get("message", {})
+    video_obj = msg.get("video") or msg.get("document")
+    if video_obj:
+        chat_id = msg.get("chat", {}).get("id") or TELEGRAM_CHAT_ID
+        file_id = video_obj["file_id"]
+        hint = msg.get("caption", "")
+        threading.Thread(target=process_video_task, args=(chat_id, file_id, hint)).start()
+
+    return "OK", 200
+
+if RENDER_URL and TELEGRAM_BOT_TOKEN:
+    try:
+        requests.get(f"{TG_API}/setWebhook", params={"url": f"{RENDER_URL}/webhook"}, timeout=10)
+    except Exception:
+        pass
+
 if __name__ == "__main__":
-    if INPUT_FILE_ID:
-        target_chat = INPUT_CHAT_ID or TELEGRAM_CHAT_ID
-        process_single_video(target_chat, INPUT_FILE_ID, INPUT_CAPTION)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
