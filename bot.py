@@ -96,7 +96,8 @@ def analyze_video_with_gemini(frames_b64, user_hint=""):
         ]
     }
 
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+    # लेटेस्ट 2026 Gemini मॉडल्स
+    models = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash"]
     last_err = ""
     for m in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
@@ -107,42 +108,48 @@ def analyze_video_with_gemini(frames_b64, user_hint=""):
             return json.loads(raw_text)
         last_err = str(res)
 
-    raise ValueError(f"API Response Issue: {last_err[:200]}")
+    raise ValueError(f"API Response Issue: {last_err[:250]}")
 
 def generate_human_voice(text, wav_out="vo.wav"):
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{
-                "parts": [{
-                    "text": f"Speak this like an excited, natural American YouTube Shorts creator with real human emotion:\n{text}"
-                }]
-            }],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {"voiceName": "Fenrir"}
+    # पहले लेटेस्ट Gemini Audio मॉडल्स से असली Human Voice निकालने की कोशिश
+    tts_models = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-2.5-flash-preview-tts"]
+    for m in tts_models:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
+            payload = {
+                "contents": [{
+                    "parts": [{
+                        "text": f"Speak this like an excited, natural American YouTube Shorts creator with real human emotion:\n{text}"
+                    }]
+                }],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {"voiceName": "Fenrir"}
+                        }
                     }
                 }
             }
-        }
-        res = requests.post(url, json=payload, timeout=40).json()
-        audio_b64 = res["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-        pcm_bytes = base64.b64decode(audio_b64)
-        with wave.open(wav_out, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(24000)
-            wf.writeframes(pcm_bytes)
-        return wav_out
-    except Exception:
-        mp3_out = "vo_backup.mp3"
-        async def _run_tts():
-            comm = edge_tts.Communicate(text, "en-US-AndrewMultilingualNeural", rate="+7%")
-            await comm.save(mp3_out)
-        asyncio.run(_run_tts())
-        return mp3_out
+            res = requests.post(url, json=payload, timeout=35).json()
+            audio_b64 = res["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+            pcm_bytes = base64.b64decode(audio_b64)
+            with wave.open(wav_out, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(pcm_bytes)
+            return wav_out
+        except Exception:
+            continue
+
+    # Ultra-Natural American Human Voice Backup (Zero Robotic Tone)
+    mp3_out = "vo_backup.mp3"
+    async def _run_tts():
+        comm = edge_tts.Communicate(text, "en-US-AndrewMultilingualNeural", rate="+7%")
+        await comm.save(mp3_out)
+    asyncio.run(_run_tts())
+    return mp3_out
 
 def build_stylish_ass_subtitles(text, audio_file, ass_out="viral_subs.ass"):
     total_dur = get_audio_duration(audio_file)
