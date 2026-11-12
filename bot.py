@@ -56,10 +56,11 @@ def get_audio_duration(audio_path):
 
 def extract_frames_base64(video_path):
     frames_b64 = []
+    # हल्की और तेज़ इमेज (480px) ताकि API बिना टाइमआउट के 3 सेकंड में जवाब दे
     for idx, sec in enumerate(["00:00:01", "00:00:03", "00:00:05"]):
         img_path = f"frame_{idx}.jpg"
         subprocess.run(
-            [FFMPEG_EXE, "-y", "-ss", sec, "-i", video_path, "-vframes", "1", "-q:v", "2", img_path],
+            [FFMPEG_EXE, "-y", "-ss", sec, "-i", video_path, "-vf", "scale=480:-1", "-vframes", "1", "-q:v", "5", img_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         if os.path.exists(img_path):
@@ -96,22 +97,24 @@ def analyze_video_with_gemini(frames_b64, user_hint=""):
         ]
     }
 
-    # लेटेस्ट 2026 Gemini मॉडल्स
     models = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash"]
     last_err = ""
     for m in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
-        res = requests.post(url, json=payload, timeout=40).json()
-        if "candidates" in res and res["candidates"]:
-            raw_text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
-            raw_text = raw_text.removeprefix("```json").removesuffix("```").strip()
-            return json.loads(raw_text)
-        last_err = str(res)
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
+            res = requests.post(url, json=payload, timeout=90).json()
+            if "candidates" in res and res["candidates"]:
+                raw_text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                raw_text = raw_text.removeprefix("```json").removesuffix("```").strip()
+                return json.loads(raw_text)
+            last_err = str(res)
+        except Exception as e:
+            last_err = str(e)
+            continue
 
     raise ValueError(f"API Response Issue: {last_err[:250]}")
 
 def generate_human_voice(text, wav_out="vo.wav"):
-    # पहले लेटेस्ट Gemini Audio मॉडल्स से असली Human Voice निकालने की कोशिश
     tts_models = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-2.5-flash-preview-tts"]
     for m in tts_models:
         try:
@@ -131,7 +134,7 @@ def generate_human_voice(text, wav_out="vo.wav"):
                     }
                 }
             }
-            res = requests.post(url, json=payload, timeout=35).json()
+            res = requests.post(url, json=payload, timeout=25).json()
             audio_b64 = res["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
             pcm_bytes = base64.b64decode(audio_b64)
             with wave.open(wav_out, "wb") as wf:
@@ -143,7 +146,6 @@ def generate_human_voice(text, wav_out="vo.wav"):
         except Exception:
             continue
 
-    # Ultra-Natural American Human Voice Backup (Zero Robotic Tone)
     mp3_out = "vo_backup.mp3"
     async def _run_tts():
         comm = edge_tts.Communicate(text, "en-US-AndrewMultilingualNeural", rate="+7%")
