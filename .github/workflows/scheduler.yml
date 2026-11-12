@@ -1,35 +1,32 @@
-name: FunzooKids 24/7 Engine
+name: FunzooKids Auto Video Upgrader
 
 on:
   schedule:
-    # 1. Shorts Mode: Tue, Wed, Fri, Sun at 11:00 AM IST (05:30 UTC)
-    - cron: '30 05 * * 0,2,3,5'
-    # 2. Long Form Mode: Mon, Thu, Sat at 10:00 PM IST (16:30 UTC)
-    - cron: '30 16 * * 1,4,6'
-  workflow_dispatch:
+    - cron: '*/10 * * * *'   # हर 10 मिनट में चेक करेगा कि आपने कोई वीडियो भेजा है या नहीं
+  workflow_dispatch:         # फोन से तुरंत चलाने के लिए (Run workflow बटन)
 
 jobs:
-  run-bot:
+  process-videos:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install FFmpeg & Audio Tools
         run: |
-          python -m pip install --upgrade pip
-          pip install requests google-generativeai
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          pip install requests edge-tts
 
-      - name: Run Studio Engine
+      - name: Run Video Upgrader Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          MY_CHANNEL_ID: ${{ secrets.MY_CHANNEL_ID }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: python bot.py
