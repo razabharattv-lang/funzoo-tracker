@@ -1,9 +1,17 @@
 name: FunzooKids Auto Video Upgrader
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'   # हर 10 मिनट में चेक करेगा कि आपने कोई वीडियो भेजा है या नहीं
-  workflow_dispatch:         # फोन से तुरंत चलाने के लिए (Run workflow बटन)
+  workflow_dispatch:
+    inputs:
+      file_id:
+        description: 'Telegram Video File ID'
+        required: false
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: false
+      caption:
+        description: 'User Hint'
+        required: false
 
 jobs:
   process-videos:
@@ -28,5 +36,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
+          INPUT_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          INPUT_CAPTION: ${{ github.event.inputs.caption }}
         run: python bot.py
