@@ -56,7 +56,6 @@ def get_audio_duration(audio_path):
 
 def extract_frames_base64(video_path):
     frames_b64 = []
-    # हल्की और तेज़ इमेज (480px) ताकि API बिना टाइमआउट के 3 सेकंड में जवाब दे
     for idx, sec in enumerate(["00:00:01", "00:00:03", "00:00:05"]):
         img_path = f"frame_{idx}.jpg"
         subprocess.run(
@@ -188,22 +187,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(header + "\n".join(events))
 
 def upgrade_video_master(in_vid, vo_audio, ass_file, out_vid):
+    # Render 512MB RAM के लिए ऑप्टिमाइज्ड: 1080x1920 HD @ 30fps + सुपरफास्ट रेंडरिंग
     vf = (
-        "[0:v]scale=1220:2170:force_original_aspect_ratio=increase,crop=1080:1920,"
-        "eq=contrast=1.09:saturation=1.18:brightness=0.01,"
-        "unsharp=5:5:1.0:3:3:0.5,"
-        "setpts=0.96*PTS,fps=60,"
+        "[0:v]scale=1180:2100:force_original_aspect_ratio=increase,crop=1080:1920,"
+        "eq=contrast=1.08:saturation=1.16:brightness=0.01,"
+        "unsharp=3:3:0.7:3:3:0.3,"
+        "setpts=0.96*PTS,fps=30,"
         "drawbox=x=30:y=1280:w=1020:h=340:color=black@0.90:t=fill,"
         f"ass={ass_file}[v_out];"
     )
-    af = "[1:a]volume=1.5,equalizer=f=120:t=q:w=1:g=3,equalizer=f=5000:t=q:w=1:g=2,loudnorm=I=-16:TP=-1.5:LRA=11[a_out]"
+    af = "[1:a]volume=1.5,equalizer=f=120:t=q:w=1:g=3,equalizer=f=5000:t=q:w=1:g=2[a_out]"
 
     cmd = [
-        FFMPEG_EXE, "-y", "-i", in_vid, "-i", vo_audio,
+        FFMPEG_EXE, "-y", "-threads", "2", "-i", in_vid, "-i", vo_audio,
         "-filter_complex", vf + af,
         "-map", "[v_out]", "-map", "[a_out]",
-        "-c:v", "libx264", "-preset", "fast", "-profile:v", "high", "-level", "4.2", "-b:v", "5M", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k",
+        "-c:v", "libx264", "-preset", "superfast", "-crf", "21",
+        "-c:a", "aac", "-b:a", "128k",
         "-shortest", "-map_metadata", "-1", out_vid
     ]
     subprocess.run(cmd, check=True)
