@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import wave
 import base64
@@ -89,18 +90,20 @@ def analyze_video_with_gemini(frames_b64, clean_dur, user_hint=""):
 
     models = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash"]
     last_err = ""
-    for m in models:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
-            res = requests.post(url, json=payload, timeout=60).json()
-            if "candidates" in res and res["candidates"]:
-                raw_text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
-                raw_text = raw_text.removeprefix("```json").removesuffix("```").strip()
-                return json.loads(raw_text)
-            last_err = str(res)
-        except Exception as e:
-            last_err = str(e)
-            continue
+    for attempt in range(3):
+        for m in models:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
+                res = requests.post(url, json=payload, timeout=60).json()
+                if "candidates" in res and res["candidates"]:
+                    raw_text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    raw_text = raw_text.removeprefix("```json").removesuffix("```").strip()
+                    return json.loads(raw_text)
+                last_err = str(res)
+            except Exception as e:
+                last_err = str(e)
+                continue
+        time.sleep(4)
 
     raise ValueError(f"API Response Issue: {last_err[:250]}")
 
