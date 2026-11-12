@@ -1,282 +1,272 @@
 import os
-import random
+import json
+import wave
+import base64
+import asyncio
 import requests
 import html
+import subprocess
+import edge_tts
 import time
-from datetime import datetime, timezone, timedelta
-import google.generativeai as genai
 
 # ==============================================================================
-# 🔑 CREDENTIALS & SECRETS
+# 🔑 CREDENTIALS (GitHub Secrets से लोड होंगे)
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID", "")
 
-ORGANIC_THEMES = [
-    "ORGANIC WATERMELON ROLL: Leo tries to steal a giant ripe watermelon, rolls down a muddy hill, and triggers a giant bouncy squash.",
-    "WILD HONEYCOMB AMBUSH: Leo aims a stone at a sweet honeycomb, accidentally knocks down a harmless berry cluster that covers Froggo in pink sticky juice.",
-    "MEGA CHILLI BITE: Leo bites a massive fiery farm chilli, shoots backward with comical smoke puffs, while Shelly drifts past like a rescue board.",
-    "MUDDY PADDY OBSTACLE SLIDE: A sudden downpour turns farmland into a natural mud slide where Shelly surfs and saves Leo and Froggo from a giant puddle.",
-    "HOLLOW PUMPKIN CAR CHASE: Carving hollow farm pumpkins into roll-carts, racing downhill until they pop harmlessly into a soft vegetable barrier."
-]
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-SEARCH_QUERIES = [
-    "funny 3D animation animal slapstick",
-    "cute 3D cartoon animal farm comedy",
-    "Pixar style funny cartoon kids slapstick",
-    "non verbal funny animal animation shorts"
-]
+# ==============================================================================
+# TELEGRAM HELPERS
+# ==============================================================================
+def tg_send(chat_id, text):
+    res = requests.post(
+        f"{TG_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+        timeout=20
+    ).json()
+    return res.get("result", {}).get("message_id")
 
-def scan_realtime_breakout_trends():
-    now_utc = datetime.now(timezone.utc)
-    three_days_ago = (now_utc - timedelta(days=3)).isoformat("T").split(".")[0] + "Z"
-    query = random.choice(SEARCH_QUERIES)
-
-    url = (
-        f"https://www.googleapis.com/youtube/v3/search"
-        f"?part=snippet&q={requests.utils.quote(query)}"
-        f"&type=video&videoCategoryId=1&order=viewCount"
-        f"&publishedAfter={three_days_ago}&regionCode=US&maxResults=8&key={YOUTUBE_API_KEY}"
+def tg_progress(chat_id, msg_id, percent, status_text):
+    if not msg_id: return
+    filled = int(percent // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    text = f"⚡ <b>FUNZOOKIDS VIDEO UPGRADER</b>\n\n<code>[{bar}] {percent}%</code>\n🔄 {status_text}"
+    requests.post(
+        f"{TG_API}/editMessageText",
+        json={"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML"},
+        timeout=15
     )
 
+# ==============================================================================
+# CORE PROCESSING FUNCTIONS
+# ==============================================================================
+def extract_frames_base64(video_path):
+    frames_b64 = []
+    # वीडियो के 1s, 4s, और 7s से 3 साफ फ्रेम निकालना
+    for idx, sec in enumerate(["00:00:01", "00:00:04", "00:00:07"]):
+        img_path = f"frame_{idx}.jpg"
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", sec, "-i", video_path, "-vframes", "1", "-q:v", "2", img_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if os.path.exists(img_path):
+            with open(img_path, "rb") as f:
+                frames_b64.append(base64.b64encode(f.read()).decode("utf-8"))
+    return frames_b64
+
+def analyze_video_with_gemini(frames_b64, user_hint=""):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    prompt = f"""
+    You are an expert viral short-form video creator for US, Europe, and Ukraine audiences.
+    Look closely at these frames from a smart gadget / life-hack / satisfying video.
+    User hint: {user_hint}
+    
+    CRITICAL INSTRUCTION: Generate a highly engaging, non-robotic script.
+    Return ONLY valid JSON with these exact keys:
+    {{
+      "voiceover": "A punchy, highly energetic 2-sentence narration in natural American English (MAX 22 WORDS). Start with an extreme curiosity hook (e.g., 'Wait till you see...') and end with a direct question that forces the viewer to comment.",
+      "title": "High-CTR viral title (under 50 chars) with 1-2 emojis",
+      "description": "2-line engaging SEO description designed for Facebook Reels & YouTube Shorts",
+      "tags": "15 comma-separated viral search tags (broad and niche)",
+      "hashtags": "#smartgadgets #homehacks #lifehacks #amazonfinds #gadgets #satisfying #reels #shorts"
+    }}
+    """
+    parts = [{"text": prompt}]
+    for b64 in frames_b64:
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
+
+    res = requests.post(url, json={"contents": [{"parts": parts}]}, timeout=40).json()
+    raw_text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+    raw_text = raw_text.removeprefix("```json").removesuffix("```").strip()
+    return json.loads(raw_text)
+
+def generate_human_voice(text, wav_out="vo.wav"):
     try:
-        res = requests.get(url, timeout=15).json()
-        items = res.get("items", [])
-        v_ids = [i["id"]["videoId"] for i in items if "videoId" in i.get("id", {}) and i["snippet"].get("liveBroadcastContent") == "none"]
-        
-        if not v_ids:
-            return fallback_trends()
-
-        stats_url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id={','.join(v_ids[:5])}&key={YOUTUBE_API_KEY}"
-        stats_res = requests.get(stats_url, timeout=15).json()
-        
-        ranked, tags = [], []
-        for v in stats_res.get("items", []):
-            views = int(v.get("statistics", {}).get("viewCount", 0))
-            if views < 10000:
-                continue
-            title = v.get("snippet", {}).get("title", "")[:45]
-            pub = v.get("snippet", {}).get("publishedAt", "")
-            hours = 24.0
-            if pub:
-                try:
-                    pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-                    hours = max((now_utc - pub_dt).total_seconds() / 3600.0, 1.0)
-                except Exception:
-                    pass
-            ranked.append((int(views / hours), views, title))
-            for t in v.get("snippet", {}).get("tags", [])[:6]:
-                if t.lower() not in [x.lower() for x in tags]:
-                    tags.append(t)
-
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        if not ranked:
-            return fallback_trends()
-
-        trend_lines = [f"⚡ {t}... ({v:,} views | 🚀 {vph:,}/hr)" for vph, v, t in ranked[:3]]
-        return "\n".join(trend_lines), ", ".join(tags[:15])
+        # 100% Human Voice via Gemini TTS
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": f"Speak this EXACTLY like a highly enthusiastic, natural American YouTube Shorts creator. Use natural pauses and human emotion:\n{text}"
+                }]
+            }],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {"voiceName": "Fenrir"}
+                    }
+                }
+            }
+        }
+        res = requests.post(url, json=payload, timeout=40).json()
+        audio_b64 = res["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+        pcm_bytes = base64.b64decode(audio_b64)
+        with wave.open(wav_out, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(pcm_bytes)
+        return wav_out
     except Exception:
-        return fallback_trends()
+        # Backup Voice
+        mp3_out = "vo_backup.mp3"
+        async def _run_tts():
+            comm = edge_tts.Communicate(text, "en-US-ChristopherNeural", rate="+8%")
+            await comm.save(mp3_out)
+        asyncio.run(_run_tts())
+        return mp3_out
 
-def fallback_trends():
-    return (
-        "⚡ 3D Animal Watermelon Mud Slide (1,450,000 views | 🚀 14,200/hr)\n"
-        "⚡ Funny Animal Farmland Trap Compilation (920,000 views | 🚀 8,400/hr)",
-        "3d animation, funny cartoon, slapstick, cute animal, farm adventure, pixar style"
-    )
+def build_stylish_ass_subtitles(text, audio_file, ass_out="viral_subs.ass"):
+    # ऑडियो की सही लंबाई निकालना
+    dur_cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", audio_file
+    ]
+    total_dur = float(subprocess.check_output(dur_cmd).decode().strip())
+    
+    # 2 से 3 शब्दों के चंक्स बनाना ताकि पढ़ने में आसान हो
+    words = text.upper().replace('"', '').replace("'", "").split()
+    chunks = [" ".join(words[i:i+3]) for i in range(0, len(words), 3)]
 
-def extract_block(text, marker, next_marker=None):
-    if marker not in text:
-        return ""
-    sub = text.split(marker, 1)[1]
-    if next_marker and next_marker in sub:
-        sub = sub.split(next_marker, 1)[0]
-    return sub.strip()
+    def fmt_ass_time(sec):
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        s = int(sec % 60)
+        cs = int((sec - int(sec)) * 100)
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-def generate_production_package(is_long_mode, trends_text, tags_text):
-    genai.configure(api_key=GEMINI_API_KEY)
-    theme = random.choice(ORGANIC_THEMES)
-    aspect_ratio = "16:9 Widescreen" if is_long_mode else "9:16 Vertical Portrait"
+    # Advanced ASS Styling (Hormozi Style Pop-Up)
+    header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
 
-    dna_and_rules = (
-        "VISUAL CONTINUITY RULES (STRICT):\n"
-        "- Attached Reference Image: Used STRICTLY for character likeness (Leo: leopard cub, Froggo: chubby green frog, Shelly: tiny blue turtle).\n"
-        "- Completely IGNORE the white studio background. Ground them in natural, sunlit organic farmland.\n"
-        "- CAUSE AND EFFECT CONTINUITY: Scene 2 MUST begin exactly where Scene 1 physically ends. Scene 3 MUST begin where Scene 2 ends.\n"
-        "- SINGLE ACTION RULE: Do NOT give multiple complex actions at once. Only ONE character drives the physical comedy; others react naturally.\n"
-        "- VEO SAFE: No violent words (no hit, punch, bleed). Use 'cartoon slip', 'squishy bounce', 'fruit splash', 'motion blur'."
-    )
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ViralPop,DejaVu Sans,72,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,2,0,1,6,4,2,40,40,420,1
 
-    if is_long_mode:
-        prompt = f"""
-Act as Master Storyboard Director for 'FunzooKids' (8-10 Min Long-Form Video).
-Theme: {theme}
-Live Harvested Tags: {tags_text}
-{dna_and_rules}
-
-STEP 1: Write a structured 4-Act Storyline Script (Hook -> Escalation -> Chaos -> Climax & Lesson).
-STEP 2: Write sequential 10s video prompts for each chapter in {aspect_ratio} format.
-
-Use ONLY these exact markers:
-
-[STORY_SCRIPT]
-(Write the 4-part continuous narrative story script explaining the exact cause-and-effect chain. Zero dialogue.)
-
-[THUMBNAIL_PROMPT]
-(High-CTR Zero-Text 3D Pixar Image Prompt, {aspect_ratio}, extreme close-up of Leo with massive shocked eyes, zero text)
-
-[CHAPTER_1]
-(Chapter 1 Hook: 4 sequential 10s prompts with Camera, Start Coordinates, Action, SFX Cues. 16:9.)
-
-[CHAPTER_2]
-(Chapter 2 Escalation: 4 sequential 10s prompts maintaining exact continuity from Chapter 1. 16:9.)
-
-[CHAPTER_3]
-(Chapter 3 Chaos: 4 sequential 10s prompts with mud/fruit physics. 16:9.)
-
-[CHAPTER_4]
-(Chapter 4 Climax: 4 sequential 10s prompts with grand satisfying finish and loop back. 16:9.)
-
-[TITLE]
-(1 High-CTR Viral Title with emojis using keywords from {tags_text})
-
-[DESCRIPTION]
-(SEO description + Chapter Timestamps 0:00, 2:15, 4:30, 6:45 + Mid-Roll Ad slots + CTA)
-
-[TAGS]
-(20 comma-separated tags prioritizing {tags_text})
-
-[HASHTAGS]
-(8 viral hashtags)
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    else:
-        prompt = f"""
-Act as Master Storyboard Director for 'FunzooKids' (30-Sec Fast Viral Short).
-Theme: {theme}
-Live Harvested Tags: {tags_text}
-{dna_and_rules}
+    step = total_dur / max(len(chunks), 1)
+    events = []
+    for idx, chunk in enumerate(chunks):
+        start = fmt_ass_time(idx * step)
+        end = fmt_ass_time(min((idx + 1) * step, total_dur))
+        # \fad(80,80) हल्का फेड-इन/आउट इफेक्ट देता है
+        events.append(f"Dialogue: 0,{start},{end},ViralPop,,0,0,0,,{{\\fad(80,80)}}{chunk}")
 
-STEP 1: Write a tight 3-Beat Slapstick Script (Beat 1: Setup/Mistake -> Beat 2: Direct Blunder Reaction -> Beat 3: Climax & Loop).
-STEP 2: Convert that script into 3 seamless 10-second Veo prompts in {aspect_ratio} format.
+    with open(ass_out, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(events))
 
-Use ONLY these exact markers:
+def upgrade_video_master(in_vid, vo_audio, ass_file, out_vid):
+    # 1. 113% Zoom-Crop (वाटरमार्क हटाने के लिए)
+    # 2. Premium Color Boost & Sharpening (4K Look)
+    # 3. Black Cover Box (चाइनीज़ टेक्स्ट छिपाने के लिए)
+    vf = (
+        "[0:v]scale=1220:2170:force_original_aspect_ratio=increase,crop=1080:1920,"
+        "eq=contrast=1.09:saturation=1.18:brightness=0.01,"
+        "unsharp=5:5:1.0:3:3:0.5,"
+        "setpts=0.96*PTS,fps=60,"
+        "drawbox=x=30:y=1280:w=1020:h=340:color=black@0.90:t=fill,"
+        f"ass={ass_file}[v_out];"
+    )
+    
+    # Audio Ducking and EQ for Premium Sound
+    af = "[1:a]volume=1.5,equalizer=f=120:t=q:w=1:g=3,equalizer=f=5000:t=q:w=1:g=2,loudnorm=I=-16:TP=-1.5:LRA=11[a_out]"
 
-[STORY_SCRIPT]
-(Write the 3-beat script: 
-Beat 1 (0-10s): Who does what mistake?
-Beat 2 (10-20s): What direct physical reaction happens?
-Beat 3 (20-30s): How does it resolve into a satisfying loop?)
+    # High Bitrate Rendering (-b:v 5M) for High Quality
+    cmd = [
+        "ffmpeg", "-y", "-i", in_vid, "-i", vo_audio,
+        "-filter_complex", vf + af,
+        "-map", "[v_out]", "-map", "[a_out]",
+        "-c:v", "libx264", "-preset", "fast", "-profile:v", "high", "-level", "4.2", "-b:v", "5M", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-map_metadata", "-1", out_vid
+    ]
+    subprocess.run(cmd, check=True)
 
-[THUMBNAIL_PROMPT]
-(High-CTR Zero-Text 3D Pixar Image Prompt, {aspect_ratio}, extreme close-up of shocked Leo and Froggo, zero text)
-
-[SCENE_1]
-(0-10s: 3D Pixar CGI, {aspect_ratio}, hyper-fast action: Starts with setup. Leo executes Beat 1. Camera locked. Ends on exact pose. SFX cues.)
-
-[SCENE_2]
-(10-20s: 3D Pixar CGI, {aspect_ratio}, hyper-fast action: Starts directly from Scene 1's end pose. Beat 2 execution. Fast tracking. Comical blunder. SFX cues.)
-
-[SCENE_3]
-(20-30s: 3D Pixar CGI, {aspect_ratio}, hyper-fast action: Starts from Scene 2's end. Beat 3 execution. Satisfying fruit/mud splash, Shelly sliding past safely, seamless reset to Scene 1. SFX cues.)
-
-[TITLE]
-(1 High-CTR Viral Title with emojis using keywords from {tags_text})
-
-[DESCRIPTION]
-(2-line SEO description weaving in {tags_text} + CTA)
-
-[TAGS]
-(15 comma-separated tags prioritizing {tags_text})
-
-[HASHTAGS]
-(6 viral hashtags)
-"""
-
-    models = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
-    for m in models:
-        try:
-            model = genai.GenerativeModel(m)
-            res = model.generate_content(prompt)
-            if res and res.text:
-                return theme, aspect_ratio, res.text
-        except Exception:
-            continue
-    return theme, aspect_ratio, ""
-
-def send_telegram_in_chunks(chat_id, token, text_parts):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for part in text_parts:
-        if not part.strip():
-            continue
-        payload = {"chat_id": chat_id, "text": part, "parse_mode": "HTML"}
-        res = requests.post(url, json=payload, timeout=25)
-        if res.status_code != 200:
-            payload.pop("parse_mode", None)
-            requests.post(url, json=payload, timeout=25)
-        time.sleep(1)
-
-def send_telegram_package(is_long_mode, trends_text, theme, aspect_ratio, raw_text):
-    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    upload_target = ist_now + timedelta(hours=1)
-    time_str = ist_now.strftime("%d %b %Y | %I:%M %p IST")
-    upload_str = upload_target.strftime("%I:%M %p IST")
-
-    if not raw_text:
-        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, ["⚠️ Gemini API Generation Error."])
+# ==============================================================================
+# MAIN BOT RUNNER
+# ==============================================================================
+def run_bot():
+    res = requests.get(f"{TG_API}/getUpdates", params={"timeout": 10}, timeout=20).json()
+    updates = res.get("result", [])
+    if not updates:
+        print("Queue is empty. No new videos.")
         return
 
-    script = html.escape(extract_block(raw_text, "[STORY_SCRIPT]", "[THUMBNAIL_PROMPT]"))
-    thumb = html.escape(extract_block(raw_text, "[THUMBNAIL_PROMPT]", "[CHAPTER_1]" if is_long_mode else "[SCENE_1]"))
-    title = html.escape(extract_block(raw_text, "[TITLE]", "[DESCRIPTION]"))
-    desc = html.escape(extract_block(raw_text, "[DESCRIPTION]", "[TAGS]"))
-    tags = html.escape(extract_block(raw_text, "[TAGS]", "[HASHTAGS]"))
-    hashtags = html.escape(extract_block(raw_text, "[HASHTAGS]"))
+    last_update_id = None
+    for upd in updates:
+        last_update_id = upd["update_id"]
+        msg = upd.get("message", {})
+        chat_id = msg.get("chat", {}).get("id") or TELEGRAM_CHAT_ID
+        video_obj = msg.get("video") or msg.get("document")
 
-    header = (
-        f"⚡ <b>FUNZOOKIDS SCRIPT-FIRST ENGINE</b>\n"
-        f"🕒 <b>Alert Time:</b> {time_str}\n"
-        f"⏰ <b>Target Upload Time:</b> <b>{upload_str}</b> (1 Hour Window)\n"
-        f"🎯 <b>Format:</b> <b>{html.escape(aspect_ratio)}</b>\n"
-        f"🌾 <b>Theme:</b> {html.escape(theme)}\n\n"
-        f"📈 <b>FAST BREAKOUT US TRENDS:</b>\n{html.escape(trends_text)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📜 <b>CORE STORY SCRIPT (Cause & Effect)</b>\n"
-        f"<i>{script}</i>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🖼️ <b>ZERO-TEXT THUMBNAIL PROMPT (Tap to Copy)</b>\n"
-        f"<code>{thumb}</code>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
+        if not video_obj:
+            continue
 
-    if is_long_mode:
-        ch1 = html.escape(extract_block(raw_text, "[CHAPTER_1]", "[CHAPTER_2]"))
-        ch2 = html.escape(extract_block(raw_text, "[CHAPTER_2]", "[CHAPTER_3]"))
-        ch3 = html.escape(extract_block(raw_text, "[CHAPTER_3]", "[CHAPTER_4]"))
-        ch4 = html.escape(extract_block(raw_text, "[CHAPTER_4]", "[TITLE]"))
-        
-        part1 = header + f"🎬 <b>CHAPTER 1: HOOK & DISCOVERY</b>\n<code>{ch1}</code>\n\n\n"
-        part2 = f"🎬 <b>CHAPTER 2: ESCALATION</b>\n<code>{ch2}</code>\n\n\n🎬 <b>CHAPTER 3: CHAOS & TRAP</b>\n<code>{ch3}</code>\n\n\n"
-        part3 = f"🎬 <b>CHAPTER 4: CLIMAX & RESOLUTION</b>\n<code>{ch4}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
-        
-        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, [part1, part2, part3])
-    else:
-        s1 = html.escape(extract_block(raw_text, "[SCENE_1]", "[SCENE_2]"))
-        s2 = html.escape(extract_block(raw_text, "[SCENE_2]", "[SCENE_3]"))
-        s3 = html.escape(extract_block(raw_text, "[SCENE_3]", "[TITLE]"))
-        
-        part1 = header + f"🎬 <b>SCENE 1 (0-10s Hook Setup)</b>\n<code>{s1}</code>\n\n\n🎬 <b>SCENE 2 (10-20s Reaction Blunder)</b>\n<code>{s2}</code>\n\n\n"
-        part2 = f"🎬 <b>SCENE 3 (20-30s Climax & Loop)</b>\n<code>{s3}</code>\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 <b>TITLE</b>\n<code>{title}</code>\n\n📝 <b>DESCRIPTION</b>\n<code>{desc}</code>\n\n🏷️ <b>TAGS</b>\n<code>{tags}</code>\n\n#️⃣ <b>HASHTAGS</b>\n<code>{hashtags}</code>"
-        
-        send_telegram_in_chunks(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, [part1, part2])
+        file_id = video_obj["file_id"]
+        user_hint = msg.get("caption", "")
+        status_id = tg_send(chat_id, "⚡ <b>FUNZOOKIDS VIDEO UPGRADER</b>\n\n<code>[█░░░░░░░░░] 10%</code>\n📥 Video is downloading...")
+
+        try:
+            # 1. Download (15%)
+            file_info = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=20).json()
+            file_path = file_info["result"]["file_path"]
+            vid_bytes = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}", timeout=60).content
+            with open("raw_input.mp4", "wb") as f:
+                f.write(vid_bytes)
+
+            # 2. AI Vision & Scripting (40%)
+            tg_progress(chat_id, status_id, 40, "AI is analyzing frames and writing viral hooks...")
+            frames = extract_frames_base64("raw_input.mp4")
+            ai_data = analyze_video_with_gemini(frames, user_hint)
+
+            # 3. Human Voiceover & Captions (65%)
+            tg_progress(chat_id, status_id, 65, "Generating Real Human Voice & Pop-up Captions...")
+            vo_file = generate_human_voice(ai_data["voiceover"])
+            build_stylish_ass_subtitles(ai_data["voiceover"], vo_file, "viral_subs.ass")
+
+            # 4. Premium Video Upgrade (85%)
+            tg_progress(chat_id, status_id, 85, "Upscaling Quality, Removing Chinese Text & Rendering...")
+            upgrade_video_master("raw_input.mp4", vo_file, "viral_subs.ass", "final_viral.mp4")
+
+            # 5. Upload to Telegram (100%)
+            tg_progress(chat_id, status_id, 100, "Done! Sending the Viral Masterpiece to you...")
+            final_caption = (
+                f"🔥 <b>VIRAL VIDEO READY TO POST</b>\n\n"
+                f"📌 <b>TITLE (Tap to Copy):</b>\n<code>{html.escape(ai_data['title'])}</code>\n\n"
+                f"📝 <b>DESCRIPTION:</b>\n<code>{html.escape(ai_data['description'])}</code>\n\n"
+                f"🏷️ <b>TAGS:</b>\n<code>{html.escape(ai_data['tags'])}</code>\n\n"
+                f"#️⃣ <b>HASHTAGS:</b>\n<code>{html.escape(ai_data['hashtags'])}</code>"
+            )
+
+            with open("final_viral.mp4", "rb") as f:
+                requests.post(
+                    f"{TG_API}/sendVideo",
+                    data={"chat_id": chat_id, "caption": final_caption, "parse_mode": "HTML"},
+                    files={"video": f},
+                    timeout=120
+                )
+
+            # Clean up status message
+            requests.post(f"{TG_API}/deleteMessage", json={"chat_id": chat_id, "message_id": status_id}, timeout=10)
+
+        except Exception as e:
+            requests.post(
+                f"{TG_API}/editMessageText",
+                json={"chat_id": chat_id, "message_id": status_id, "text": f"❌ Error occurred: {html.escape(str(e))}"},
+                timeout=15
+            )
+
+    # Clear processed updates from queue
+    if last_update_id is not None:
+        requests.get(f"{TG_API}/getUpdates", params={"offset": last_update_id + 1}, timeout=15)
 
 if __name__ == "__main__":
-    weekday = datetime.now(timezone.utc).weekday()
-    # सोमवार (0) और गुरुवार (3) को 10-मिनट लॉन्ग वीडियो मोड, बाकी दिन शॉर्ट्स
-    is_long_mode = (weekday in [0, 3])
-
-    trends, tags = scan_realtime_breakout_trends()
-    theme, aspect_ratio, content = generate_production_package(is_long_mode, trends, tags)
-    send_telegram_package(is_long_mode, trends, theme, aspect_ratio, content)
+    run_bot()
