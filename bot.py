@@ -37,7 +37,7 @@ def tg_progress(chat_id, msg_id, percent, status_text):
         return
     filled = int(percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
-    text = f"⚡ <b>FUNZOOKIDS VIDEO UPGRADER</b>\n\n<code>[{bar}] {percent}%</code>\n🔄 {status_text}"
+    text = f"⚡ <b>FUNZOOKIDS PREMIUM UPGRADER</b>\n\n<code>[{bar}] {percent}%</code>\n🔄 {status_text}"
     try:
         requests.post(
             f"{TG_API}/editMessageText",
@@ -59,7 +59,6 @@ def get_media_duration(file_path):
 
 def extract_frames_base64(video_path, dur):
     frames_b64 = []
-    # वीडियो के शुरुआत, बीच और आखिरी हिस्से से 4 फ्रेम निकालना ताकि AI पूरी कहानी समझे
     points = [max(0.5, dur * 0.15), dur * 0.40, dur * 0.65, max(1.0, dur * 0.85)]
     for idx, sec in enumerate(points):
         img_path = f"frame_{idx}.jpg"
@@ -74,19 +73,21 @@ def extract_frames_base64(video_path, dur):
     return frames_b64
 
 def analyze_video_with_gemini(frames_b64, clean_dur, user_hint=""):
-    target_words = max(22, min(42, int(clean_dur * 2.7)))
+    target_words = max(22, min(40, int(clean_dur * 2.6)))
     prompt = f"""
-    You are an expert viral short-form video creator for US, Europe, and Ukraine audiences.
-    Look at these frames from a {clean_dur:.1f}-second smart gadget / kitchen / life-hack video.
+    You are an elite viral video strategist targeting High-CPM audiences (USA, Europe).
+    Analyze these frames from a {clean_dur:.1f}-second smart gadget/life-hack video.
     User hint: {user_hint}
     
     Return ONLY valid JSON with these exact keys:
     {{
-      "voiceover": "A punchy, energetic, natural American English narration of roughly {target_words} words so it fits a {clean_dur:.1f}-second video smoothly. Start with a strong curiosity hook, explain what happens across the video, and end with a question that forces comments.",
-      "title": "High-CTR viral title (under 50 chars) with 1-2 emojis",
-      "description": "2-line engaging SEO description for Facebook Reels & YouTube Shorts",
-      "tags": "15 comma-separated viral search tags",
-      "hashtags": "#smartgadgets #homehacks #kitchenhacks #lifehacks #amazonfinds #gadgets #reels #shorts"
+      "voice_gender": "female" or "male" (Choose strictly based on what fits this specific product's vibe best),
+      "voiceover": "A hyper-engaging American English narration of roughly {target_words} words. Hook the viewer instantly, emphasize the premium quality/usefulness, and end with a viral comment-bait question.",
+      "title": "High-CTR viral title tailored to current US Facebook Reels trends (No generic titles)",
+      "description": "2-line engaging SEO description strictly customized for this exact item.",
+      "tags": "15 highly specific, trendy comma-separated tags for this exact item (Do NOT use generic tags like 'gadget' or 'hack' alone).",
+      "hashtags": "7 ultra-targeted trending hashtags for US/UK audiences.",
+      "posting_time": "The single best time to post this for peak US/Europe views (e.g., '6:30 PM EST')"
     }}
     """
     parts = [{"text": prompt}]
@@ -120,7 +121,11 @@ def analyze_video_with_gemini(frames_b64, clean_dur, user_hint=""):
 
     raise ValueError(f"API Response Issue: {last_err[:250]}")
 
-def generate_human_voice(text, wav_out="vo.wav"):
+def generate_human_voice(text, gender, wav_out="vo.wav"):
+    is_male = "male" in gender.lower() and "female" not in gender.lower()
+    gemini_voice = "Puck" if is_male else "Aoede"
+    edge_voice = "en-US-AndrewMultilingualNeural" if is_male else "en-US-AvaMultilingualNeural"
+    
     tts_models = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-2.5-flash-preview-tts"]
     for m in tts_models:
         try:
@@ -128,14 +133,14 @@ def generate_human_voice(text, wav_out="vo.wav"):
             payload = {
                 "contents": [{
                     "parts": [{
-                        "text": f"Speak this like an excited, natural American YouTube Shorts creator with real human emotion:\n{text}"
+                        "text": f"Speak this in a highly engaging, professional, and natural American voice like a top lifestyle creator:\n{text}"
                     }]
                 }],
                 "generationConfig": {
                     "responseModalities": ["AUDIO"],
                     "speechConfig": {
                         "voiceConfig": {
-                            "prebuiltVoiceConfig": {"voiceName": "Fenrir"}
+                            "prebuiltVoiceConfig": {"voiceName": gemini_voice}
                         }
                     }
                 }
@@ -154,7 +159,7 @@ def generate_human_voice(text, wav_out="vo.wav"):
 
     mp3_out = "vo_backup.mp3"
     async def _run_tts():
-        comm = edge_tts.Communicate(text, "en-US-AndrewMultilingualNeural", rate="+5%")
+        comm = edge_tts.Communicate(text, edge_voice, rate="+3%")
         await comm.save(mp3_out)
     asyncio.run(_run_tts())
     return mp3_out
@@ -162,7 +167,7 @@ def generate_human_voice(text, wav_out="vo.wav"):
 def build_stylish_ass_subtitles(text, audio_file, ass_out="viral_subs.ass"):
     total_dur = get_media_duration(audio_file)
     words = text.upper().replace('"', '').replace("'", "").split()
-    chunks = [" ".join(words[i:i+3]) for i in range(0, len(words), 3)]
+    chunks = [words[i:i+3] for i in range(0, len(words), 3)]
 
     def fmt_ass_time(sec):
         h = int(sec // 3600)
@@ -171,7 +176,7 @@ def build_stylish_ass_subtitles(text, audio_file, ass_out="viral_subs.ass"):
         cs = int((sec - int(sec)) * 100)
         return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-    # बिना किसी काले डिब्बे (Black Box) के साफ-सुथरा चमकदार वायरल फॉन्ट + आउटलाइन
+    # और भी प्रीमियम वायरल फोंट स्टाइल (Neon Glow Effect के साथ)
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 720
@@ -179,46 +184,54 @@ PlayResY: 1280
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralPop,DejaVu Sans,46,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,1,0,1,4,2,2,30,30,230,1
+Style: ViralPop,DejaVu Sans,54,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,1.2,0,1,5,4,2,25,25,240,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     step = total_dur / max(len(chunks), 1)
     events = []
-    for idx, chunk in enumerate(chunks):
+    for idx, word_group in enumerate(chunks):
         start = fmt_ass_time(idx * step)
         end = fmt_ass_time(min((idx + 1) * step, total_dur))
-        events.append(f"Dialogue: 0,{start},{end},ViralPop,,0,0,0,,{{\\fad(60,60)}}{chunk}")
+        
+        highlight_color = "&H0000D7FF&" if idx % 2 == 0 else "&H0000FFFF&" # Gold & Cyan Highlights
+        if len(word_group) > 1:
+            styled_text = " ".join(word_group[:-1]) + f" {{\\c{highlight_color}}}{word_group[-1]}{{\\c&H00FFFFFF&}}"
+        else:
+            styled_text = f"{{\\c{highlight_color}}}{word_group[0]}"
+
+        anim = "{\\fscx85\\fscy85\\t(0,60,\\fscx108\\fscy108)\\t(60,120,\\fscx100\\fscy100)}"
+        events.append(f"Dialogue: 0,{start},{end},ViralPop,,0,0,0,,{anim}{styled_text}")
 
     with open(ass_out, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(events))
 
 def upgrade_video_master(in_vid, vo_audio, ass_file, out_vid, target_dur):
     gc.collect()
-    # 1. कोई black box नहीं, कोई setpts झटका नहीं
-    # 2. 9% क्लीन ज़ूम (792x1408 -> crop 720x1280) जिससे कोनों के चाइनीज़ वॉटरमार्क अपने आप कट जाएं
-    # 3. apad से पूरी वीडियो की लंबाई तक स्मूद प्लेबैक
+    # प्रीमियम 4K-Level कलर ग्रेडिंग और शार्पनेस (Professional Look)
     vf = (
-        "[0:v]scale=792:1408:force_original_aspect_ratio=increase,crop=720:1280,"
-        "eq=contrast=1.07:saturation=1.15:brightness=0.01,"
+        "[0:v]scale=830:1476:force_original_aspect_ratio=increase,crop=720:1280,"
+        "eq=contrast=1.15:saturation=1.40:brightness=0.02:gamma=1.05,"
+        "colorbalance=rs=0.05:gs=0.02:bs=-0.02,"
+        "unsharp=3:3:0.8:3:3:0.4,"
         f"ass={ass_file}[v_out];"
     )
-    af = "[1:a]volume=1.5,apad[a_out]"
+    af = "[1:a]volume=1.6,equalizer=f=200:t=q:w=1:g=2,equalizer=f=4500:t=q:w=1:g=2,apad[a_out]"
 
     cmd = [
         FFMPEG_EXE, "-y", "-threads", "1", "-i", in_vid, "-i", vo_audio,
         "-filter_complex", vf + af,
         "-map", "[v_out]", "-map", "[a_out]",
         "-t", f"{target_dur:.2f}",
-        "-c:v", "libx264", "-preset", "superfast", "-crf", "21",
+        "-c:v", "libx264", "-preset", "superfast", "-crf", "19",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", "-map_metadata", "-1", out_vid
     ]
     subprocess.run(cmd, check=True)
 
 def process_video_task(chat_id, file_id, user_hint=""):
-    status_id = tg_send(chat_id, "⚡ <b>FUNZOOKIDS VIDEO UPGRADER</b>\n\n<code>[█░░░░░░░░░] 10%</code>\n📥 Video received! Downloading...")
+    status_id = tg_send(chat_id, "⚡ <b>FUNZOOKIDS PREMIUM UPGRADER</b>\n\n<code>[█░░░░░░░░░] 10%</code>\n📥 Video received! Downloading...")
     try:
         file_info = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=20).json()
         file_path = file_info["result"]["file_path"]
@@ -229,31 +242,34 @@ def process_video_task(chat_id, file_id, user_hint=""):
         gc.collect()
 
         raw_dur = get_media_duration("raw_input.mp4")
-        # RedNote/Douyin का आखिरी 2.4 सेकंड का एंड-स्क्रीन लोगो ऑटोमैटिक हटाना
         clean_dur = max(4.0, raw_dur - 2.4) if raw_dur > 7.5 else raw_dur
 
-        tg_progress(chat_id, status_id, 40, "AI is analyzing full video & writing viral script...")
+        tg_progress(chat_id, status_id, 40, "AI is researching US Trends & analyzing frames...")
         frames = extract_frames_base64("raw_input.mp4", clean_dur)
         ai_data = analyze_video_with_gemini(frames, clean_dur, user_hint)
         del frames
         gc.collect()
 
-        tg_progress(chat_id, status_id, 65, "Generating Real Human Voice & Clean Captions...")
-        vo_file = generate_human_voice(ai_data["voiceover"])
+        voice_gender = ai_data.get("voice_gender", "female")
+        tg_progress(chat_id, status_id, 65, f"Generating Professional {voice_gender.title()} Voice & Captions...")
+        vo_file = generate_human_voice(ai_data["voiceover"], voice_gender)
         vo_dur = get_media_duration(vo_file)
         final_dur = max(clean_dur, min(raw_dur, vo_dur))
         build_stylish_ass_subtitles(ai_data["voiceover"], vo_file, "viral_subs.ass")
 
-        tg_progress(chat_id, status_id, 85, "Rendering Smooth HD Video without Watermarks...")
+        tg_progress(chat_id, status_id, 85, "Upgrading Colors to Premium Quality & Rendering...")
         upgrade_video_master("raw_input.mp4", vo_file, "viral_subs.ass", "final_viral.mp4", final_dur)
 
         tg_progress(chat_id, status_id, 100, "Done! Sending the Viral Masterpiece to you...")
+        
+        # Telegram पर भेजे जाने वाले मैसेज में अब Posting Time भी मिलेगा
         final_caption = (
             f"🔥 <b>VIRAL VIDEO READY TO POST</b>\n\n"
-            f"📌 <b>TITLE (Tap to Copy):</b>\n<code>{html.escape(ai_data['title'])}</code>\n\n"
-            f"📝 <b>DESCRIPTION:</b>\n<code>{html.escape(ai_data['description'])}</code>\n\n"
-            f"🏷️ <b>TAGS:</b>\n<code>{html.escape(ai_data['tags'])}</code>\n\n"
-            f"#️⃣ <b>HASHTAGS:</b>\n<code>{html.escape(ai_data['hashtags'])}</code>"
+            f"📌 <b>TITLE (Tap to Copy):</b>\n<code>{html.escape(ai_data.get('title', ''))}</code>\n\n"
+            f"📝 <b>DESCRIPTION:</b>\n<code>{html.escape(ai_data.get('description', ''))}</code>\n\n"
+            f"🏷️ <b>TRENDING TAGS:</b>\n<code>{html.escape(ai_data.get('tags', ''))}</code>\n\n"
+            f"#️⃣ <b>HASHTAGS:</b>\n<code>{html.escape(ai_data.get('hashtags', ''))}</code>\n\n"
+            f"🕒 <b>BEST POSTING TIME (US/EU):</b>\n<code>{html.escape(ai_data.get('posting_time', ''))}</code>"
         )
 
         with open("final_viral.mp4", "rb") as f:
