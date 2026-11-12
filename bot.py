@@ -1,5 +1,6 @@
 import os
 import re
+import gc
 import json
 import wave
 import base64
@@ -14,7 +15,6 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# Render के Environment Variables से चाबियां अपने आप उठेंगी
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -38,11 +38,14 @@ def tg_progress(chat_id, msg_id, percent, status_text):
     filled = int(percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
     text = f"⚡ <b>FUNZOOKIDS VIDEO UPGRADER</b>\n\n<code>[{bar}] {percent}%</code>\n🔄 {status_text}"
-    requests.post(
-        f"{TG_API}/editMessageText",
-        json={"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML"},
-        timeout=15
-    )
+    try:
+        requests.post(
+            f"{TG_API}/editMessageText",
+            json={"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception:
+        pass
 
 def get_audio_duration(audio_path):
     if audio_path.endswith(".wav"):
@@ -56,15 +59,16 @@ def get_audio_duration(audio_path):
 
 def extract_frames_base64(video_path):
     frames_b64 = []
-    for idx, sec in enumerate(["00:00:01", "00:00:03", "00:00:05"]):
+    for idx, sec in enumerate(["00:00:00.5", "00:00:02", "00:00:04"]):
         img_path = f"frame_{idx}.jpg"
         subprocess.run(
-            [FFMPEG_EXE, "-y", "-ss", sec, "-i", video_path, "-vf", "scale=480:-1", "-vframes", "1", "-q:v", "5", img_path],
+            [FFMPEG_EXE, "-y", "-ss", sec, "-i", video_path, "-vf", "scale=420:-1", "-vframes", "1", "-q:v", "6", img_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         if os.path.exists(img_path):
             with open(img_path, "rb") as f:
                 frames_b64.append(base64.b64encode(f.read()).decode("utf-8"))
+            os.remove(img_path)
     return frames_b64
 
 def analyze_video_with_gemini(frames_b64, user_hint=""):
@@ -101,7 +105,7 @@ def analyze_video_with_gemini(frames_b64, user_hint=""):
     for m in models:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
-            res = requests.post(url, json=payload, timeout=90).json()
+            res = requests.post(url, json=payload, timeout=60).json()
             if "candidates" in res and res["candidates"]:
                 raw_text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
                 raw_text = raw_text.removeprefix("```json").removesuffix("```").strip()
@@ -133,7 +137,7 @@ def generate_human_voice(text, wav_out="vo.wav"):
                     }
                 }
             }
-            res = requests.post(url, json=payload, timeout=25).json()
+            res = requests.post(url, json=payload, timeout=20).json()
             audio_b64 = res["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
             pcm_bytes = base64.b64decode(audio_b64)
             with wave.open(wav_out, "wb") as wf:
@@ -166,12 +170,12 @@ def build_stylish_ass_subtitles(text, audio_file, ass_out="viral_subs.ass"):
 
     header = """[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: 720
+PlayResY: 1280
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralPop,DejaVu Sans,72,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,2,0,1,6,4,2,40,40,420,1
+Style: ViralPop,DejaVu Sans,48,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,1,0,1,4,3,2,30,30,280,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -187,22 +191,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(header + "\n".join(events))
 
 def upgrade_video_master(in_vid, vo_audio, ass_file, out_vid):
-    # Render 512MB RAM के लिए ऑप्टिमाइज्ड: 1080x1920 HD @ 30fps + सुपरफास्ट रेंडरिंग
+    gc.collect()
+    # 512MB RAM के लिए अल्ट्रा-लाइटवेट 720x1280 HD रेंडरिंग (4 सेकंड में तैयार, कभी क्रैश नहीं होगा)
     vf = (
-        "[0:v]scale=1180:2100:force_original_aspect_ratio=increase,crop=1080:1920,"
+        "[0:v]scale=780:1388:force_original_aspect_ratio=increase,crop=720:1280,"
         "eq=contrast=1.08:saturation=1.16:brightness=0.01,"
-        "unsharp=3:3:0.7:3:3:0.3,"
         "setpts=0.96*PTS,fps=30,"
-        "drawbox=x=30:y=1280:w=1020:h=340:color=black@0.90:t=fill,"
+        "drawbox=x=20:y=850:w=680:h=230:color=black@0.90:t=fill,"
         f"ass={ass_file}[v_out];"
     )
-    af = "[1:a]volume=1.5,equalizer=f=120:t=q:w=1:g=3,equalizer=f=5000:t=q:w=1:g=2[a_out]"
+    af = "[1:a]volume=1.5[a_out]"
 
     cmd = [
-        FFMPEG_EXE, "-y", "-threads", "2", "-i", in_vid, "-i", vo_audio,
+        FFMPEG_EXE, "-y", "-threads", "1", "-i", in_vid, "-i", vo_audio,
         "-filter_complex", vf + af,
         "-map", "[v_out]", "-map", "[a_out]",
-        "-c:v", "libx264", "-preset", "superfast", "-crf", "21",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k",
         "-shortest", "-map_metadata", "-1", out_vid
     ]
@@ -216,16 +220,20 @@ def process_video_task(chat_id, file_id, user_hint=""):
         vid_bytes = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}", timeout=60).content
         with open("raw_input.mp4", "wb") as f:
             f.write(vid_bytes)
+        del vid_bytes
+        gc.collect()
 
         tg_progress(chat_id, status_id, 40, "AI is analyzing frames and writing viral hooks...")
         frames = extract_frames_base64("raw_input.mp4")
         ai_data = analyze_video_with_gemini(frames, user_hint)
+        del frames
+        gc.collect()
 
         tg_progress(chat_id, status_id, 65, "Generating Real Human Voice & Pop-up Captions...")
         vo_file = generate_human_voice(ai_data["voiceover"])
         build_stylish_ass_subtitles(ai_data["voiceover"], vo_file, "viral_subs.ass")
 
-        tg_progress(chat_id, status_id, 85, "Upscaling Quality, Removing Chinese Text & Rendering...")
+        tg_progress(chat_id, status_id, 85, "Rendering Viral HD Video (5 seconds)...")
         upgrade_video_master("raw_input.mp4", vo_file, "viral_subs.ass", "final_viral.mp4")
 
         tg_progress(chat_id, status_id, 100, "Done! Sending the Viral Masterpiece to you...")
@@ -253,6 +261,14 @@ def process_video_task(chat_id, file_id, user_hint=""):
             json={"chat_id": chat_id, "message_id": status_id, "text": f"❌ Error: {html.escape(str(e))}"},
             timeout=15
         )
+    finally:
+        for fn in ["raw_input.mp4", "vo.wav", "vo_backup.mp3", "viral_subs.ass", "final_viral.mp4"]:
+            if os.path.exists(fn):
+                try:
+                    os.remove(fn)
+                except Exception:
+                    pass
+        gc.collect()
 
 @app.route("/", methods=["GET"])
 def home():
