@@ -1,37 +1,46 @@
 import type { SavedRenderRecord } from '../types/studio';
 
-const STORAGE_KEY = 'explainer_studio_renders_v2';
+const STORAGE_KEY = 'explainer_studio_renders_v3';
 
 export function loadSavedRenders(): SavedRenderRecord[] {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? (parsed as SavedRenderRecord[]) : [];
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as SavedRenderRecord[]).filter(
+      (item) =>
+        item &&
+        typeof item.runTag === 'string' &&
+        Array.isArray(item.clips) &&
+        item.clips.length > 0
+    );
   } catch {
     return [];
   }
 }
 
-export function saveRenderRecord(record: SavedRenderRecord): SavedRenderRecord[] {
+export function saveRenderRecord(
+  record: SavedRenderRecord
+): SavedRenderRecord[] {
   const existing = loadSavedRenders().filter(
-    (item) => item.manifest.run_tag !== record.manifest.run_tag
+    (item) => item.runTag !== record.runTag
   );
   const next = [record, ...existing].slice(0, 25);
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch {
-    // ignore quota errors
+    // ignore storage quota errors
   }
   return next;
 }
 
 export function deleteRenderRecord(runTag: string): SavedRenderRecord[] {
-  const next = loadSavedRenders().filter((item) => item.manifest.run_tag !== runTag);
+  const next = loadSavedRenders().filter((item) => item.runTag !== runTag);
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch {
-    // ignore quota errors
+    // ignore storage quota errors
   }
   return next;
 }

@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { AlertCircle, Check, Loader2, XCircle } from 'lucide-react';
-import type { PipelineProgressState, PipelineStepId } from '../types/studio';
+import type { PipelineProgress, PipelineStepId } from '../types/studio';
 
 interface CloudProgressBarProps {
-  progress: PipelineProgressState;
+  progress: PipelineProgress;
   onCancelRender: () => void;
   onDismissError: () => void;
 }
@@ -15,19 +15,19 @@ const PIPELINE_STEPS: { id: PipelineStepId; label: string; shortLabel: string }[
     shortLabel: 'Resolving Stream',
   },
   {
-    id: 'ai_trends',
-    label: '1-Call AI & US Trends',
-    shortLabel: '1-Call AI & Trends',
+    id: 'visual_clip',
+    label: 'Clean & Lock Clip',
+    shortLabel: 'Clean & Lock Clip',
   },
   {
-    id: 'voice_lipsync',
-    label: 'Voice & Lip-Sync',
-    shortLabel: 'Voice & Lip-Sync',
+    id: 'ai_sync_trends',
+    label: 'Beat-Sync AI & Trends',
+    shortLabel: 'Beat-Sync & Trends',
   },
   {
-    id: 'gpu_render',
-    label: 'GPU Hardware Render',
-    shortLabel: 'GPU Render',
+    id: 'voice_mux',
+    label: 'Voice & Fast GPU Mux',
+    shortLabel: 'Voice & GPU Mux',
   },
   { id: 'ready', label: 'Ready', shortLabel: 'Ready' },
 ];
@@ -84,7 +84,7 @@ export function CloudProgressBar({
     >
       <div className="flex flex-wrap items-center justify-between gap-3 mb-3.5">
         <div className="min-w-0">
-          <div className="flex items-center gap-2.5 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-base font-extrabold text-[#0F172A]">
               In-Browser GPU Engine
             </h2>
@@ -95,7 +95,7 @@ export function CloudProgressBar({
             )}
             {isRunning && (
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-[#3D5AFE] text-white text-xs font-extrabold whitespace-nowrap">
-                GPU Active
+                {progress.clipProgressLabel || 'GPU Active'}
               </span>
             )}
             {isError && (

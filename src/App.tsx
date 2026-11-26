@@ -1,13 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Scissors } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { StudioConfigBar } from './components/StudioConfigBar';
 import { VideoSourceCard } from './components/VideoSourceCard';
+import { SourcePreviewCard } from './components/SourcePreviewCard';
 import { CharacterCard } from './components/CharacterCard';
 import { ExplainerControls } from './components/ExplainerControls';
 import { CloudProgressBar } from './components/CloudProgressBar';
-import { VerticalPlayerCard } from './components/VerticalPlayerCard';
-import { MetadataDeck } from './components/MetadataDeck';
+import { OutputDeckCard } from './components/OutputDeckCard';
 import { RecentRendersView } from './components/RecentRendersView';
 import {
   clearStudioKeysOnly,
@@ -15,7 +14,7 @@ import {
   loadStudioConfig,
   saveStudioConfig,
 } from './lib/env';
-import { formatDuration, probeLocalVideoFile } from './lib/videoProbe';
+import { probeVideoBlobToSource } from './lib/videoProbe';
 import { extractVideoUrl } from './lib/urlExtractor';
 import { uploadCharacterPortraitToCloudinary } from './lib/cloudinary';
 import {
@@ -23,34 +22,35 @@ import {
   loadSavedRenders,
   saveRenderRecord,
 } from './lib/storage';
-import { resolveSourceStream } from './engine/streamResolver';
+import { resolveLinkToSourceMedia } from './engine/streamResolver';
+import { prepareLockedVisualClipsStage1 } from './engine/visualClipper';
 import {
-  analyzeContactSheetOneCall,
   applyFaceLockedOutfitChange,
-  buildContactSheetJpeg,
   fetchLiveYouTubeTrends,
-  generateViralScriptAndMetadata,
+  inspectLockedVisualClipOneCall,
+  refineBeatSyncedScriptAndMetadata,
 } from './engine/intelligenceEngine';
-import { synthesizeStudioVoiceover } from './engine/audioEngine';
+import { synthesizeCommandingVoiceover } from './engine/audioEngine';
 import { renderProductionMp4Gpu } from './engine/gpuRenderer';
 import type {
-  LocalClipInfo,
-  PipelineProgressState,
-  RenderedClipItem,
-  RenderResultManifest,
+  PipelineProgress,
+  RenderedClipOutput,
   SavedCharacterAsset,
   SavedRenderRecord,
+  SourceMediaItem,
   StudioConfig,
   StudioControlsState,
+  YouTubeTrendVideo,
 } from './types/studio';
 
-const IDLE_PROGRESS: PipelineProgressState = {
+const IDLE_PROGRESS: PipelineProgress = {
   status: 'idle',
   activeStep: null,
   completedSteps: [],
   percent: 0,
   statusDetail:
-    'Paste any video link or share-text (or upload a file), then click Generate Production Video — runs 100% on your device GPU.',
+    'Paste any video link (click Preview Source) or upload a file, then click Generate Production Video.',
+  clipProgressLabel: null,
   runTag: null,
   startedAtMs: null,
   errorMessage: null,
@@ -59,40 +59,6 @@ const IDLE_PROGRESS: PipelineProgressState = {
 function createRunTag(): string {
   const hex = Math.random().toString(16).slice(2, 8);
   return `exp_${Date.now()}_${hex}`;
-}
-
-function normalizeManifestClips(
-  manifest: RenderResultManifest | null
-): RenderedClipItem[] {
-  if (!manifest) return [];
-  if (Array.isArray(manifest.clips) && manifest.clips.length > 0) {
-    return manifest.clips;
-  }
-  return [
-    {
-      clip_index: 1,
-      start_sec: 0,
-      end_sec: manifest.duration_sec,
-      reason: 'Short Video Main Scene',
-      video_url: manifest.video_url,
-      duration_sec: manifest.duration_sec,
-      width: manifest.width,
-      height: manifest.height,
-      file_size_bytes: manifest.file_size_bytes,
-      voice_engine: manifest.voice_engine,
-      render_engine: manifest.render_engine || 'WebCodecs GPU',
-      character_mode: manifest.character_mode,
-      watermark_boxes_removed: manifest.watermark_boxes_removed,
-      climax_second: manifest.mid_twist_second,
-      youtube_trends_count: manifest.youtube_trends_count,
-      voiceover: manifest.voiceover,
-      title: manifest.title,
-      description: manifest.description,
-      tags: manifest.tags,
-      hashtags: manifest.hashtags,
-      posting_time: manifest.posting_time,
-    },
-  ];
 }
 
 export default function App() {
@@ -104,8 +70,10 @@ export default function App() {
     () => getMissingConfigFields(loadStudioConfig()).length > 0
   );
 
-  const [localClip, setLocalClip] = useState<LocalClipInfo | null>(null);
-  const [clipError, setClipError] = useState<string | null>(null);
+  // Compact Card 1: Fetched / Imported Source Preview state
+  const [sourceMedia, setSourceMedia] = useState<SourceMediaItem | null>(null);
+  const [isFetchingLink, setIsFetchingLink] = useState(false);
+  const [sourceError, setSourceError] = useState<string | null>(null);
 
   const [controls, setControls] = useState<StudioControlsState>(() => {
     const initialConfig = loadStudioConfig();
@@ -124,9 +92,13 @@ export default function App() {
   const [isUploadingPortrait, setIsUploadingPortrait] = useState(false);
   const [portraitError, setPortraitError] = useState<string | null>(null);
 
-  const [progress, setProgress] = useState<PipelineProgressState>(IDLE_PROGRESS);
-  const [result, setResult] = useState<RenderResultManifest | null>(null);
-  const [selectedClipIndex, setSelectedClipIndex] = useState(0);
+  const [progress, setProgress] = useState<PipelineProgress>(IDLE_PROGRESS);
+
+  // Compact Card 2: Final Production Output Deck state
+  const [outputRunTag, setOutputRunTag] = useState<string | null>(null);
+  const [outputSourceDuration, setOutputSourceDuration] = useState<number>(0);
+  const [renderedClips, setRenderedClips] = useState<RenderedClipOutput[]>([]);
+
   const [savedRenders, setSavedRenders] = useState<SavedRenderRecord[]>(() =>
     loadSavedRenders()
   );
@@ -136,11 +108,17 @@ export default function App() {
 
   const revokeOutputBlobUrls = useCallback(() => {
     for (const url of activeOutputBlobUrlsRef.current) {
-      if (url.startsWith('blob:')) {
-        URL.revokeObjectURL(url);
-      }
+      if (url.startsWith('blob:')) URL.revokeObjectURL(url);
     }
     activeOutputBlobUrlsRef.current = [];
+  }, []);
+
+  const clearSourceMedia = useCallback(() => {
+    setSourceMedia((prev) => {
+      if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+      return null;
+    });
+    setSourceError(null);
   }, []);
 
   useEffect(() => {
@@ -149,13 +127,6 @@ export default function App() {
       revokeOutputBlobUrls();
     };
   }, [revokeOutputBlobUrls]);
-
-  const renderedClips = useMemo(
-    () => normalizeManifestClips(result),
-    [result]
-  );
-  const activeClip =
-    renderedClips[selectedClipIndex] ?? renderedClips[0] ?? null;
 
   const handleSaveConfig = useCallback((next: StudioConfig) => {
     const saved = saveStudioConfig(next);
@@ -180,36 +151,56 @@ export default function App() {
     setStudioConfig((current) => clearStudioKeysOnly(current));
   }, []);
 
-  const clearLocalClip = useCallback(() => {
-    setLocalClip((prev) => {
-      if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
-      return null;
-    });
-    setClipError(null);
-  }, []);
-
   const handleFileSelected = useCallback(async (file: File) => {
-    setClipError(null);
+    setSourceError(null);
     try {
-      const info = await probeLocalVideoFile(file);
-      setLocalClip((prev) => {
-        if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
-        return info;
+      const probed = await probeVideoBlobToSource({
+        blob: file,
+        sourceType: 'upload',
+        label: file.name,
+        platform: 'Local File',
       });
-      setResult(null);
-      setSelectedClipIndex(0);
+      setSourceMedia((prev) => {
+        if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+        return probed;
+      });
+      setRenderedClips([]);
+      setOutputRunTag(null);
       setProgress(IDLE_PROGRESS);
     } catch (err) {
-      setClipError((err as Error).message);
+      setSourceError((err as Error).message);
     }
   }, []);
+
+  const handleFetchLinkPreview = useCallback(async () => {
+    if (isFetchingLink || progress.status === 'running') return;
+    setSourceError(null);
+    setIsFetchingLink(true);
+    try {
+      const resolved = await resolveLinkToSourceMedia({
+        rawInput: controls.videoUrl,
+        onStatus: () => {},
+      });
+      setSourceMedia((prev) => {
+        if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+        return resolved;
+      });
+    } catch (err) {
+      setSourceError((err as Error).message);
+    } finally {
+      setIsFetchingLink(false);
+    }
+  }, [controls.videoUrl, isFetchingLink, progress.status]);
 
   const handleUploadPortrait = useCallback(
     async (file: File) => {
       setPortraitError(null);
       setIsUploadingPortrait(true);
       try {
-        const res = await uploadCharacterPortraitToCloudinary(file, studioConfig);
+        const res = await uploadCharacterPortraitToCloudinary(
+          file,
+          studioConfig
+        );
         const cleanName =
           file.name.replace(/\.[^.]+$/, '').slice(0, 32) || 'Portrait';
         const newAsset: SavedCharacterAsset = {
@@ -249,11 +240,12 @@ export default function App() {
         (c) => c.id === selectedCharacterId
       );
       if (chosen) {
-        const nextConfig = saveStudioConfig({
-          ...studioConfig,
-          characterImageUrl: chosen.url,
-        });
-        setStudioConfig(nextConfig);
+        setStudioConfig(
+          saveStudioConfig({
+            ...studioConfig,
+            characterImageUrl: chosen.url,
+          })
+        );
       }
     },
     [studioConfig]
@@ -263,12 +255,13 @@ export default function App() {
     (id: string) => {
       const remaining = studioConfig.savedCharacters.filter((c) => c.id !== id);
       const nextUrl = remaining[0]?.url ?? '';
-      const nextConfig = saveStudioConfig({
-        ...studioConfig,
-        characterImageUrl: nextUrl,
-        savedCharacters: remaining,
-      });
-      setStudioConfig(nextConfig);
+      setStudioConfig(
+        saveStudioConfig({
+          ...studioConfig,
+          characterImageUrl: nextUrl,
+          savedCharacters: remaining,
+        })
+      );
       setControls((prev) => ({
         ...prev,
         selectedCharacterId:
@@ -282,7 +275,7 @@ export default function App() {
 
   const handleResetWorkspace = useCallback(() => {
     if (progress.status === 'running') return;
-    clearLocalClip();
+    clearSourceMedia();
     revokeOutputBlobUrls();
     setControls((prev) => ({
       ...prev,
@@ -291,16 +284,18 @@ export default function App() {
       outfitPrompt: '',
     }));
     setProgress(IDLE_PROGRESS);
-    setResult(null);
-    setSelectedClipIndex(0);
+    setRenderedClips([]);
+    setOutputRunTag(null);
+    setOutputSourceDuration(0);
     setActiveTab('studio');
-  }, [clearLocalClip, progress.status, revokeOutputBlobUrls]);
+  }, [clearSourceMedia, progress.status, revokeOutputBlobUrls]);
 
   const handleCancelRender = useCallback(() => {
     abortRef.current?.abort();
     setProgress((prev) => ({
       ...prev,
       status: 'cancelled',
+      clipProgressLabel: null,
       statusDetail: 'GPU render cancelled. Ready for your next video.',
       errorMessage: null,
     }));
@@ -320,7 +315,7 @@ export default function App() {
 
   const canGenerate =
     controls.sourceType === 'upload'
-      ? Boolean(localClip)
+      ? Boolean(sourceMedia && sourceMedia.sourceType === 'upload')
       : Boolean(extractedLink);
 
   const handleStartRender = useCallback(async () => {
@@ -356,9 +351,10 @@ export default function App() {
     revokeOutputBlobUrls();
     const runTag = createRunTag();
     const startedAtMs = Date.now();
-    setResult(null);
-    setSelectedClipIndex(0);
+    setOutputRunTag(runTag);
+    setRenderedClips([]);
     setPortraitError(null);
+    setSourceError(null);
 
     setProgress({
       status: 'running',
@@ -367,40 +363,84 @@ export default function App() {
       percent: 5,
       statusDetail:
         controls.sourceType === 'upload'
-          ? 'Loading local video clip into browser engine...'
-          : 'Racing parallel no-watermark stream resolvers...',
+          ? 'Preparing imported local video...'
+          : 'Resolving direct no-watermark MP4 stream...',
+      clipProgressLabel: null,
       runTag,
       startedAtMs,
       errorMessage: null,
     });
 
-    let sourceObjectUrlToRevoke: string | null = null;
     const newOutputBlobUrls: string[] = [];
 
     try {
-      // CORE 1: Resolving Stream & Smart Clipping (5% -> 20%)
-      const resolved = await resolveSourceStream({
-        sourceType: controls.sourceType,
-        videoUrl: controls.videoUrl,
-        localClip,
-        config: studioConfig,
+      // STEP 1: Resolve or reuse already-previewed SourceMediaItem (Compact Card 1)
+      let activeSource = sourceMedia;
+      const linkMatchesExisting =
+        controls.sourceType === 'link' &&
+        activeSource?.sourceType === 'link' &&
+        extractedLink &&
+        activeSource.label === extractedLink.cleanUrl;
+
+      if (controls.sourceType === 'link' && !linkMatchesExisting) {
+        activeSource = await resolveLinkToSourceMedia({
+          rawInput: controls.videoUrl,
+          onStatus: (msg) => {
+            setProgress((prev) => ({
+              ...prev,
+              activeStep: 'resolving_stream',
+              percent: Math.min(18, prev.percent + 2),
+              statusDetail: msg,
+            }));
+          },
+          signal,
+        });
+        setSourceMedia((prev) => {
+          if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+          return activeSource;
+        });
+      }
+
+      if (!activeSource) {
+        throw new Error('No source video available to render.');
+      }
+
+      setOutputSourceDuration(activeSource.durationSec);
+
+      if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+      // STAGE 1: Build & Lock Clean Visual Timeline FIRST (Clip, De-watermark, Cinema Grade)
+      setProgress((prev) => ({
+        ...prev,
+        activeStep: 'visual_clip',
+        completedSteps: ['resolving_stream'],
+        percent: 18,
+        statusDetail:
+          activeSource.mode === 'long'
+            ? 'Stage 1: Scanning 18 proportional keyframes (4%–96%) & locking clean viral clip timelines...'
+            : 'Stage 1: Auto-trimming creator bumper & locking clean cinema-graded visual timeline...',
+      }));
+
+      const preparedClips = await prepareLockedVisualClipsStage1({
+        source: activeSource,
+        customAngle: controls.customAngle,
+        geminiApiKey: studioConfig.geminiApiKey,
         onStatus: (msg) => {
           setProgress((prev) => ({
             ...prev,
-            activeStep: 'resolving_stream',
-            percent: Math.min(18, prev.percent + 2),
+            activeStep: 'visual_clip',
+            percent: Math.min(32, Math.max(prev.percent, 22)),
             statusDetail: msg,
           }));
         },
         signal,
       });
-      sourceObjectUrlToRevoke = resolved.objectUrl;
 
-      if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      if (preparedClips.length === 0) {
+        throw new Error('Stage 1 could not prepare a locked visual timeline.');
+      }
 
-      const totalSegments = resolved.segments.length;
-
-      // Optional Face-Locked Outfit Change (executed once before sequential clips)
+      // Optional Face-Locked Outfit Change (once per job)
       let effectivePortraitUrl = activeCharacterUrl;
       if (
         controls.characterEnabled &&
@@ -409,9 +449,8 @@ export default function App() {
       ) {
         setProgress((prev) => ({
           ...prev,
-          activeStep: 'ai_trends',
-          completedSteps: ['resolving_stream'],
-          percent: 21,
+          activeStep: 'visual_clip',
+          percent: 34,
           statusDetail:
             'Applying face-locked outfit change to your talking character...',
         }));
@@ -423,123 +462,132 @@ export default function App() {
         });
       }
 
-      const clipOutputs: RenderedClipItem[] = [];
+      const totalClips = preparedClips.length;
+      const finishedOutputs: RenderedClipOutput[] = [];
+      const trendsCache = new Map<string, YouTubeTrendVideo[]>();
 
-      // Strictly sequential multi-clip processing so mobile RAM stays flat between clips
-      for (let idx = 0; idx < totalSegments; idx++) {
+      // Process each locked visual clip strictly sequentially so phone RAM stays flat
+      for (let i = 0; i < totalClips; i++) {
         if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-        const seg = resolved.segments[idx];
-        const segDuration = Math.max(3, seg.endSec - seg.startSec);
-        const clipPrefix =
-          totalSegments > 1 ? `[Clip ${idx + 1}/${totalSegments}] ` : '';
+        const preparedClip = preparedClips[i];
+        const clipLabel =
+          totalClips > 1 ? `Clip ${i + 1}/${totalClips}` : 'Single Short';
+        const clipPrefix = totalClips > 1 ? `Clip ${i + 1}/${totalClips}: ` : '';
 
-        const segStartPct = 22 + Math.round((idx / totalSegments) * 75);
-        const segSpanPct = Math.round(75 / totalSegments);
+        const clipBasePct = 36 + Math.round((i / totalClips) * 60);
+        const clipSpanPct = Math.round(60 / totalClips);
 
-        // CORE 2: 1-Call Contact-Sheet Vision + Live YouTube Trends + NVIDIA Script
+        // STAGE 2A: Inspect the ALREADY-CLEANED & STAMPED 9-Frame Contact Sheet (1 Vision Call)
         setProgress((prev) => ({
           ...prev,
-          activeStep: 'ai_trends',
-          completedSteps: ['resolving_stream'],
-          percent: segStartPct,
-          statusDetail: `${clipPrefix}Sampling 9 keyframes onto lightweight OffscreenCanvas contact sheet...`,
+          activeStep: 'ai_sync_trends',
+          completedSteps: ['resolving_stream', 'visual_clip'],
+          clipProgressLabel: clipLabel,
+          percent: clipBasePct,
+          statusDetail: `${clipPrefix}Stage 2: Inspecting locked ${preparedClip.lockedVisualDurationSec.toFixed(
+            1
+          )}s stamped frames & writing beat-synced script...`,
         }));
 
-        const { base64Jpeg } = await buildContactSheetJpeg(
-          resolved.objectUrl,
-          seg.startSec,
-          seg.endSec,
-          signal
-        );
-
-        setProgress((prev) => ({
-          ...prev,
-          percent: segStartPct + Math.round(segSpanPct * 0.12),
-          statusDetail: `${clipPrefix}1-Call Gemini Vision scanning beats, climax & watermark boxes...`,
-        }));
-
-        const vision = await analyzeContactSheetOneCall({
-          base64Jpeg,
-          clipDurationSec: segDuration,
+        const inspection = await inspectLockedVisualClipOneCall({
+          source: activeSource,
+          preparedClip,
+          language: controls.language,
           customAngle: controls.customAngle,
           geminiApiKey: studioConfig.geminiApiKey,
           signal,
         });
 
+        const lockedClip = inspection.updatedClip;
+
+        // Fetch live US YouTube Shorts trends (cached by query key to save API quota)
+        const trendCacheKey = inspection.searchQueries
+          .map((q) => q.trim().toLowerCase())
+          .sort()
+          .join('|');
+        let trends = trendsCache.get(trendCacheKey);
+        if (!trends) {
+          setProgress((prev) => ({
+            ...prev,
+            activeStep: 'ai_sync_trends',
+            percent: clipBasePct + Math.round(clipSpanPct * 0.14),
+            statusDetail: `${clipPrefix}Stage 2: Querying live US YouTube Shorts trends (${inspection.visionModel})...`,
+          }));
+          trends = await fetchLiveYouTubeTrends(
+            inspection.searchQueries,
+            studioConfig.youtubeApiKey,
+            signal
+          );
+          trendsCache.set(trendCacheKey, trends);
+        }
+
+        // STAGE 2B: Refine strictly word-budgeted beats & 5 US trend SEO metadata cards
         setProgress((prev) => ({
           ...prev,
-          percent: segStartPct + Math.round(segSpanPct * 0.22),
-          statusDetail: `${clipPrefix}Fetching live US YouTube Shorts trends (YouTube Data API v3)...`,
+          activeStep: 'ai_sync_trends',
+          percent: clipBasePct + Math.round(clipSpanPct * 0.24),
+          statusDetail: `${clipPrefix}Stage 2: Refining word-budgeted beats (${lockedClip.lockedVisualDurationSec.toFixed(
+            1
+          )}s lock) & US SEO deck...`,
         }));
 
-        const trends = await fetchLiveYouTubeTrends(
-          vision.search_queries,
-          studioConfig.youtubeApiKey,
-          signal
-        );
-
-        setProgress((prev) => ({
-          ...prev,
-          percent: segStartPct + Math.round(segSpanPct * 0.3),
-          statusDetail: `${clipPrefix}Generating suspense loop narration & viral SEO metadata...`,
-        }));
-
-        const scriptPack = await generateViralScriptAndMetadata({
-          vision,
+        const metadata = await refineBeatSyncedScriptAndMetadata({
+          inspection,
           trends,
-          clipDurationSec: segDuration,
           language: controls.language,
           customAngle: controls.customAngle,
           config: studioConfig,
           signal,
         });
 
-        // CORE 3: Studio WebAudio DSP & Real Male/Female Voiceover + Lip-Sync Envelope
+        // STAGE 3A: Commanding Heavy Voiceover + Automatic Time-Fit inside locked visual clip
         setProgress((prev) => ({
           ...prev,
-          activeStep: 'voice_lipsync',
-          completedSteps: ['resolving_stream', 'ai_trends'],
-          percent: segStartPct + Math.round(segSpanPct * 0.4),
-          statusDetail: `${clipPrefix}Synthesizing high-energy voiceover & OfflineAudioContext vocal DSP...`,
+          activeStep: 'voice_mux',
+          completedSteps: ['resolving_stream', 'visual_clip', 'ai_sync_trends'],
+          clipProgressLabel: clipLabel,
+          percent: clipBasePct + Math.round(clipSpanPct * 0.36),
+          statusDetail: `${clipPrefix}Stage 3: Synthesizing bold voiceover & broadcast vocal DSP...`,
         }));
 
-        const audio = await synthesizeStudioVoiceover({
-          scriptText: scriptPack.voiceover,
+        const audio = await synthesizeCommandingVoiceover({
+          scriptText: metadata.voiceover,
           language: controls.language,
           voiceGender: controls.voiceGender,
           geminiApiKey: studioConfig.geminiApiKey,
+          lockedVisualDurationSec: lockedClip.lockedVisualDurationSec,
           onStatus: (msg) => {
             setProgress((prev) => ({
               ...prev,
+              activeStep: 'voice_mux',
               statusDetail: `${clipPrefix}${msg}`,
             }));
           },
           signal,
         });
 
-        // CORE 4: Off-Main-Thread WebWorker + WebGL2 + WebCodecs GPU Render (lazy FFmpeg fallback)
-        const gpuBasePct = segStartPct + Math.round(segSpanPct * 0.52);
-        const gpuSpanPct = Math.max(12, Math.round(segSpanPct * 0.45));
+        // STAGE 3B: Fast Single-Pass Continuous GPU Mux (requestVideoFrameCallback -> WebGL2/WebCodecs)
+        const gpuStartPct = clipBasePct + Math.round(clipSpanPct * 0.5);
+        const gpuSpanPct = Math.max(10, Math.round(clipSpanPct * 0.48));
 
         setProgress((prev) => ({
           ...prev,
-          activeStep: 'gpu_render',
-          completedSteps: ['resolving_stream', 'ai_trends', 'voice_lipsync'],
-          percent: gpuBasePct,
-          statusDetail: `${clipPrefix}Launching background WebGL2 + WebCodecs GPU Worker...`,
+          activeStep: 'voice_mux',
+          completedSteps: ['resolving_stream', 'visual_clip', 'ai_sync_trends'],
+          clipProgressLabel: clipLabel,
+          percent: gpuStartPct,
+          statusDetail: `${clipPrefix}Stage 3: Starting fast single-pass GPU mux (${lockedClip.lockedVisualDurationSec.toFixed(
+            1
+          )}s locked clip)...`,
         }));
 
         const rendered = await renderProductionMp4Gpu({
-          sourceVideoBlob: resolved.blob,
-          sourceWidth: resolved.width,
-          sourceHeight: resolved.height,
-          startSec: seg.startSec,
-          endSec: seg.endSec,
+          source: activeSource,
+          clip: lockedClip,
           audio,
-          scriptText: scriptPack.voiceover,
+          scriptText: metadata.voiceover,
+          beats: metadata.beats,
           language: controls.language,
-          watermarkBoxes: vision.watermark_boxes,
-          climaxSecond: vision.climax_second,
           characterEnabled: controls.characterEnabled,
           characterPortraitUrl: controls.characterEnabled
             ? effectivePortraitUrl
@@ -547,17 +595,18 @@ export default function App() {
           onStatus: (msg) => {
             setProgress((prev) => ({
               ...prev,
+              activeStep: 'voice_mux',
               statusDetail: `${clipPrefix}${msg}`,
             }));
           },
           onProgressPct: (localPct) => {
-            const mappedPct = Math.min(
+            const mapped = Math.min(
               98,
-              gpuBasePct + Math.round((localPct / 100) * gpuSpanPct)
+              gpuStartPct + Math.round((localPct / 100) * gpuSpanPct)
             );
             setProgress((prev) => ({
               ...prev,
-              percent: Math.max(prev.percent, mappedPct),
+              percent: Math.max(prev.percent, mapped),
             }));
           },
           signal,
@@ -565,134 +614,108 @@ export default function App() {
 
         newOutputBlobUrls.push(rendered.blobUrl);
 
-        clipOutputs.push({
-          clip_index: seg.clipIndex,
-          start_sec: seg.startSec,
-          end_sec: seg.endSec,
-          reason: seg.reason,
-          video_url: rendered.blobUrl,
-          duration_sec: rendered.durationSec,
+        const clipOutput: RenderedClipOutput = {
+          clipIndex: lockedClip.clipIndex,
+          totalClips,
+          startSec: lockedClip.trimRange.startSec,
+          endSec: lockedClip.trimRange.endSec,
+          reason: lockedClip.reason,
+          videoUrl: rendered.blobUrl,
+          durationSec: rendered.durationSec,
           width: rendered.width,
           height: rendered.height,
-          file_size_bytes: rendered.sizeBytes,
-          voice_engine: `${audio.engineLabel} · ${scriptPack.scriptEngine}`,
-          render_engine: rendered.renderEngine,
-          character_mode: rendered.characterMode,
-          watermark_boxes_removed: rendered.delogoCount,
-          climax_second: vision.climax_second,
-          youtube_trends_count: trends.length,
-          voiceover: scriptPack.voiceover,
-          title: scriptPack.title,
-          description: scriptPack.description,
-          tags: scriptPack.tags,
-          hashtags: scriptPack.hashtags,
-          posting_time: scriptPack.posting_time,
-        });
-      }
+          fps: rendered.fps,
+          fileSizeBytes: rendered.sizeBytes,
+          language: controls.language,
+          voiceGender: controls.voiceGender,
+          voiceEngine: `${audio.engineLabel} · ${metadata.scriptEngine}`,
+          renderEngine: rendered.renderEngine,
+          characterMode: rendered.characterMode,
+          watermarkBoxesRemoved: rendered.delogoCount,
+          endCardTrimmedSec: rendered.bumperTrimmedSec,
+          safeCropApplied: rendered.safeCropApplied,
+          climaxSecond: lockedClip.climaxSec,
+          metadata,
+        };
 
-      const first = clipOutputs[0];
-      if (!first) {
-        throw new Error('No output clips were generated.');
+        finishedOutputs.push(clipOutput);
+        // Append each completed clip immediately to Compact Card 2
+        setRenderedClips([...finishedOutputs]);
       }
-
-      const manifest: RenderResultManifest = {
-        run_tag: runTag,
-        video_url: first.video_url,
-        duration_sec: first.duration_sec,
-        width: first.width,
-        height: first.height,
-        file_size_bytes: first.file_size_bytes,
-        language: controls.language,
-        voice_gender: controls.voiceGender,
-        voice_engine: first.voice_engine,
-        render_engine: first.render_engine,
-        character_mode: first.character_mode,
-        watermark_boxes_removed: first.watermark_boxes_removed,
-        mid_twist_second: first.climax_second,
-        youtube_trends_count: first.youtube_trends_count,
-        voiceover: first.voiceover,
-        title: first.title,
-        description: first.description,
-        tags: first.tags,
-        hashtags: first.hashtags,
-        posting_time: first.posting_time,
-        completed_at: new Date().toISOString(),
-        is_long_video_split: resolved.isLongVideoSplit,
-        source_total_duration: resolved.durationSec,
-        clips: clipOutputs,
-      };
 
       activeOutputBlobUrlsRef.current = newOutputBlobUrls;
-      setResult(manifest);
-      setSelectedClipIndex(0);
+      const first = finishedOutputs[0];
       setProgress((prev) => ({
         ...prev,
         status: 'completed',
         activeStep: 'ready',
         completedSteps: [
           'resolving_stream',
-          'ai_trends',
-          'voice_lipsync',
-          'gpu_render',
+          'visual_clip',
+          'ai_sync_trends',
+          'voice_mux',
           'ready',
         ],
+        clipProgressLabel: null,
         percent: 100,
         statusDetail:
-          clipOutputs.length > 1
-            ? `Hardware-rendered ${clipOutputs.length} viral ${first.width}×${first.height} MP4 clips directly in your browser.`
-            : `Finished ${first.width}×${first.height} explainer MP4 (${first.render_engine}) — ready for instant download.`,
+          finishedOutputs.length > 1
+            ? `Completed all ${finishedOutputs.length} beat-synced 9:16 MP4 clips (${first?.width}×${first?.height} @ ${first?.fps}fps) — ready below.`
+            : `Finished ${first?.width}×${first?.height} MP4 (${first?.renderEngine}) — ready for instant download below.`,
       }));
 
-      const updated = saveRenderRecord({
-        manifest,
-        sourceLabel: resolved.sourceLabel,
+      const record: SavedRenderRecord = {
+        runTag,
+        completedAt: new Date().toISOString(),
+        sourceLabel: activeSource.label,
+        sourceDurationSec: activeSource.durationSec,
+        mode: activeSource.mode,
         customAngle: controls.customAngle,
-      });
-      setSavedRenders(updated);
+        clips: finishedOutputs,
+      };
+      setSavedRenders(saveRenderRecord(record));
     } catch (err) {
       for (const u of newOutputBlobUrls) URL.revokeObjectURL(u);
       if ((err as Error).name === 'AbortError') return;
       setProgress((prev) => ({
         ...prev,
         status: 'error',
+        clipProgressLabel: null,
         statusDetail: 'In-browser render stopped with an error.',
         errorMessage: (err as Error).message || 'Unexpected render failure.',
       }));
-    } finally {
-      if (sourceObjectUrlToRevoke) {
-        URL.revokeObjectURL(sourceObjectUrlToRevoke);
-      }
     }
   }, [
     activeCharacterUrl,
     canGenerate,
     controls,
-    localClip,
+    extractedLink,
     progress.status,
     revokeOutputBlobUrls,
+    sourceMedia,
     studioConfig,
   ]);
 
   const handleLoadRecord = useCallback((record: SavedRenderRecord) => {
-    setResult(record.manifest);
-    setSelectedClipIndex(0);
-    const clipsCount = record.manifest.clips?.length ?? 1;
+    setOutputRunTag(record.runTag);
+    setOutputSourceDuration(record.sourceDurationSec);
+    setRenderedClips(record.clips);
     setProgress({
       status: 'completed',
       activeStep: 'ready',
       completedSteps: [
         'resolving_stream',
-        'ai_trends',
-        'voice_lipsync',
-        'gpu_render',
+        'visual_clip',
+        'ai_sync_trends',
+        'voice_mux',
         'ready',
       ],
       percent: 100,
-      statusDetail:
-        clipsCount > 1
-          ? `Loaded ${clipsCount}-clip render metadata (${record.manifest.run_tag}).`
-          : `Loaded saved render metadata (${record.manifest.run_tag}).`,
-      runTag: record.manifest.run_tag,
+      clipProgressLabel: null,
+      statusDetail: `Loaded ${record.clips.length} saved clip${
+        record.clips.length === 1 ? '' : 's'
+      } (${record.runTag}).`,
+      runTag: record.runTag,
       startedAtMs: null,
       errorMessage: null,
     });
@@ -724,22 +747,32 @@ export default function App() {
 
         {activeTab === 'studio' ? (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            {/* LEFT COLUMN: Zero-Clutter Essential Controls */}
+            {/* LEFT COLUMN: Source Input -> Compact Card 1 (Source Preview) -> Character -> Controls */}
             <div className="lg:col-span-5 space-y-5">
               <VideoSourceCard
                 sourceType={controls.sourceType}
                 videoUrl={controls.videoUrl}
-                clip={localClip}
+                sourceMedia={sourceMedia}
                 disabled={progress.status === 'running'}
-                error={clipError}
+                isFetchingLink={isFetchingLink}
+                error={sourceError}
                 onSourceTypeChange={(sourceType) =>
                   setControls((prev) => ({ ...prev, sourceType }))
                 }
-                onVideoUrlChange={(videoUrl) =>
-                  setControls((prev) => ({ ...prev, videoUrl }))
-                }
+                onVideoUrlChange={(videoUrl) => {
+                  setSourceError(null);
+                  setControls((prev) => ({ ...prev, videoUrl }));
+                }}
+                onFetchLinkPreview={() => void handleFetchLinkPreview()}
                 onFileSelected={(file) => void handleFileSelected(file)}
-                onClearClip={clearLocalClip}
+                onClearSource={clearSourceMedia}
+              />
+
+              {/* COMPACT CARD 1: Fetched / Imported Source Preview */}
+              <SourcePreviewCard
+                source={sourceMedia}
+                disabled={progress.status === 'running'}
+                onClear={clearSourceMedia}
               />
 
               <CharacterCard
@@ -770,7 +803,7 @@ export default function App() {
               />
             </div>
 
-            {/* RIGHT COLUMN: Live 5-Step Progress, Multi-Clip Switcher, 9:16 Player & Copy Output Deck */}
+            {/* RIGHT COLUMN: Live 5-Step Progress -> Compact Card 2 (Final Production Output Deck) */}
             <div className="lg:col-span-7 space-y-5">
               <CloudProgressBar
                 progress={progress}
@@ -778,92 +811,13 @@ export default function App() {
                 onDismissError={() => setProgress(IDLE_PROGRESS)}
               />
 
-              {renderedClips.length > 1 && (
-                <section
-                  aria-label="Viral Clips Selector"
-                  className="rounded-2xl border-2 border-[#3D5AFE] bg-[#EEF2FF] p-4 space-y-3"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <span className="w-7 h-7 rounded-lg bg-[#3D5AFE] text-white flex items-center justify-center shrink-0">
-                        <Scissors className="w-4 h-4" strokeWidth={2.5} />
-                      </span>
-                      <div>
-                        <h2 className="text-sm font-extrabold text-[#0F172A]">
-                          Top {renderedClips.length} Viral Shorts Extracted
-                        </h2>
-                        <p className="text-xs font-semibold text-[#334155]">
-                          Auto-sliced from{' '}
-                          {formatDuration(result?.source_total_duration ?? 0)} long video — select a clip to preview, download &amp; copy metadata
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div
-                    className={`grid grid-cols-1 gap-2.5 ${
-                      renderedClips.length >= 4
-                        ? 'sm:grid-cols-2 xl:grid-cols-4'
-                        : 'sm:grid-cols-3'
-                    }`}
-                  >
-                    {renderedClips.map((clip, idx) => {
-                      const isActive = idx === selectedClipIndex;
-                      return (
-                        <button
-                          key={clip.clip_index}
-                          type="button"
-                          onClick={() => setSelectedClipIndex(idx)}
-                          className={`rounded-xl border-2 px-3 py-2.5 text-left transition-colors cursor-pointer ${
-                            isActive
-                              ? 'border-[#3D5AFE] bg-[#3D5AFE] text-white'
-                              : 'border-[#CBD5E1] bg-white text-[#0F172A] hover:border-[#3D5AFE]'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-xs font-extrabold whitespace-nowrap">
-                              Clip {clip.clip_index}
-                            </span>
-                            <span
-                              className={`font-mono-tabular text-[11px] font-bold ${
-                                isActive ? 'text-white/90' : 'text-[#3D5AFE]'
-                              }`}
-                            >
-                              {formatDuration(clip.start_sec)}–{formatDuration(clip.end_sec)}
-                            </span>
-                          </div>
-                          <p
-                            className={`text-[11px] font-semibold mt-1 truncate ${
-                              isActive ? 'text-white/90' : 'text-[#64748B]'
-                            }`}
-                            title={clip.title || clip.reason}
-                          >
-                            {clip.title || clip.reason}
-                          </p>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </section>
-              )}
-
-              <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
-                <div className="xl:col-span-5">
-                  <VerticalPlayerCard
-                    localClip={controls.sourceType === 'upload' ? localClip : null}
-                    result={result}
-                    activeClip={activeClip}
-                    totalClips={renderedClips.length}
-                  />
-                </div>
-                <div className="xl:col-span-7">
-                  <MetadataDeck
-                    result={result}
-                    activeClip={activeClip}
-                    totalClips={renderedClips.length}
-                  />
-                </div>
-              </div>
+              {/* COMPACT CARD 2: Final Production Output Deck (Lists ALL rendered clips sequentially) */}
+              <OutputDeckCard
+                runTag={outputRunTag}
+                clips={renderedClips}
+                isRendering={progress.status === 'running'}
+                sourceDurationSec={outputSourceDuration}
+              />
             </div>
           </div>
         ) : (

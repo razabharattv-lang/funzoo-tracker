@@ -1,46 +1,54 @@
 import { useRef, useState } from 'react';
 import {
   CheckCircle2,
+  DownloadCloud,
   Film,
   Link2,
+  Loader2,
   RefreshCw,
   Trash2,
   UploadCloud,
   X,
 } from 'lucide-react';
-import type { LocalClipInfo, SourceType } from '../types/studio';
+import type { SourceMediaItem, SourceType } from '../types/studio';
 import { formatBytes, formatDuration } from '../lib/videoProbe';
 import { extractVideoUrl } from '../lib/urlExtractor';
 
 interface VideoSourceCardProps {
   sourceType: SourceType;
   videoUrl: string;
-  clip: LocalClipInfo | null;
+  sourceMedia: SourceMediaItem | null;
   disabled: boolean;
+  isFetchingLink: boolean;
   error: string | null;
   onSourceTypeChange: (type: SourceType) => void;
   onVideoUrlChange: (url: string) => void;
+  onFetchLinkPreview: () => void;
   onFileSelected: (file: File) => void;
-  onClearClip: () => void;
+  onClearSource: () => void;
 }
 
 export function VideoSourceCard({
   sourceType,
   videoUrl,
-  clip,
+  sourceMedia,
   disabled,
+  isFetchingLink,
   error,
   onSourceTypeChange,
   onVideoUrlChange,
+  onFetchLinkPreview,
   onFileSelected,
-  onClearClip,
+  onClearSource,
 }: VideoSourceCardProps) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
   const extracted = extractVideoUrl(videoUrl);
   const hasValidLink = Boolean(extracted);
-  const isReady = sourceType === 'link' ? hasValidLink : Boolean(clip);
+  const isReady = sourceType === 'link' ? hasValidLink : Boolean(sourceMedia);
+  const uploadedClip =
+    sourceMedia && sourceMedia.sourceType === 'upload' ? sourceMedia : null;
 
   const handleFiles = (files: FileList | null) => {
     if (!files || files.length === 0 || disabled) return;
@@ -52,7 +60,7 @@ export function VideoSourceCard({
 
   return (
     <section
-      aria-label="Paste Any Video Link or Upload File"
+      aria-label="Universal Video Link or Local File Upload"
       className={`rounded-2xl border-2 p-5 space-y-4 transition-colors ${
         isDragging
           ? 'border-[#3D5AFE] bg-[#EEF2FF]'
@@ -61,7 +69,7 @@ export function VideoSourceCard({
           : 'border-[#E2E8F0] bg-white'
       }`}
     >
-      {/* PRIMARY HERO INPUT: Paste Any Video Link */}
+      {/* PRIMARY HERO INPUT: Universal Video Link Input */}
       <div className="space-y-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2.5">
@@ -73,7 +81,7 @@ export function VideoSourceCard({
                 1. Universal Video Link Input
               </h2>
               <p className="text-xs font-medium text-[#64748B]">
-                RedNote · Douyin · TikTok · Facebook · Reels · Shorts (20–40s) &amp; Long Videos (&gt;65s auto-slices 30s / 40s / 60s viral clips)
+                RedNote · Douyin · TikTok · Facebook · Reels · Shorts &amp; Long Videos (10–60+ min auto-clipped)
               </p>
             </div>
           </div>
@@ -97,7 +105,7 @@ export function VideoSourceCard({
             <textarea
               id="paste-any-video-link"
               rows={2}
-              disabled={disabled}
+              disabled={disabled || isFetchingLink}
               value={videoUrl}
               onFocus={() => {
                 if (sourceType !== 'link') onSourceTypeChange('link');
@@ -109,7 +117,7 @@ export function VideoSourceCard({
               placeholder="Paste any raw link or full Chinese share-text (e.g., 78 【标题】 http://xhslink.com/abc 复制打开...)"
               className="w-full rounded-xl border-2 border-[#3D5AFE] bg-white pl-3.5 pr-9 py-2.5 text-sm font-semibold text-[#0F172A] placeholder:text-[#94A3B8] focus:outline-none disabled:opacity-55 resize-none"
             />
-            {videoUrl && !disabled && (
+            {videoUrl && !disabled && !isFetchingLink && (
               <button
                 type="button"
                 onClick={() => onVideoUrlChange('')}
@@ -122,12 +130,12 @@ export function VideoSourceCard({
           </div>
 
           {sourceType === 'link' && extracted && (
-            <div className="mt-2.5 rounded-lg border-2 border-[#3D5AFE] bg-white px-3 py-2 flex items-center justify-between gap-2">
-              <div className="min-w-0">
+            <div className="mt-2.5 rounded-lg border-2 border-[#3D5AFE] bg-white px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0 flex-1">
                 <p className="text-[11px] font-extrabold text-[#3D5AFE]">
                   {extracted.wasExtractedFromText
-                    ? `Clean URL Auto-Extracted (${extracted.platform})`
-                    : `Ready to Fetch (${extracted.platform})`}
+                    ? `Clean URL Extracted (${extracted.platform})`
+                    : `Ready to Resolve (${extracted.platform})`}
                 </p>
                 <p
                   className="font-mono-tabular text-xs font-bold text-[#0F172A] truncate mt-0.5"
@@ -136,6 +144,24 @@ export function VideoSourceCard({
                   {extracted.cleanUrl}
                 </p>
               </div>
+              <button
+                type="button"
+                disabled={disabled || isFetchingLink}
+                onClick={onFetchLinkPreview}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border-2 border-[#3D5AFE] bg-[#3D5AFE] hover:bg-[#2F49E6] text-white text-xs font-extrabold transition-colors disabled:opacity-55 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                {isFetchingLink ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={2.5} />
+                    <span>Fetching...</span>
+                  </>
+                ) : (
+                  <>
+                    <DownloadCloud className="w-3.5 h-3.5" strokeWidth={2.5} />
+                    <span>Preview Source</span>
+                  </>
+                )}
+              </button>
             </div>
           )}
 
@@ -147,7 +173,7 @@ export function VideoSourceCard({
         </div>
       </div>
 
-      {/* SECONDARY OPTION: Or Upload Local File */}
+      {/* SECONDARY OPTION: Direct Local Gallery Upload */}
       <div className="pt-1">
         <div className="flex items-center gap-3 mb-2.5">
           <div className="flex-1 h-0.5 bg-[#E2E8F0]" />
@@ -169,7 +195,7 @@ export function VideoSourceCard({
           }}
         />
 
-        {clip && sourceType === 'upload' ? (
+        {uploadedClip && sourceType === 'upload' ? (
           <div className="rounded-xl border-2 border-[#3D5AFE] bg-[#EEF2FF] p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
               <div className="w-10 h-10 rounded-xl bg-[#3D5AFE] text-white flex items-center justify-center shrink-0">
@@ -178,20 +204,18 @@ export function VideoSourceCard({
               <div className="min-w-0">
                 <p
                   className="text-sm font-extrabold text-[#0F172A] truncate"
-                  title={clip.name}
+                  title={uploadedClip.label}
                 >
-                  {clip.name}
+                  {uploadedClip.label}
                 </p>
                 <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-[#334155] mt-0.5 font-mono-tabular">
-                  <span>{formatDuration(clip.durationSec)}</span>
+                  <span>{formatDuration(uploadedClip.durationSec)}</span>
                   <span aria-hidden="true">·</span>
                   <span>
-                    {clip.width > 0 && clip.height > 0
-                      ? `${clip.width}×${clip.height}`
-                      : 'Video'}
+                    {uploadedClip.width}×{uploadedClip.height}
                   </span>
                   <span aria-hidden="true">·</span>
-                  <span>{formatBytes(clip.sizeBytes)}</span>
+                  <span>{formatBytes(uploadedClip.sizeBytes)}</span>
                 </div>
               </div>
             </div>
@@ -210,7 +234,7 @@ export function VideoSourceCard({
                 type="button"
                 disabled={disabled}
                 onClick={() => {
-                  onClearClip();
+                  onClearSource();
                   onSourceTypeChange('link');
                 }}
                 aria-label="Remove local video file"

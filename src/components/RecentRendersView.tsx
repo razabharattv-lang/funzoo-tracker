@@ -45,7 +45,7 @@ export function RecentRendersView({
             No completed renders yet
           </h2>
           <p className="text-sm font-medium text-[#64748B] max-w-md mx-auto mt-1.5">
-            Paste a video link or upload a clip in the Studio Workspace to render your first viral explainer video directly in the browser.
+            Paste a video link or upload a clip in the Studio Workspace to render your first viral explainer video on your device GPU.
           </p>
           <button
             type="button"
@@ -58,43 +58,46 @@ export function RecentRendersView({
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {records.map((record) => {
-            const { manifest } = record;
-            const completedDate = manifest.completed_at
-              ? new Date(manifest.completed_at).toLocaleString()
+            const firstClip = record.clips[0];
+            if (!firstClip) return null;
+            const completedDate = record.completedAt
+              ? new Date(record.completedAt).toLocaleString()
               : '';
 
             return (
               <article
-                key={manifest.run_tag}
+                key={record.runTag}
                 className="rounded-2xl border-2 border-[#E2E8F0] bg-white p-4 flex flex-col justify-between gap-4 hover:border-[#3D5AFE] transition-colors"
               >
                 <div className="space-y-2.5">
                   <div className="flex items-start justify-between gap-2">
                     <h3 className="text-sm font-extrabold text-[#0F172A] leading-snug line-clamp-2">
-                      {manifest.title || record.sourceLabel}
+                      {firstClip.metadata.title || record.sourceLabel}
                     </h3>
                     <div className="flex items-center gap-1.5 shrink-0">
-                      {manifest.clips && manifest.clips.length > 1 && (
+                      {record.clips.length > 1 && (
                         <span className="px-2 py-0.5 rounded-full bg-[#3D5AFE] text-white text-[11px] font-extrabold whitespace-nowrap">
-                          {manifest.clips.length} Clips
+                          {record.clips.length} Clips
                         </span>
                       )}
                       <span className="px-2 py-0.5 rounded-full bg-[#00C853] text-white text-[11px] font-extrabold whitespace-nowrap">
-                        {manifest.language === 'hi' ? 'Hindi' : 'US EN'}
+                        {firstClip.language === 'hi' ? 'Hindi' : 'US EN'}
                       </span>
                     </div>
                   </div>
 
                   <p className="text-xs font-medium text-[#475569] line-clamp-2">
-                    {manifest.description}
+                    {firstClip.metadata.description}
                   </p>
 
                   <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-[#64748B] font-mono-tabular">
-                    <span>{formatDuration(manifest.duration_sec)}</span>
+                    <span>{formatDuration(firstClip.durationSec)}</span>
                     <span aria-hidden="true">·</span>
-                    <span>{formatBytes(manifest.file_size_bytes)}</span>
+                    <span>{formatBytes(firstClip.fileSizeBytes)}</span>
                     <span aria-hidden="true">·</span>
-                    <span>{manifest.voice_gender === 'male' ? 'Male' : 'Female'}</span>
+                    <span>
+                      {firstClip.voiceGender === 'male' ? 'Fenrir Male' : 'Kore Female'}
+                    </span>
                   </div>
 
                   {completedDate && (
@@ -115,8 +118,10 @@ export function RecentRendersView({
                   </button>
                   <button
                     type="button"
-                    onClick={() => onDeleteRecord(manifest.run_tag)}
-                    aria-label={`Remove ${manifest.title || manifest.run_tag}`}
+                    onClick={() => onDeleteRecord(record.runTag)}
+                    aria-label={`Remove ${
+                      firstClip.metadata.title || record.runTag
+                    }`}
                     className="p-2 rounded-lg border-2 border-[#E2E8F0] text-[#64748B] hover:border-[#FF1744] hover:text-[#FF1744] hover:bg-[#FFF1F3] transition-colors cursor-pointer"
                   >
                     <Trash2 className="w-4 h-4" strokeWidth={2.25} />

@@ -1,28 +1,6 @@
 import { extractVideoUrl } from '../lib/urlExtractor';
-import type { LocalClipInfo, SourceType, StudioConfig } from '../types/studio';
-
-export interface VideoSegmentPlan {
-  clipIndex: number;
-  startSec: number;
-  endSec: number;
-  reason: string;
-}
-
-export interface ResolvedSourceVideo {
-  blob: Blob;
-  objectUrl: string;
-  sourceLabel: string;
-  width: number;
-  height: number;
-  durationSec: number;
-  isLongVideoSplit: boolean;
-  segments: VideoSegmentPlan[];
-}
-
-interface ChapterMarker {
-  startSec: number;
-  title: string;
-}
+import { probeVideoBlobToSource } from '../lib/videoProbe';
+import type { SourceMediaItem, ViralSegment } from '../types/studio';
 
 const COBALT_NODES = [
   'https://api.cobalt.tools/',
@@ -36,6 +14,8 @@ const CORS_RELAYS: ((url: string) => string)[] = [
   (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
   (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
 ];
+
+export const SOCIAL_ENDCARD_TRIM_SEC = 2.6;
 
 function extractYouTubeVideoId(url: string): string | null {
   try {
@@ -59,101 +39,7 @@ function extractYouTubeVideoId(url: string): string | null {
   return null;
 }
 
-function parseChaptersFromDescription(description: string): ChapterMarker[] {
-  const markers: ChapterMarker[] = [];
-  const lines = (description || '').split(/\r?\n/);
-  for (const line of lines) {
-    const match = line.match(
-      /(?:^|\s)(\d{1,2}:)?(\d{1,2}):(\d{2})(?:\s*[-–—]?\s*(.*))?/
-    );
-    if (!match) continue;
-    const hrs = match[1] ? parseInt(match[1].replace(':', ''), 10) : 0;
-    const mins = parseInt(match[2], 10);
-    const secs = parseInt(match[3], 10);
-    if (Number.isNaN(hrs) || Number.isNaN(mins) || Number.isNaN(secs)) continue;
-    const total = hrs * 3600 + mins * 60 + secs;
-    const title =
-      (match[4] || '').trim().slice(0, 48) || `Chapter ${markers.length + 1}`;
-    markers.push({ startSec: total, title });
-  }
-  return markers.sort((a, b) => a.startSec - b.startSec);
-}
-
-async function fetchYouTubeChapters(
-  videoId: string,
-  youtubeApiKey: string,
-  signal?: AbortSignal
-): Promise<ChapterMarker[]> {
-  if (!youtubeApiKey) return [];
-  try {
-    const resp = await fetch(
-      `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${encodeURIComponent(
-        videoId
-      )}&key=${encodeURIComponent(youtubeApiKey)}`,
-      { signal }
-    );
-    if (!resp.ok) return [];
-    const data = (await resp.json()) as {
-      items?: { snippet?: { description?: string } }[];
-    };
-    const desc = data.items?.[0]?.snippet?.description ?? '';
-    return parseChaptersFromDescription(desc);
-  } catch {
-    return [];
-  }
-}
-
-export async function probeVideoBlob(blob: Blob): Promise<{
-  objectUrl: string;
-  width: number;
-  height: number;
-  durationSec: number;
-}> {
-  const objectUrl = URL.createObjectURL(blob);
-  try {
-    const meta = await new Promise<{
-      width: number;
-      height: number;
-      durationSec: number;
-    }>((resolve, reject) => {
-      const video = document.createElement('video');
-      video.preload = 'metadata';
-      video.muted = true;
-      video.playsInline = true;
-
-      const timer = window.setTimeout(() => {
-        video.removeAttribute('src');
-        reject(new Error('Timed out reading video metadata.'));
-      }, 18_000);
-
-      video.onloadedmetadata = () => {
-        window.clearTimeout(timer);
-        const dur =
-          Number.isFinite(video.duration) && video.duration > 0
-            ? video.duration
-            : 15;
-        resolve({
-          width: video.videoWidth || 1080,
-          height: video.videoHeight || 1920,
-          durationSec: dur,
-        });
-      };
-
-      video.onerror = () => {
-        window.clearTimeout(timer);
-        reject(new Error('Browser could not decode the fetched video stream.'));
-      };
-
-      video.src = objectUrl;
-    });
-    return { objectUrl, ...meta };
-  } catch (err) {
-    URL.revokeObjectURL(objectUrl);
-    throw err;
-  }
-}
-
-async function querySingleCobaltNode(
+async function queryCobaltNode(
   endpoint: string,
   cleanUrl: string,
   signal?: AbortSignal
@@ -188,7 +74,7 @@ async function querySingleCobaltNode(
       (item) => item.url && (!item.type || item.type === 'video')
     );
     if (videoPick?.url) return videoPick.url;
-    throw new Error('No playable URL');
+    throw new Error('No playable stream URL');
   } finally {
     window.clearTimeout(timer);
     signal?.removeEventListener('abort', onParentAbort);
@@ -200,12 +86,9 @@ async function raceCobaltNodes(
   signal?: AbortSignal
 ): Promise<string | null> {
   try {
-    const fastest = await Promise.any(
-      COBALT_NODES.map((endpoint) =>
-        querySingleCobaltNode(endpoint, cleanUrl, signal)
-      )
+    return await Promise.any(
+      COBALT_NODES.map((ep) => queryCobaltNode(ep, cleanUrl, signal))
     );
-    return fastest;
   } catch {
     if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
     return null;
@@ -236,20 +119,19 @@ async function resolveViaTikWM(
 async function resolveYouTubeViaPiped(
   videoId: string,
   signal?: AbortSignal
-): Promise<{ streamUrl: string | null; chapters: ChapterMarker[] }> {
+): Promise<string | null> {
   const pipedInstances = [
     'https://pipedapi.kavin.rocks',
     'https://pipedapi.adminforge.de',
     'https://api.piped.yt',
   ];
 
-  const attempt = async (host: string) => {
+  const attempt = async (host: string): Promise<string> => {
     const resp = await fetch(`${host}/streams/${encodeURIComponent(videoId)}`, {
       signal,
     });
     if (!resp.ok) throw new Error('Piped unavailable');
     const data = (await resp.json()) as {
-      chapters?: { start?: number; title?: string }[];
       videoStreams?: {
         url?: string;
         mimeType?: string;
@@ -257,13 +139,7 @@ async function resolveYouTubeViaPiped(
         height?: number;
       }[];
     };
-    const chapters: ChapterMarker[] = (data.chapters ?? [])
-      .filter((c) => typeof c.start === 'number')
-      .map((c) => ({
-        startSec: c.start as number,
-        title: c.title || 'Chapter Peak',
-      }));
-    const muxedStreams = (data.videoStreams ?? [])
+    const muxed = (data.videoStreams ?? [])
       .filter(
         (s) =>
           s.url &&
@@ -271,16 +147,15 @@ async function resolveYouTubeViaPiped(
           (s.mimeType || '').toLowerCase().includes('mp4')
       )
       .sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
-    const best = muxedStreams[0]?.url ?? null;
-    if (!best) throw new Error('No muxed stream');
-    return { streamUrl: best, chapters };
+    if (!muxed[0]?.url) throw new Error('No muxed MP4 stream');
+    return muxed[0].url;
   };
 
   try {
     return await Promise.any(pipedInstances.map(attempt));
   } catch {
     if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-    return { streamUrl: null, chapters: [] };
+    return null;
   }
 }
 
@@ -294,7 +169,7 @@ async function downloadVideoBlobWithRelayFallback(
     try {
       if (i > 0) {
         onStatus(
-          `Downloading MP4 stream via CORS relay (${i}/${CORS_RELAYS.length - 1})...`
+          `Fetching MP4 stream via CORS relay (${i}/${CORS_RELAYS.length - 1})...`
         );
       }
       const resp = await fetch(targetUrl, { signal });
@@ -320,162 +195,160 @@ async function downloadVideoBlobWithRelayFallback(
   return null;
 }
 
-export function buildViralSegmentPlans(
-  durationSec: number,
-  chapters: ChapterMarker[]
-): VideoSegmentPlan[] {
-  // Short video (<= 65s): trim slow intro/outro and extract peak main scene (20–40s)
-  if (durationSec <= 65) {
-    if (durationSec <= 22) {
+/**
+ * Computes usable duration after automatically trimming the final 2.6s creator
+ * end-card bumper on RedNote/Xiaohongshu, Douyin, TikTok, and Reels sources.
+ */
+export function getUsableSourceDuration(source: SourceMediaItem): {
+  usableDurationSec: number;
+  endCardTrimmedSec: number;
+} {
+  if (source.trimSocialEndCard && source.durationSec > 6.5) {
+    return {
+      usableDurationSec: Number(
+        Math.max(3.5, source.durationSec - SOCIAL_ENDCARD_TRIM_SEC).toFixed(2)
+      ),
+      endCardTrimmedSec: SOCIAL_ENDCARD_TRIM_SEC,
+    };
+  }
+  return {
+    usableDurationSec: source.durationSec,
+    endCardTrimmedSec: 0,
+  };
+}
+
+/**
+ * Builds deterministic fallback segments if Vision did not return custom viral windows.
+ * - Short (<= 65s): trims slow lead-in & social end-card into 1 peak main scene (20–40s).
+ * - Long (> 65s): slices 3–4 proportional viral segments (30s, 40s, 60s).
+ */
+export function buildDefaultViralSegments(
+  source: SourceMediaItem
+): ViralSegment[] {
+  const { usableDurationSec, endCardTrimmedSec } =
+    getUsableSourceDuration(source);
+  const zeroInsets = { top: 0, bottom: 0, left: 0, right: 0 };
+
+  const defaultBumperZones =
+    endCardTrimmedSec > 0
+      ? [
+          {
+            id: 'social_outro_bumper',
+            startSec: usableDurationSec,
+            endSec: source.durationSec,
+            box: [0, 0, 1000, 1000] as [number, number, number, number],
+            action: 'trim_bumper' as const,
+            label: `${source.platform} Creator Outro Bumper`,
+          },
+        ]
+      : [];
+
+  if (source.mode === 'short') {
+    if (usableDurationSec <= 24) {
       return [
         {
           clipIndex: 1,
           startSec: 0,
-          endSec: Number(durationSec.toFixed(2)),
-          reason: 'Short Video Main Scene',
+          endSec: usableDurationSec,
+          climaxSec: Number((usableDurationSec * 0.52).toFixed(2)),
+          reason: 'Short Explainer Main Scene',
+          trimRange: { startSec: 0, endSec: usableDurationSec },
+          safeCropInsets: { ...zeroInsets },
+          watermarkZones: [...defaultBumperZones],
         },
       ];
     }
-    if (durationSec <= 40) {
-      const trimLead = durationSec > 26 ? 1.0 : 0;
-      const trimTail = durationSec > 26 ? 1.0 : 0;
+    if (usableDurationSec <= 42) {
+      const startSec = usableDurationSec > 28 ? 0.8 : 0;
+      const endSec = usableDurationSec;
       return [
         {
           clipIndex: 1,
-          startSec: trimLead,
-          endSec: Number((durationSec - trimTail).toFixed(2)),
-          reason: 'Trimmed Main Action Scene (20–40s)',
+          startSec,
+          endSec,
+          climaxSec: Number(((endSec - startSec) * 0.52).toFixed(2)),
+          reason: 'Trimmed Main Action Scene',
+          trimRange: { startSec, endSec },
+          safeCropInsets: { ...zeroInsets },
+          watermarkZones: [...defaultBumperZones],
         },
       ];
     }
     const clipLen = 36;
     const startSec = Number(
-      Math.max(0, (durationSec - clipLen) * 0.35).toFixed(2)
+      Math.max(0, (usableDurationSec - clipLen) * 0.35).toFixed(2)
     );
+    const endSec = Number(Math.min(usableDurationSec, startSec + clipLen).toFixed(2));
     return [
       {
         clipIndex: 1,
         startSec,
-        endSec: Number(Math.min(durationSec, startSec + clipLen).toFixed(2)),
-        reason: 'Auto-Extracted Main Scene (36s)',
+        endSec,
+        climaxSec: Number(((endSec - startSec) * 0.52).toFixed(2)),
+        reason: 'Peak 36s Action Scene',
+        trimRange: { startSec, endSec },
+        safeCropInsets: { ...zeroInsets },
+        watermarkZones: [...defaultBumperZones],
       },
     ];
   }
 
-  // Long video (> 65s): slice top 3 viral segments (30s, 40s, 60s)
-  const targetLengths =
-    durationSec >= 140
+  // Long video (> 65s): proportional 30s / 40s / 60s windows
+  const lengths =
+    usableDurationSec >= 300
+      ? [30, 40, 60, 40]
+      : usableDurationSec >= 150
       ? [30, 40, 60]
       : [
-          Math.max(20, Math.floor((durationSec - 6) * 0.25)),
-          Math.max(22, Math.floor((durationSec - 6) * 0.32)),
-          Math.max(24, Math.floor((durationSec - 6) * 0.38)),
+          Math.max(20, Math.floor((usableDurationSec - 6) * 0.25)),
+          Math.max(22, Math.floor((usableDurationSec - 6) * 0.32)),
+          Math.max(24, Math.floor((usableDurationSec - 6) * 0.38)),
         ];
 
-  const segments: VideoSegmentPlan[] = [];
-  const validChapters = chapters.filter(
-    (c) => c.startSec >= 0 && c.startSec < durationSec - 20
-  );
+  const fractions =
+    lengths.length === 4 ? [0.1, 0.34, 0.58, 0.8] : [0.1, 0.45, 0.74];
+  const labels = [
+    'Opening Tension Spike',
+    'Mid-Story Climax Twist',
+    'High-Stakes Deep Reveal',
+    'Finale Payoff Moment',
+  ];
 
-  const overlaps = (s: number, e: number) =>
-    segments.some((seg) => !(e <= seg.startSec + 1 || s >= seg.endSec - 1));
-
-  const preferredAnchors: { start: number; reason: string }[] = [];
-  if (validChapters.length >= 3) {
-    const picks = [
-      validChapters[Math.min(1, validChapters.length - 1)],
-      validChapters[Math.floor(validChapters.length * 0.5)],
-      validChapters[Math.max(0, validChapters.length - 2)],
-    ];
-    for (const ch of picks) {
-      preferredAnchors.push({
-        start: ch.startSec,
-        reason: `Chapter Highlight: ${ch.title}`,
+  const segments: ViralSegment[] = [];
+  for (let i = 0; i < lengths.length; i++) {
+    const len = lengths[i];
+    const startSec = Number(
+      Math.max(
+        0,
+        Math.min(usableDurationSec - len, usableDurationSec * fractions[i])
+      ).toFixed(2)
+    );
+    const endSec = Number(Math.min(usableDurationSec, startSec + len).toFixed(2));
+    if (endSec - startSec >= 15) {
+      segments.push({
+        clipIndex: segments.length + 1,
+        startSec,
+        endSec,
+        climaxSec: Number(((endSec - startSec) * 0.52).toFixed(2)),
+        reason: `${labels[i] || `Viral Highlight #${i + 1}`} (${Math.round(
+          endSec - startSec
+        )}s)`,
+        trimRange: { startSec, endSec },
+        safeCropInsets: { ...zeroInsets },
+        watermarkZones: [],
       });
     }
   }
-
-  preferredAnchors.push(
-    { start: Math.min(12, durationSec * 0.08), reason: 'Opening Hook Spike' },
-    { start: durationSec * 0.44, reason: 'Mid-Video Climax Spike' },
-    { start: Math.max(0, durationSec * 0.72), reason: 'Finale Reveal Spike' }
-  );
-
-  for (let i = 0; i < targetLengths.length; i++) {
-    const len = targetLengths[i];
-    let placed = false;
-
-    for (const anchor of preferredAnchors) {
-      const startSec = Math.max(0, Math.min(durationSec - len, anchor.start));
-      const endSec = Math.min(durationSec, startSec + len);
-      if (endSec - startSec >= 18 && !overlaps(startSec, endSec)) {
-        segments.push({
-          clipIndex: segments.length + 1,
-          startSec: Number(startSec.toFixed(2)),
-          endSec: Number(endSec.toFixed(2)),
-          reason: `${anchor.reason} (${Math.round(endSec - startSec)}s)`,
-        });
-        placed = true;
-        break;
-      }
-    }
-
-    if (!placed) {
-      const fallbackStart = Math.max(
-        0,
-        Math.min(durationSec - len, (durationSec / targetLengths.length) * i)
-      );
-      const fallbackEnd = Math.min(durationSec, fallbackStart + len);
-      if (
-        !overlaps(fallbackStart, fallbackEnd) &&
-        fallbackEnd - fallbackStart >= 15
-      ) {
-        segments.push({
-          clipIndex: segments.length + 1,
-          startSec: Number(fallbackStart.toFixed(2)),
-          endSec: Number(fallbackEnd.toFixed(2)),
-          reason: `Viral Segment #${i + 1} (${Math.round(
-            fallbackEnd - fallbackStart
-          )}s)`,
-        });
-      }
-    }
-  }
-
-  segments.sort((a, b) => a.startSec - b.startSec);
-  return segments.map((seg, idx) => ({ ...seg, clipIndex: idx + 1 }));
+  return segments;
 }
 
-export async function resolveSourceStream(params: {
-  sourceType: SourceType;
-  videoUrl: string;
-  localClip: LocalClipInfo | null;
-  config: StudioConfig;
+export async function resolveLinkToSourceMedia(params: {
+  rawInput: string;
   onStatus: (msg: string) => void;
   signal?: AbortSignal;
-}): Promise<ResolvedSourceVideo> {
-  const { sourceType, videoUrl, localClip, config, onStatus, signal } = params;
-
-  if (sourceType === 'upload') {
-    if (!localClip) {
-      throw new Error('Select a local MP4, MOV, or WebM video file first.');
-    }
-    onStatus('Reading local video file metadata...');
-    const probed = await probeVideoBlob(localClip.file);
-    const segments = buildViralSegmentPlans(probed.durationSec, []);
-    return {
-      blob: localClip.file,
-      objectUrl: probed.objectUrl,
-      sourceLabel: localClip.name,
-      width: probed.width,
-      height: probed.height,
-      durationSec: probed.durationSec,
-      isLongVideoSplit: probed.durationSec > 65,
-      segments,
-    };
-  }
-
-  const extracted = extractVideoUrl(videoUrl);
+}): Promise<SourceMediaItem> {
+  const { rawInput, onStatus, signal } = params;
+  const extracted = extractVideoUrl(rawInput);
   if (!extracted) {
     throw new Error(
       'Paste a valid http:// or https:// video link or social share-text.'
@@ -484,23 +357,18 @@ export async function resolveSourceStream(params: {
 
   const cleanUrl = extracted.cleanUrl;
   onStatus(
-    `Sanitized ${extracted.platform} URL. Racing parallel no-watermark stream nodes...`
+    `Sanitized ${extracted.platform} link. Racing parallel no-watermark stream nodes...`
   );
 
-  let chapters: ChapterMarker[] = [];
-  const ytId = extractYouTubeVideoId(cleanUrl);
-  const chaptersPromise = ytId
-    ? fetchYouTubeChapters(ytId, config.youtubeApiKey, signal)
-    : Promise.resolve<ChapterMarker[]>([]);
-
   let candidateStreamUrl: string | null = null;
+  const ytId = extractYouTubeVideoId(cleanUrl);
 
   if (/\.(mp4|webm|mov)(\?|$)/i.test(cleanUrl)) {
     candidateStreamUrl = cleanUrl;
   }
 
   if (!candidateStreamUrl && cleanUrl.toLowerCase().includes('tiktok')) {
-    onStatus('Resolving no-watermark HD TikTok stream...');
+    onStatus('Fetching no-watermark HD TikTok stream...');
     candidateStreamUrl = await resolveViaTikWM(cleanUrl, signal);
   }
 
@@ -509,18 +377,13 @@ export async function resolveSourceStream(params: {
   }
 
   if (!candidateStreamUrl && ytId) {
-    onStatus('Checking parallel YouTube stream resolvers...');
-    const piped = await resolveYouTubeViaPiped(ytId, signal);
-    if (piped.chapters.length > 0) chapters = piped.chapters;
-    candidateStreamUrl = piped.streamUrl;
+    onStatus('Checking parallel YouTube MP4 resolvers...');
+    candidateStreamUrl = await resolveYouTubeViaPiped(ytId, signal);
   }
-
-  const ytChapters = await chaptersPromise;
-  if (ytChapters.length > 0) chapters = ytChapters;
 
   if (!candidateStreamUrl) {
     throw new Error(
-      `Could not extract a direct no-watermark MP4 stream from ${extracted.platform} in the browser (CORS or login wall). Drop the saved video into "Or Upload Local File" to render instantly.`
+      `Could not extract a direct no-watermark MP4 from ${extracted.platform} inside the browser (CORS or login wall). Drop the saved video into "Or Upload Local File" to preview & render immediately.`
     );
   }
 
@@ -533,22 +396,15 @@ export async function resolveSourceStream(params: {
 
   if (!blob) {
     throw new Error(
-      `${extracted.platform} blocked browser stream download. Save the clip and drop it into "Or Upload Local File" for instant hardware rendering.`
+      `${extracted.platform} blocked browser stream download. Drop the saved clip into "Or Upload Local File" for instant hardware GPU rendering.`
     );
   }
 
-  onStatus('Inspecting duration & slicing peak viral segments...');
-  const probed = await probeVideoBlob(blob);
-  const segments = buildViralSegmentPlans(probed.durationSec, chapters);
-
-  return {
+  onStatus('Inspecting video dimensions & mode...');
+  return probeVideoBlobToSource({
     blob,
-    objectUrl: probed.objectUrl,
-    sourceLabel: cleanUrl,
-    width: probed.width,
-    height: probed.height,
-    durationSec: probed.durationSec,
-    isLongVideoSplit: probed.durationSec > 65,
-    segments,
-  };
+    sourceType: 'link',
+    label: cleanUrl,
+    platform: extracted.platform,
+  });
 }

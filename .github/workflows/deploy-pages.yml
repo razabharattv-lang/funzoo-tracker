@@ -35,6 +35,9 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
+      - name: Strict Type Check (tsc --noEmit)
+        run: npm run lint
+
       - name: Build Production Bundle
         env:
           VITE_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

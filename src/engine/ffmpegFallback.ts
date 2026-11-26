@@ -1,6 +1,12 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
-import type { OutputLanguage } from '../types/studio';
+import type {
+  OutputLanguage,
+  SafeCropInsets,
+  ScriptBeat,
+  TrimRange,
+  WatermarkZone,
+} from '../types/studio';
 import {
   encodeFloat32ToWavBytes,
   type ProcessedStudioAudio,
@@ -20,12 +26,16 @@ export interface FallbackRenderOptions {
   sourceHeight: number;
   targetWidth: number;
   targetHeight: number;
-  startSec: number;
-  endSec: number;
+  targetFps: number;
+  trimRange: TrimRange;
+  safeCropInsets: SafeCropInsets;
+  watermarkZones: WatermarkZone[];
+  bumperTrimmedSec: number;
+  lockedDurationSec: number;
   audio: ProcessedStudioAudio;
   scriptText: string;
+  beats: ScriptBeat[];
   language: OutputLanguage;
-  watermarkBoxes: number[][];
   climaxSecond: number;
   characterEnabled: boolean;
   characterPortraitUrl: string;
@@ -41,7 +51,10 @@ export interface FallbackRenderResult {
   durationSec: number;
   width: number;
   height: number;
+  fps: number;
   delogoCount: number;
+  bumperTrimmedSec: number;
+  safeCropApplied: boolean;
   characterMode: string;
   renderEngine: string;
 }
@@ -80,25 +93,29 @@ async function getLazyFFmpeg(onStatus: (msg: string) => void): Promise<FFmpeg> {
   throw new Error(`FFmpeg.wasm fallback load failed: ${lastErr}`);
 }
 
-function buildDelogoFilters(
-  boxes: number[][],
+function buildTimeWindowedDelogoFilters(
+  zones: WatermarkZone[],
   srcW: number,
-  srcH: number
+  srcH: number,
+  clipStartSec: number
 ): string[] {
   const filters: string[] = [];
-  for (const box of (boxes || []).slice(0, 6)) {
-    if (!Array.isArray(box) || box.length !== 4) continue;
-    const [ymin, xmin, ymax, xmax] = box.map((v) => Number(v));
+  for (const z of (zones || []).filter((x) => x.action === 'gpu_delogo_patch').slice(0, 8)) {
+    const [ymin, xmin, ymax, xmax] = z.box.map((v) => Number(v));
     if ([ymin, xmin, ymax, xmax].some((v) => !Number.isFinite(v))) continue;
     const scale = Math.max(ymin, xmin, ymax, xmax) > 1.5 ? 1000 : 1;
-    const x = Math.max(2, Math.floor((xmin / scale) * srcW) - 4);
-    const y = Math.max(2, Math.floor((ymin / scale) * srcH) - 4);
-    let w = Math.floor(((xmax - xmin) / scale) * srcW) + 8;
-    let h = Math.floor(((ymax - ymin) / scale) * srcH) + 8;
+    const x = Math.max(2, Math.floor((xmin / scale) * srcW) - 8);
+    const y = Math.max(2, Math.floor((ymin / scale) * srcH) - 8);
+    let w = Math.floor(((xmax - xmin) / scale) * srcW) + 16;
+    let h = Math.floor(((ymax - ymin) / scale) * srcH) + 16;
     w = Math.max(8, Math.min(w, srcW - x - 2));
     h = Math.max(8, Math.min(h, srcH - y - 2));
     if (w >= 10 && h >= 10 && w < srcW * 0.75 && h < srcH * 0.5) {
-      filters.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}`);
+      const relStart = Math.max(0, z.startSec - clipStartSec).toFixed(2);
+      const relEnd = Math.max(0.2, z.endSec - clipStartSec).toFixed(2);
+      filters.push(
+        `delogo=x=${x}:y=${y}:w=${w}:h=${h}:enable='between(t,${relStart},${relEnd})'`
+      );
     }
   }
   return filters;
@@ -121,12 +138,16 @@ export async function renderWithLazyFFmpegFallback(
     sourceHeight,
     targetWidth,
     targetHeight,
-    startSec,
-    endSec,
+    targetFps,
+    trimRange,
+    safeCropInsets,
+    watermarkZones,
+    bumperTrimmedSec,
+    lockedDurationSec,
     audio,
     scriptText,
+    beats,
     language,
-    watermarkBoxes,
     climaxSecond,
     characterEnabled,
     characterPortraitUrl,
@@ -158,12 +179,8 @@ export async function renderWithLazyFFmpegFallback(
     }
   }
 
-  const clipSourceDur = Math.max(3, endSec - startSec);
-  const finalDurationSec = Math.max(
-    4.0,
-    Math.min(Math.max(audio.durationSec + 0.15, clipSourceDur / 1.03), 60.0)
-  );
-
+  const startSec = Math.max(0, trimRange.startSec);
+  const clipSourceDur = Math.max(3, trimRange.endSec - startSec);
   const tempFiles = [
     'input.mp4',
     'vo_master.wav',
@@ -173,28 +190,54 @@ export async function renderWithLazyFFmpegFallback(
   ];
   for (const f of tempFiles) await safeDelete(ffmpeg, f);
 
-  const wavBytes = encodeFloat32ToWavBytes(audio.pcmMono, audio.sampleRate);
+  const paddedSamples = Math.ceil(lockedDurationSec * audio.sampleRate);
+  const paddedPcm = new Float32Array(paddedSamples);
+  paddedPcm.set(
+    audio.pcmMono.subarray(0, Math.min(paddedSamples, audio.pcmMono.length)),
+    0
+  );
+
+  const wavBytes = encodeFloat32ToWavBytes(paddedPcm, audio.sampleRate);
   await ffmpeg.writeFile('input.mp4', await fetchFile(sourceVideoBlob));
   await ffmpeg.writeFile('vo_master.wav', wavBytes);
   onProgressPct(25);
 
-  const delogoFilters = buildDelogoFilters(
-    watermarkBoxes,
+  const delogoFilters = buildTimeWindowedDelogoFilters(
+    watermarkZones,
     sourceWidth,
-    sourceHeight
+    sourceHeight,
+    startSec
   );
-  const cropW = Math.round(targetWidth * 1.15);
-  const cropH = Math.round(targetHeight * 1.15);
+
+  const leftPx = Math.round(
+    sourceWidth * Math.max(0, Math.min(0.14, safeCropInsets.left))
+  );
+  const rightPx = Math.round(
+    sourceWidth * Math.max(0, Math.min(0.14, safeCropInsets.right))
+  );
+  const topPx = Math.round(
+    sourceHeight * Math.max(0, Math.min(0.14, safeCropInsets.top))
+  );
+  const bottomPx = Math.round(
+    sourceHeight * Math.max(0, Math.min(0.14, safeCropInsets.bottom))
+  );
+  const safeW = Math.max(64, sourceWidth - leftPx - rightPx);
+  const safeH = Math.max(64, sourceHeight - topPx - bottomPx);
+  const safeCropApplied = leftPx > 0 || rightPx > 0 || topPx > 0 || bottomPx > 0;
 
   const vFilters = [
     ...delogoFilters,
-    'setpts=PTS/1.03',
-    `scale=${cropW}:${cropH}:force_original_aspect_ratio=increase`,
+    ...(safeCropApplied
+      ? [`crop=${safeW}:${safeH}:${leftPx}:${topPx}`]
+      : []),
+    `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=increase`,
     `crop=${targetWidth}:${targetHeight}`,
-    'eq=contrast=1.14:saturation=1.32:brightness=0.02:gamma=1.04',
+    'eq=contrast=1.22:saturation=1.36:brightness=0.03',
   ];
 
-  onStatus('FFmpeg.wasm fallback pass 1: delogo, crop & color grade...');
+  onStatus(
+    'FFmpeg.wasm fallback pass 1: time-windowed delogo, subject-safe crop & cinema grade...'
+  );
   await ffmpeg.exec([
     '-y',
     '-ss',
@@ -207,7 +250,7 @@ export async function renderWithLazyFFmpegFallback(
     vFilters.join(','),
     '-an',
     '-r',
-    '30',
+    String(targetFps),
     '-c:v',
     'libx264',
     '-preset',
@@ -222,7 +265,6 @@ export async function renderWithLazyFFmpegFallback(
   ]);
   onProgressPct(55);
 
-  // Optional Canvas 2D overlay pass for captions + character pop-ins
   let compositedWebM: Blob | null = null;
   if (typeof MediaRecorder !== 'undefined') {
     const chosenMime = ['video/webm;codecs=vp8', 'video/webm'].find((m) =>
@@ -250,15 +292,16 @@ export async function renderWithLazyFFmpegFallback(
             video.onerror = () => rej(new Error('Base video decode failed'));
           });
           const schedule = buildCharacterPopInSchedule(
-            climaxSecond / 1.03,
-            finalDurationSec
+            climaxSecond,
+            lockedDurationSec
           );
           const chunks = buildCaptionChunks(
             scriptText,
-            finalDurationSec,
-            language
+            lockedDurationSec,
+            language,
+            beats
           );
-          const stream = canvas.captureStream(30);
+          const stream = canvas.captureStream(targetFps);
           const recorder = new MediaRecorder(stream, {
             mimeType: chosenMime,
             videoBitsPerSecond: targetWidth >= 1000 ? 4_500_000 : 3_200_000,
@@ -271,11 +314,11 @@ export async function renderWithLazyFFmpegFallback(
             recorder.onstop = () => res(new Blob(parts, { type: chosenMime }));
           });
 
-          onStatus('Compositing kinetic captions & character pop-ins...');
+          onStatus('Compositing beat-synced captions & character pop-ins...');
           await video.play();
           recorder.start(250);
           const startPerf = performance.now();
-          const totalMs = finalDurationSec * 1000;
+          const totalMs = lockedDurationSec * 1000;
 
           await new Promise<void>((res, rej) => {
             const tick = () => {
@@ -290,7 +333,8 @@ export async function renderWithLazyFFmpegFallback(
               }
               const elapsed = performance.now() - startPerf;
               const t = elapsed / 1000;
-              const zoom = 1.0 + 0.05 * Math.abs(Math.sin(t * 0.65));
+              // Subtle 1.02x -> 1.06x micro-zoom
+              const zoom = 1.02 + 0.04 * Math.abs(Math.sin(t * 0.58));
               const dw = targetWidth * zoom;
               const dh = targetHeight * zoom;
               ctx.fillStyle = '#000';
@@ -362,7 +406,7 @@ export async function renderWithLazyFFmpegFallback(
       '-map',
       '1:a:0',
       '-t',
-      finalDurationSec.toFixed(2),
+      lockedDurationSec.toFixed(2),
       '-c:v',
       'libx264',
       '-preset',
@@ -395,7 +439,7 @@ export async function renderWithLazyFFmpegFallback(
       '-map',
       '1:a:0',
       '-t',
-      finalDurationSec.toFixed(2),
+      lockedDurationSec.toFixed(2),
       '-c:v',
       'copy',
       '-c:a',
@@ -421,11 +465,14 @@ export async function renderWithLazyFFmpegFallback(
     blob: finalBlob,
     blobUrl,
     sizeBytes: finalBlob.size,
-    durationSec: Number(finalDurationSec.toFixed(2)),
+    durationSec: Number(lockedDurationSec.toFixed(2)),
     width: targetWidth,
     height: targetHeight,
+    fps: targetFps,
     delogoCount: delogoFilters.length,
+    bumperTrimmedSec,
+    safeCropApplied,
     characterMode,
-    renderEngine: `FFmpeg.wasm Fallback (${targetWidth}×${targetHeight})`,
+    renderEngine: `FFmpeg.wasm Fallback (${targetWidth}×${targetHeight} @ ${targetFps}fps)`,
   };
 }

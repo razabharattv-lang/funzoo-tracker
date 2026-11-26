@@ -1,4 +1,4 @@
-import type { OutputLanguage } from '../types/studio';
+import type { OutputLanguage, ScriptBeat } from '../types/studio';
 
 export interface CaptionChunk {
   words: string[];
@@ -7,19 +7,17 @@ export interface CaptionChunk {
   accentColor: string;
 }
 
-export function buildCaptionChunks(
-  scriptText: string,
-  totalDurationSec: number,
+function splitTextToWordGroups(
+  text: string,
   language: OutputLanguage
-): CaptionChunk[] {
-  const cleaned = scriptText
+): string[][] {
+  const cleaned = text
     .replace(/["“”\n\r]+/g, ' ')
     .trim()
     .split(/\s+/)
     .filter(Boolean);
 
   if (cleaned.length === 0) return [];
-
   const formatted =
     language === 'hi' ? cleaned : cleaned.map((w) => w.toUpperCase());
 
@@ -27,8 +25,53 @@ export function buildCaptionChunks(
   for (let i = 0; i < formatted.length; i += 3) {
     groups.push(formatted.slice(i, i + 3));
   }
+  return groups;
+}
 
-  const step = totalDurationSec / Math.max(groups.length, 1);
+/**
+ * Builds kinetic CapCut-style caption chunks strictly synced to chronological
+ * ScriptBeat timestamps when available (falling back to even distribution).
+ */
+export function buildCaptionChunks(
+  scriptText: string,
+  totalDurationSec: number,
+  language: OutputLanguage,
+  beats?: ScriptBeat[]
+): CaptionChunk[] {
+  if (Array.isArray(beats) && beats.length > 0) {
+    const chunks: CaptionChunk[] = [];
+    let colorIdx = 0;
+
+    for (const beat of beats) {
+      const groups = splitTextToWordGroups(beat.text, language);
+      if (groups.length === 0) continue;
+
+      const bStart = Math.max(0, Math.min(totalDurationSec - 0.1, beat.startSec));
+      const bEnd = Math.max(
+        bStart + 0.25,
+        Math.min(totalDurationSec, beat.endSec)
+      );
+      const step = (bEnd - bStart) / groups.length;
+
+      for (let g = 0; g < groups.length; g++) {
+        chunks.push({
+          words: groups[g],
+          startSec: bStart + g * step,
+          endSec: Math.min(bEnd, bStart + (g + 1) * step),
+          accentColor: colorIdx % 2 === 0 ? '#FFAB00' : '#00E5FF',
+        });
+        colorIdx++;
+      }
+    }
+
+    if (chunks.length > 0) return chunks;
+  }
+
+  const groups = splitTextToWordGroups(scriptText, language);
+  if (groups.length === 0) return [];
+
+  const usableDur = Math.max(1, totalDurationSec - 0.35);
+  const step = usableDur / groups.length;
   return groups.map((words, idx) => ({
     words,
     startSec: idx * step,
