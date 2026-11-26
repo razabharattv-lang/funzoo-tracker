@@ -2,10 +2,28 @@ export interface ExtractedVideoLink {
   cleanUrl: string;
   platform: string;
   wasExtractedFromText: boolean;
+  isYouTube: boolean;
 }
+
+export const YOUTUBE_DIRECT_FETCH_BLOCKED_MSG =
+  'Direct browser video fetching is blocked for YouTube URLs without a backend downloader/proxy. Download the video to your device and upload it via Choose Video File (MP4, MOV, WebM) so Steps 1–5 can run cleanly.';
 
 const URL_REGEX = /https?:\/\/[^\s]+/i;
 const TRAILING_PUNCT_REGEX = /[.,;!?)"'】》」』，。！？、]+$/;
+
+export function isYouTubeUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === 'youtube.com' ||
+      host.endsWith('.youtube.com') ||
+      host === 'youtu.be' ||
+      host.endsWith('.youtu.be')
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function detectVideoPlatform(url: string): string {
   const lower = url.toLowerCase();
@@ -63,5 +81,6 @@ export function extractVideoUrl(rawInput: string): ExtractedVideoLink | null {
     cleanUrl,
     platform: detectVideoPlatform(cleanUrl),
     wasExtractedFromText: cleanUrl !== trimmed,
+    isYouTube: isYouTubeUrl(cleanUrl),
   };
 }

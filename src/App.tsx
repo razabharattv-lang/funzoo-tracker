@@ -7,7 +7,10 @@ import { CloudProgressBar } from './components/CloudProgressBar';
 import { OutputDeckCard } from './components/OutputDeckCard';
 import { RecentRendersView } from './components/RecentRendersView';
 import { probeVideoBlobToSource } from './lib/videoProbe';
-import { extractVideoUrl } from './lib/urlExtractor';
+import {
+  extractVideoUrl,
+  YOUTUBE_DIRECT_FETCH_BLOCKED_MSG,
+} from './lib/urlExtractor';
 import {
   deleteRenderRecord,
   loadSavedRenders,
@@ -182,6 +185,11 @@ export function App() {
     const extracted = extractVideoUrl(controls.videoUrl);
     if (!extracted) {
       setSourceError('Paste a valid http:// or https:// video link first.');
+      return;
+    }
+    if (extracted.isYouTube) {
+      replaceSourceMedia(null);
+      setSourceError(YOUTUBE_DIRECT_FETCH_BLOCKED_MSG);
       return;
     }
 
@@ -493,9 +501,10 @@ export function App() {
   ]);
 
   const isRendering = progress.status === 'running';
+  const extractedLink =
+    controls.sourceType === 'link' ? extractVideoUrl(controls.videoUrl) : null;
   const canRun =
-    Boolean(sourceMedia) ||
-    (controls.sourceType === 'link' && Boolean(extractVideoUrl(controls.videoUrl)));
+    Boolean(sourceMedia) || Boolean(extractedLink && !extractedLink.isYouTube);
 
   return (
     <div className="min-h-screen bg-[#F4F6F9] text-[#0F172A] flex flex-col">
@@ -529,7 +538,12 @@ export function App() {
                   setControls((prev) => ({ ...prev, sourceType }))
                 }
                 onVideoUrlChange={(videoUrl) => {
-                  setSourceError(null);
+                  const nextExtracted = extractVideoUrl(videoUrl);
+                  setSourceError(
+                    nextExtracted?.isYouTube
+                      ? YOUTUBE_DIRECT_FETCH_BLOCKED_MSG
+                      : null
+                  );
                   if (sourceMedia?.sourceType === 'link') {
                     replaceSourceMedia(null);
                   }

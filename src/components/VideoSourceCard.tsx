@@ -45,7 +45,7 @@ export function VideoSourceCard({
   const [isDragging, setIsDragging] = useState(false);
 
   const extracted = extractVideoUrl(videoUrl);
-  const hasValidLink = Boolean(extracted);
+  const hasValidLink = Boolean(extracted && !extracted.isYouTube);
   const isReady = sourceType === 'link' ? hasValidLink : Boolean(sourceMedia);
   const uploadedClip =
     sourceMedia && sourceMedia.sourceType === 'upload' ? sourceMedia : null;
@@ -124,7 +124,7 @@ export function VideoSourceCard({
             )}
           </div>
 
-          {sourceType === 'link' && extracted && (
+          {sourceType === 'link' && extracted && !extracted.isYouTube && (
             <div className="mt-2.5 rounded-lg border-2 border-[#3D5AFE] bg-white px-3 py-2 flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-0 flex-1">
                 <p className="text-[11px] font-extrabold text-[#3D5AFE]">

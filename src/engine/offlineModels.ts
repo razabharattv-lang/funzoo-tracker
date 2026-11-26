@@ -493,10 +493,23 @@ export async function analyzeVideoTimelineLocally(
   };
 }
 
+let fallbackScriptRunCounter = 0;
+let lastUsedFallbackVariant = -1;
+
+function pickNonRepeatingVariant(seed: number, poolLength: number): number {
+  if (poolLength <= 1) return 0;
+  let idx = Math.abs(seed) % poolLength;
+  if (idx === lastUsedFallbackVariant) {
+    idx = (idx + 1) % poolLength;
+  }
+  lastUsedFallbackVariant = idx;
+  return idx;
+}
+
 /**
- * Clean, natural, duration-calibrated local fallback when cloud AI is blocked or offline.
- * NEVER speaks raw camera/numeric filenames (like `1000179945`) and matches exact clip
- * duration (e.g., 17s -> ~34-38 punchy words finishing cleanly before 16.5s).
+ * Clean, dynamic, duration-calibrated local fallback when cloud AI is blocked or offline.
+ * Varies phrasing across runs using clip duration, framing, pacing, lighting, and language
+ * so consecutive videos NEVER receive the same canned script or raw camera IDs.
  */
 export function generateOfflineDirectTranslationAndMetadata(params: {
   clip: PreparedVisualClip;
@@ -508,13 +521,28 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
 }): TrendMetadata {
   const { clip, sourceLabel, language, customAngle, trends, fallbackReason } = params;
   const dur = Math.max(4, clip.lockedVisualDurationSec);
+  const roundedDur = Math.round(dur);
   const safeSpeechEnd = Math.max(2.5, dur - 0.35);
 
   const readableTopic = extractReadableTopicFromLabel(sourceLabel, customAngle);
   const visual = clip.visualSummary;
   const climaxSecRounded = Math.max(1, Math.round(clip.climaxSec));
+  const sceneCuts = visual?.sceneCutCount ?? 0;
   const isFast = visual?.pacing === 'fast-cut';
-  const formatWord = visual?.orientation === 'landscape' ? 'widescreen' : 'vertical';
+  const isSteady = visual?.pacing === 'steady';
+  const orientation = visual?.orientation ?? 'vertical';
+  const formatWord =
+    orientation === 'landscape'
+      ? 'widescreen'
+      : orientation === 'square'
+      ? 'square'
+      : 'vertical';
+  const lightingNote =
+    visual?.lighting === 'bright'
+      ? 'bright, crisp'
+      : visual?.lighting === 'high-contrast'
+      ? 'high-contrast'
+      : 'cinematic';
 
   // Mine live YouTube Data API v3 tags, keywords, and upload-hour signals when available
   const liveTrendTags: string[] = [];
@@ -536,7 +564,7 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
       .split(/\s+/)
       .slice(0, 3)
       .join(' ') ||
-    'Breakdown';
+    'Spotlight';
 
   // Derive EST/IST peak window from real YouTube top-video publish hours when available
   const formatHour12 = (hour24: number): string => {
@@ -560,40 +588,155 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
     liveUploadWindow = `YouTube Trend Peak (${trends.length} live videos): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`;
   }
 
-  // Calibrate number of sentences strictly to clip duration (~2.15 words/sec)
+  // Compute non-repeating variant seed from clip metrics + session counter
+  fallbackScriptRunCounter += 1;
+  let labelHash = 0;
+  for (let i = 0; i < sourceLabel.length; i++) {
+    labelHash = (labelHash * 31 + sourceLabel.charCodeAt(i)) | 0;
+  }
+  const variantSeed =
+    Math.abs(labelHash) +
+    roundedDur * 7 +
+    climaxSecRounded * 13 +
+    clip.clipIndex * 17 +
+    sceneCuts * 5 +
+    fallbackScriptRunCounter * 23;
+
+  // Combinatoric suspense/twist composer (Hook × Escalation × Twist × Payoff = 100+ unique stories)
   const sentenceCount = dur <= 10 ? 2 : dur <= 22 ? 3 : 4;
+  const pickFrom = (pool: string[], salt: number): string => {
+    const idx = Math.abs(variantSeed + salt * 37 + fallbackScriptRunCounter * 11) % pool.length;
+    return pool[idx];
+  };
 
   let chosenLines: string[];
+  let titleVariant = '';
+
   if (language === 'hi') {
-    const hiPool = readableTopic
+    const subjectHi = readableTopic ? `${readableTopic}` : 'यह दृश्य';
+    const paceCueHi = isFast
+      ? 'तेज़ी से बदलते इन शॉट्स के बीच'
+      : isSteady
+      ? 'इस शांत दिखने वाले पल के ठीक पीछे'
+      : 'इन लगातार आगे बढ़ते फ्रेम्स के बीच';
+    const cutCueHi =
+      sceneCuts >= 2
+        ? `${sceneCuts} अचानक कट्स के ठीक बाद`
+        : `${climaxSecRounded} सेकंड पूरे होते ही`;
+
+    const hiHooks = [
+      `पहली नज़र में ${subjectHi} बिल्कुल सामान्य लगता है, लेकिन अगले कुछ सेकंड सब कुछ पलट देने वाले हैं।`,
+      `ज़्यादातर लोग पहले दो सेकंड में ही हार मान लेते हैं, पर ${subjectHi} का असली खेल अभी शुरू हुआ है।`,
+      `ज़रा रुकिए, क्योंकि ${roundedDur} सेकंड के इस क्लिप में जो होने वाला है उसका अंदाज़ा किसी को नहीं था।`,
+      `${subjectHi} की यह शुरुआत जितनी शांत दिख रही है, इसका अंजाम उतना ही चौंकाने वाला है।`,
+      `आँखें स्क्रीन से मत हटाइए, क्योंकि यहाँ हर एक सेकंड के साथ सस्पेंस और गहरा होता जा रहा है।`,
+    ];
+    const hiEscalations = [
+      `${paceCueHi} दबाव लगातार बढ़ता जाता है और ${cutCueHi} पूरा माहौल अचानक बदल जाता है।`,
+      `जैसे ही घड़ी ${climaxSecRounded} सेकंड के करीब पहुँचती है, असली मोड़ सीधे सामने आकर सबको हैरान कर देता है।`,
+      `ठीक ${climaxSecRounded} सेकंड पर वह अनोखी चाल दिखती है जिसने इस पूरे सीक्वेंस की दिशा ही बदल दी।`,
+      `${cutCueHi} अचानक एक ऐसा ट्विस्ट आता है जिसे पहली बार में पकड़ पाना लगभग नामुमकिन है।`,
+      `हर अगले फ्रेम में तनाव बढ़ता है, और ${climaxSecRounded} सेकंड पर असली राज़ से पर्दा उठ जाता है।`,
+    ];
+    const hiTwists = [
+      `जिस नतीजे की उम्मीद थी वह बिल्कुल नहीं हुआ, बल्कि आखिरी पल में पूरा सीन ही पलट गया।`,
+      `यही वह चौंकाने वाला ट्विस्ट है जिसकी वजह से लोग इस ${roundedDur} सेकंड की क्लिप को दोबारा देख रहे हैं।`,
+      `आखिरी सेकंड तक पहुँचते ही पूरा सस्पेंस खत्म होता है और असली कमाल साफ दिखाई देता है।`,
+      `नज़दीकी वर्टिकल एंगल की वजह से वह अनदेखा ट्विस्ट आखिरी पल में बिल्कुल साफ उभर कर सामने आता है।`,
+    ];
+    const hiClosers = [
+      `क्या आपने इस ट्विस्ट का अंदाज़ा पहले ही लगा लिया था, कमेंट में सच बताइए।`,
+      `ऐसे ही रोंगटे खड़े कर देने वाले ट्विस्ट वीडियो के लिए चैनल को अभी फॉलो करें।`,
+      `इस ${roundedDur} सेकंड के सस्पेंस को सेव करें और दोस्तों को चौंकाने के लिए शेयर करें।`,
+    ];
+
+    const vIdx = pickNonRepeatingVariant(variantSeed, hiHooks.length);
+    const fullStory = [
+      hiHooks[vIdx],
+      pickFrom(hiEscalations, vIdx + 2),
+      pickFrom(hiTwists, vIdx + 5),
+      pickFrom(hiClosers, vIdx + 7),
+    ];
+    chosenLines = fullStory.slice(0, sentenceCount);
+
+    const hiTitles = readableTopic
       ? [
-          `${readableTopic} के इस दृश्य को ध्यान से देखिए, क्योंकि असली बात शुरुआत के पहले ही सेकंड से तय हो जाती है।`,
-          `लगभग ${climaxSecRounded} सेकंड के आसपास मुख्य बदलाव सामने आता है, जहाँ पूरा फोकस सीधे नतीजे की ओर मुड़ता है।`,
-          `हर फ्रेम बिना किसी भटकाव के इसी मुख्य बिंदु को साफ साबित करता है।`,
-          `यही ${readableTopic} का सीधा और स्पष्ट सार है, जिसे आप इस क्लिप में तुरंत समझ सकते हैं।`,
+          `${readableTopic} में ऐसा ट्विस्ट किसी ने नहीं सोचा था!`,
+          `${readableTopic}: ${climaxSecRounded} सेकंड पर पलटा पूरा खेल`,
+          `आखिरी पल तक देखिए — ${readableTopic} का चौंकाने वाला अंत`,
+          `${readableTopic} का वह सस्पेंस जो सबको हैरान कर दे (${roundedDur}s)`,
         ]
       : [
-          `इस क्लिप के पहले ही पल को ध्यान से देखिए, क्योंकि असली बदलाव यहीं से शुरू होता है।`,
-          `${isFast ? 'तेज़ कट्स के बीच ' : ''}लगभग ${climaxSecRounded} सेकंड पर वह मुख्य मोड़ आता है, जिसे ज़्यादातर लोग पहली बार में छोड़ देते हैं।`,
-          `अंत तक पहुँचते-पहुँचते पूरी तस्वीर बिल्कुल साफ हो जाती है और मुख्य बात सीधे सामने आ जाती है।`,
-          `ऐसे ही स्पष्ट और तेज़ विश्लेषण के लिए इस वीडियो को सेव करें और चैनल से जुड़े रहें।`,
+          `${climaxSecRounded} सेकंड पर अचानक पलट गया पूरा सीन!`,
+          `शुरुआत शांत थी, लेकिन आखिरी ${roundedDur} सेकंड का ट्विस्ट चौंका देगा`,
+          `किसी ने इस मोड़ की उम्मीद नहीं की थी (${roundedDur}s सस्पेंस)`,
+          `अंत तक रुकिए — इस क्लिप का असली ट्विस्ट अभी बाकी है`,
+          `सिर्फ ${roundedDur} सेकंड में सबसे चौंकाने वाला मोड़!`,
         ];
-    chosenLines = hiPool.slice(0, sentenceCount);
+    titleVariant = hiTitles[(vIdx + fallbackScriptRunCounter) % hiTitles.length];
   } else {
-    const enPool = readableTopic
+    const subjectEn = readableTopic ? readableTopic : 'this scene';
+    const paceCueEn = isFast
+      ? 'through these rapid cuts'
+      : isSteady
+      ? 'beneath this deceptively calm buildup'
+      : 'as the momentum tightens';
+    const cutCueEn =
+      sceneCuts >= 2
+        ? `right after ${sceneCuts} sharp cuts`
+        : `the instant we hit ${climaxSecRounded} seconds`;
+
+    const enHooks = [
+      `At first glance, ${subjectEn} looks completely ordinary, until the tension snaps seconds later.`,
+      `Almost everyone scrolls past too early and misses the exact twist hiding inside ${subjectEn}.`,
+      `Hold on, because nothing in the first three seconds prepares you for where this ${roundedDur}-second clip goes next.`,
+      `What starts out calm in ${subjectEn} is actually setting up a twist nobody saw coming.`,
+      `Don't blink for the next ${roundedDur} seconds, because the real story isn't what it looks like at the start.`,
+      `Watch how fast everything changes once ${subjectEn} stops playing by the rules.`,
+    ];
+    const enEscalations = [
+      `Stay locked in ${paceCueEn}, because ${cutCueEn}, the entire situation flips upside down.`,
+      `Right around ${climaxSecRounded} seconds, the buildup cracks open and reveals what was really happening all along.`,
+      `Every second raises the stakes until ${cutCueEn} delivers the shock move at the heart of the clip.`,
+      `Just when you think you've figured out the outcome, ${climaxSecRounded} seconds hits and changes the whole story.`,
+      `Tension builds frame by frame until ${cutCueEn} exposes the sudden twist right in front of the lens.`,
+    ];
+    const enTwists = [
+      `The payoff lands out of nowhere, turning a ${roundedDur}-second moment into an instant replay.`,
+      `That single twist flips the whole ${formatWord} sequence and explains why viewers keep watching twice.`,
+      `In crisp, ${lightingNote} close-up detail, the final seconds deliver the exact shock nobody expected.`,
+      `By the closing beat, the real reveal hits hard and leaves zero doubt why this moment stands out.`,
+    ];
+    const enClosers = [
+      `Did you call that twist before ${climaxSecRounded} seconds, or did it catch you off guard?`,
+      `Follow for more gripping ${roundedDur}-second twists that hit harder every time.`,
+      `Save this clip and send it to someone who never sees the ending coming.`,
+    ];
+
+    const vIdx = pickNonRepeatingVariant(variantSeed, enHooks.length);
+    const fullStory = [
+      enHooks[vIdx],
+      pickFrom(enEscalations, vIdx + 3),
+      pickFrom(enTwists, vIdx + 6),
+      pickFrom(enClosers, vIdx + 9),
+    ];
+    chosenLines = fullStory.slice(0, sentenceCount);
+
+    const enTitles = readableTopic
       ? [
-          `Watch this moment in ${readableTopic} closely — the key shift starts right from the opening frame.`,
-          `Right around the ${climaxSecRounded}-second mark, the main action turns and reveals what actually drives the outcome.`,
-          `Every beat in this sequence locks onto that core detail with zero filler.`,
-          `That is the exact takeaway from ${readableTopic} — clear, direct, and easy to verify on screen.`,
+          `Nobody Saw This ${readableTopic} Twist Coming!`,
+          `${readableTopic} Flips Everything at ${climaxSecRounded}s`,
+          `Wait Until the End of This ${readableTopic} Story`,
+          `The ${roundedDur}-Second ${readableTopic} Twist Everyone Missed`,
         ]
       : [
-          `Watch the opening frame closely — the key detail that changes everything happens faster than most viewers expect.`,
-          `${isFast ? 'Across the rapid cuts, right' : 'Right'} around the ${climaxSecRounded}-second mark, the main turning point locks in and drives the entire sequence.`,
-          `By the final second, the full picture comes together cleanly with zero wasted motion.`,
-          `Save this breakdown and follow for more direct, frame-by-frame visual explainers.`,
+          `Wait for the ${climaxSecRounded}-Second Twist Nobody Expected${trends.length > 0 ? ` (${trendKeyword})` : ''}`,
+          `It Looked Normal Until ${climaxSecRounded}s Changed Everything`,
+          `Don't Blink — This ${roundedDur}s Ending Hits Hard${trends.length > 0 ? ` | ${trendKeyword}` : ''}`,
+          `You Won't Guess How This ${roundedDur}-Second Story Ends`,
+          `The Sudden ${climaxSecRounded}s Twist That Stops Every Scroll`,
         ];
-    chosenLines = enPool.slice(0, sentenceCount);
+    titleVariant = enTitles[(vIdx + fallbackScriptRunCounter) % enTitles.length];
   }
 
   // Distribute beat timings proportionally to word length inside safeSpeechEnd
@@ -611,28 +754,13 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
   });
 
   const voiceover = beats.map((b) => b.text).join(' ');
-
-  const displayTitleSubject =
-    readableTopic ||
-    (language === 'hi'
-      ? `${Math.round(dur)} सेकंड में मुख्य पल का सीधा विश्लेषण`
-      : `The ${climaxSecRounded}-Second Turning Point Most Viewers Miss`);
-
-  const title =
-    language === 'hi'
-      ? readableTopic
-        ? `${readableTopic} | सीधी हिंदी व्याख्या और असली मोड़`
-        : `${displayTitleSubject} | हिंदी एक्सप्लेनर`
-      : readableTopic
-      ? `${readableTopic} — Direct Breakdown & Key Moment`
-      : trends.length > 0
-      ? `${displayTitleSubject} (${trendKeyword})`
-      : `${displayTitleSubject} (Direct Breakdown)`;
+  const displayTitleSubject = readableTopic || titleVariant;
+  const title = titleVariant;
 
   const description =
     language === 'hi'
-      ? `${displayTitleSubject} का स्पष्ट और सीधा हिंदी विश्लेषण।\n\nइस क्लिप में क्या खास है:\n• शुरुआती फ्रेम से लेकर ${climaxSecRounded} सेकंड के मुख्य मोड़ तक सीधा कवरेज\n• साफ ${formatWord} वर्टिकल फ्रेमिंग, सिनेमा कलर ग्रेड और नैचुरल वॉइसओवर\n\nऐसे और सीधे वीडियो ब्रेकडाउन के लिए सब्सक्राइब करें।`
-      : `Direct English breakdown of ${displayTitleSubject}, keeping every key on-screen moment crystal clear.\n\nWhat happens in this clip:\n• Opening setup leading straight into the ${climaxSecRounded}-second turning point\n• Clean vertical framing, cinema color grade, and synced natural narration\n\nSubscribe for daily visual breakdowns and ${trendKeyword} highlights.`;
+      ? `${displayTitleSubject}\n\nइस ${roundedDur} सेकंड की सस्पेंस क्लिप में:\n• तेज़ हुक और ${climaxSecRounded} सेकंड पर अनपेक्षित ट्विस्ट\n• फुल वर्टिकल फ्रेमिंग, सिनेमा कलर ग्रेड और दमदार हिंदी वॉइसओवर\n\nऐसे ही सस्पेंस और ट्विस्ट शॉर्ट्स के लिए सब्सक्राइब करें।`
+      : `${displayTitleSubject}\n\nInside this ${roundedDur}-second suspense clip:\n• Dramatic hook building straight into the ${climaxSecRounded}s twist\n• Full-bleed vertical framing, ${lightingNote} cinema color grade, and powerful narration\n\nSubscribe for daily ${trendKeyword} twists and high-retention stories.`;
 
   const tagList = [
     ...(readableTopic ? [readableTopic.toLowerCase()] : []),

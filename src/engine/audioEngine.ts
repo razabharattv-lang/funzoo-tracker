@@ -147,7 +147,7 @@ async function masterAndFitVoiceover(params: {
   src.buffer = trimmedBuf;
   src.playbackRate.value = playbackRate;
 
-  // Balanced Studio EQ: 85Hz HPF, +3dB warmth, +4dB vocal clarity, smooth compression
+  // Studio Broadcast EQ: 85Hz HPF, warm low-mid body (+3.5dB @ 160Hz), crisp presence (+3.8dB @ 3kHz), smooth compression
   const highPass = offlineCtx.createBiquadFilter();
   highPass.type = 'highpass';
   highPass.frequency.value = 85;
@@ -155,14 +155,14 @@ async function masterAndFitVoiceover(params: {
 
   const bassShelf = offlineCtx.createBiquadFilter();
   bassShelf.type = 'lowshelf';
-  bassShelf.frequency.value = 140;
-  bassShelf.gain.value = 3.0;
+  bassShelf.frequency.value = 160;
+  bassShelf.gain.value = 3.5;
 
   const presencePeak = offlineCtx.createBiquadFilter();
   presencePeak.type = 'peaking';
-  presencePeak.frequency.value = 3100;
+  presencePeak.frequency.value = 3000;
   presencePeak.Q.value = 1.0;
-  presencePeak.gain.value = 4.0;
+  presencePeak.gain.value = 3.8;
 
   const compressor = offlineCtx.createDynamicsCompressor();
   compressor.threshold.value = -16;
@@ -216,21 +216,42 @@ function createCleanSilentTrack(targetDurationSec: number): AudioBuffer {
   });
 }
 
+let cachedSpeechVoices: SpeechSynthesisVoice[] = [];
+let speechVoiceListenerBound = false;
+
+function getLoadedSpeechVoices(): SpeechSynthesisVoice[] {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return [];
+  try {
+    if (!speechVoiceListenerBound) {
+      speechVoiceListenerBound = true;
+      window.speechSynthesis.addEventListener?.('voiceschanged', () => {
+        try {
+          cachedSpeechVoices = window.speechSynthesis.getVoices() || [];
+        } catch {
+          // ignore
+        }
+      });
+    }
+    const live = window.speechSynthesis.getVoices() || [];
+    if (live.length > 0) {
+      cachedSpeechVoices = live;
+    }
+    return cachedSpeechVoices;
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Selects the most natural, non-robotic OS SpeechSynthesisVoice matching language
- * (`en-US` / `hi-IN`) and gender (`male` / `female`) by preferring neural/enhanced voices.
+ * Selects the most natural, human-sounding OS SpeechSynthesisVoice matching language
+ * (`en-US` / `hi-IN`) and gender (`male` / `female`), prioritizing neural/enhanced voices
+ * over legacy robotic desktop voices.
  */
 export function pickBestBrowserSpeechVoice(
   language: OutputLanguage,
   voiceGender: VoiceGender
 ): SpeechSynthesisVoice | null {
-  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null;
-  let voices: SpeechSynthesisVoice[] = [];
-  try {
-    voices = window.speechSynthesis.getVoices() || [];
-  } catch {
-    return null;
-  }
+  const voices = getLoadedSpeechVoices();
   if (voices.length === 0) return null;
 
   const langPrefix = language === 'hi' ? 'hi' : 'en';
@@ -244,15 +265,21 @@ export function pickBestBrowserSpeechVoice(
     'jenny',
     'emma',
     'ava',
+    'allison',
     'samantha',
+    'siri',
     'swara',
     'lekha',
+    'neerja',
     'google us english',
     'google हिन्दी',
-    'zira',
     'victoria',
+    'karen',
+    'moira',
+    'tessa',
     'heera',
     'kalpana',
+    'zira',
     'female',
     'kore',
   ];
@@ -260,33 +287,79 @@ export function pickBestBrowserSpeechVoice(
     'andrew',
     'brian',
     'guy',
+    'steffan',
+    'ryan',
+    'eric',
     'christopher',
     'matthew',
     'daniel',
     'alex',
     'madhur',
-    'david',
+    'prabhat',
+    'aaron',
+    'arthur',
     'mark',
+    'david',
     'hemant',
     'ravi',
     'male',
     'fenrir',
   ];
-  const naturalBonusHints = ['natural', 'neural', 'online', 'enhanced', 'premium', 'google'];
-  const roboticPenaltyHints = ['espeak', 'compact', 'festival', 'pico', 'whisper', 'bad news', 'zarvox', 'trinoids', 'bells', 'boing'];
+  const naturalBonusHints = [
+    'natural',
+    'neural',
+    'online',
+    'enhanced',
+    'premium',
+    'siri',
+    'google',
+    'wavenet',
+    'studio',
+  ];
+  const roboticPenaltyHints = [
+    'child',
+    'kid',
+    'princess',
+    'bubbles',
+    'espeak',
+    'compact',
+    'festival',
+    'pico',
+    'desktop',
+    'sapi',
+    'whisper',
+    'bad news',
+    'good news',
+    'zarvox',
+    'trinoids',
+    'bells',
+    'boing',
+    'fred',
+    'albert',
+    'ralph',
+    'kathy',
+    'junior',
+    'cellos',
+    'hysterical',
+    'bahh',
+  ];
   const preferredHints = voiceGender === 'female' ? femaleHints : maleHints;
+  const oppositeHints = voiceGender === 'female' ? maleHints : femaleHints;
 
   const scored = pool.map((v) => {
     const name = v.name.toLowerCase();
     const lang = v.lang.toLowerCase();
     let score = 0;
 
-    if (language === 'en' && lang.includes('us')) score += 18;
-    if (language === 'hi' && lang.includes('in')) score += 18;
-    if (preferredHints.some((h) => name.includes(h))) score += 26;
-    if (naturalBonusHints.some((h) => name.includes(h))) score += 22;
-    if (!v.localService) score += 8; // Cloud/neural OS voices usually sound much cleaner
-    if (roboticPenaltyHints.some((h) => name.includes(h))) score -= 40;
+    if (language === 'en' && (lang === 'en-us' || lang.startsWith('en-us'))) score += 20;
+    else if (language === 'en' && lang.includes('gb')) score += 12;
+    if (language === 'hi' && lang.includes('in')) score += 22;
+
+    if (naturalBonusHints.some((h) => name.includes(h))) score += 42;
+    if (!v.localService) score += 14; // Cloud/neural OS voices avoid metallic local DSP
+    if (preferredHints.some((h) => name.includes(h))) score += 22;
+    if (oppositeHints.some((h) => name.includes(h))) score -= 12;
+    if (roboticPenaltyHints.some((h) => name.includes(h))) score -= 60;
 
     return { voice: v, score };
   });
@@ -296,8 +369,9 @@ export function pickBestBrowserSpeechVoice(
 }
 
 /**
- * Speaks the narration with `window.speechSynthesis` using smooth natural pacing
- * fitted cleanly inside `targetDurationSec`.
+ * Speaks the narration with `window.speechSynthesis` using dramatic suspense/twist cadence:
+ * mature resonant pitch (never childish/thin > 1.0), smooth controlled rate (0.95–1.12),
+ * and beat-by-beat pacing across hook, rising suspense, and twist payoff.
  */
 export function speakWithBrowserSpeech(params: {
   scriptText: string;
@@ -311,21 +385,46 @@ export function speakWithBrowserSpeech(params: {
 
   try {
     window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(params.scriptText);
-    utterance.lang = params.language === 'hi' ? 'hi-IN' : 'en-US';
     const voice = pickBestBrowserSpeechVoice(params.language, params.voiceGender);
-    if (voice) utterance.voice = voice;
 
-    // Energetic, crisp explainer pacing (0.98x–1.22x) fitted cleanly inside exact clip duration
-    const words = params.scriptText.trim().split(/\s+/).filter(Boolean).length;
-    const estBaseSec = Math.max(1.5, words / 2.55);
-    const budgetSec = Math.max(1.4, params.targetDurationSec - 0.35);
-    const fittedRate = Math.max(0.98, Math.min(1.22, estBaseSec / budgetSec));
+    // Replace harsh dashes/symbols with natural comma pauses so TTS reads dramatically
+    const normalizedText = params.scriptText
+      .replace(/[—–]+/g, ', ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!normalizedText) return false;
 
-    utterance.rate = Number(fittedRate.toFixed(2));
-    utterance.pitch = params.voiceGender === 'female' ? 1.02 : 0.95;
-    utterance.volume = 1.0;
-    window.speechSynthesis.speak(utterance);
+    const sentences = normalizedText
+      .split(/(?<=[.!?।])\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const segments = sentences.length > 0 ? sentences : [normalizedText];
+
+    const words = normalizedText.split(/\s+/).filter(Boolean).length;
+    const estBaseSec = Math.max(1.5, words / 2.35);
+    const budgetSec = Math.max(1.5, params.targetDurationSec - 0.35);
+    const baseRate = Math.max(0.95, Math.min(1.11, estBaseSec / budgetSec));
+    // Keep pitch strictly mature & resonant (never high/thin/childish)
+    const basePitch = params.voiceGender === 'female' ? 0.98 : 0.94;
+
+    segments.forEach((sentence, idx) => {
+      const utterance = new SpeechSynthesisUtterance(sentence);
+      utterance.lang = params.language === 'hi' ? 'hi-IN' : 'en-US';
+      if (voice) utterance.voice = voice;
+
+      const isHook = idx === 0;
+      const isTwistPayoff = idx === segments.length - 1 && segments.length > 1;
+      const beatRate = isHook
+        ? Math.min(1.12, baseRate * 1.02)
+        : isTwistPayoff
+        ? Math.min(1.11, baseRate * 1.01)
+        : Math.max(0.94, baseRate * 0.97);
+
+      utterance.rate = Number(beatRate.toFixed(2));
+      utterance.pitch = basePitch;
+      utterance.volume = 1.0;
+      window.speechSynthesis.speak(utterance);
+    });
     return true;
   } catch {
     return false;
@@ -379,8 +478,12 @@ export async function synthesizeCommandingVoiceover(params: {
 
   const styleDesc =
     language === 'hi'
-      ? 'Natural, powerful, energetic Hindi Shorts explainer voice. Crisp diction, warm human authority, lively engaging pacing, never robotic or flat.'
-      : 'Natural, powerful, energetic American Shorts explainer voice. Crisp studio clarity, warm human confidence, lively engaging pacing, never robotic or metallic.';
+      ? voiceGender === 'female'
+        ? 'Mature, powerful, emotionally gripping female Hindi suspense storyteller. Rich resonant alto tone, dramatic opening hook, rising tension, sharp punch on the twist, never thin, childish, or robotic.'
+        : 'Deep, powerful, emotionally intense male Hindi suspense storyteller. Warm commanding baritone, gripping opening tension, dramatic build-up, explosive clarity on the twist, never thin, childish, or robotic.'
+      : voiceGender === 'female'
+      ? 'Mature, commanding, high-emotion American female cinematic storyteller. Rich velvety alto presence, magnetic suspenseful hook, rising emotional tension, bold unforgettable punch on the twist, never childish, thin, or robotic.'
+      : 'Deep, powerful, high-emotion American male cinematic storyteller. Resonant authoritative baritone, intense suspenseful hook, deliberate dramatic tension, commanding emotional impact on the twist, never childish, thin, or robotic.';
 
   if (health.geminiConfigured) {
     onStatus?.(

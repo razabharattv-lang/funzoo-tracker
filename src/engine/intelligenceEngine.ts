@@ -254,37 +254,37 @@ export async function translateClipAndBuildSeoStep3(params: {
 
   const languageName =
     language === 'hi'
-      ? 'Hindi (natural, energetic, crystal-clear spoken Devanagari Hindi)'
-      : 'English (USA — crisp, fast-paced, high-retention American Shorts/Reels explainer English)';
+      ? 'Hindi (dramatic, gripping, suspenseful spoken Devanagari Hindi)'
+      : 'English (USA — dramatic, high-emotion, suspenseful American storytelling Shorts/Reels English)';
 
-  const systemPrompt = `You are a real-time Vision-to-Action Video Explainer & YouTube Shorts SEO Strategist.
-You are looking at a 3x2 contact sheet of 6 evenly spaced frames (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) taken directly from the user's actual video.
+  const systemPrompt = `You are a master High-Retention Viral Storyteller & YouTube Shorts SEO Strategist.
+You are inspecting a 3x2 contact sheet of 6 evenly spaced frames (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) taken directly from the user's real video.
 
-STRICT VISION-TO-ACTION RULES:
-1. INSPECT EVERY FRAME: Name the exact real objects, people, tools, food, machines, animals, or physical movements visible in Frame 1 through Frame 6.
-2. NEVER USE GENERIC FILLER: Strictly FORBIDDEN phrases include "opening frame", "turning point", "second mark", "core detail", "wasted motion", "main action turns", "full picture comes together", "contact sheet", or raw numeric filenames like "1000179945".
-3. STEP-BY-STEP ACCURACY: Narrate the real physical sequence second-by-second from T=0.0s to T=${maxSpeechSec.toFixed(1)}s in ${languageName} with high-retention hook energy (~${targetWordCount} words total so speech finishes cleanly before ${maxSpeechSec.toFixed(1)}s).
-4. DETECT NICHE FOR YOUTUBE: Return "detected_topic" (2–5 words describing the exact subject/action) and "youtube_search_query" (2–4 clean English search words for finding top-viewed US YouTube Shorts in this exact niche).
-5. Return ONLY valid JSON matching the exact schema.`;
+STRICT STORYTELLING & VISION RULES:
+1. REAL VISUALS ONLY: Name the exact real objects, people, animals, tools, food, or physical movements visible in Frames 1 through 6.
+2. SUSPENSE + TWIST STRUCTURE: Build genuine emotional tension from Frame 1, escalate the stakes through Frames 3–4, and hit an unforgettable twist or dramatic payoff in Frames 5–6!
+3. ZERO CANNED BOILERPLATE: Strictly FORBIDDEN phrases include "opening frame", "turning point", "second mark", "core detail", "wasted motion", "contact sheet", "crayon", or raw camera filenames like "1000179945".
+4. EXACT DURATION FIT: Write ~${targetWordCount} high-impact spoken words in ${languageName} with punchy dramatic sentences so the voiceover finishes cleanly before ${maxSpeechSec.toFixed(1)}s.
+5. POPULATE ALL SEO FIELDS: Return non-empty "detected_topic", "youtube_search_query", "title", "description", "tags", "hashtags", and "posting_time" (EST/IST). Return ONLY valid JSON.`;
 
   const userPrompt = `CLIP HINT: ${safeTopicHint}
 CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (locked duration: ${targetDurSec.toFixed(1)}s, frame timestamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
 OUTPUT LANGUAGE: ${languageName}
-KEY POINTS TO KEEP: ${customAngle.trim() || 'Describe the real objects and exact step-by-step physical actions happening across all 6 frames.'}
+KEY POINTS TO KEEP: ${customAngle.trim() || 'Turn the real objects and step-by-step physical actions across all 6 frames into a gripping, suspenseful, twist-driven story.'}
 
 RETURN STRICT JSON ONLY:
 {
   "detected_topic": "Exact real subject/action visible on screen (2-5 words)",
   "youtube_search_query": "2-4 clean English YouTube Shorts search words for this exact niche",
-  "voiceover": "Fast, high-retention, second-by-second accurate narration describing the real objects & physical actions (~${targetWordCount} words, finishes before ${maxSpeechSec.toFixed(1)}s)",
+  "voiceover": "Suspenseful, emotional, twist-driven story narration matching the real on-screen visuals (~${targetWordCount} words, finishes before ${maxSpeechSec.toFixed(1)}s)",
   "beats": [
-    { "start_sec": 0.0, "end_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "text": "Hook describing the exact object/action in frames 1-2" },
-    { "start_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "end_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "text": "Step-by-step action visible in frames 3-4" },
-    { "start_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Final payoff/result visible in frames 5-6" }
+    { "start_sec": 0.0, "end_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "text": "Dramatic suspense hook naming the exact subject/action in frames 1-2" },
+    { "start_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "end_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "text": "Rising tension describing what unfolds in frames 3-4" },
+    { "start_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Sharp twist or emotional payoff revealed in frames 5-6" }
   ],
-  "title": "High-CTR YouTube Shorts / Reels title (<= 75 chars) about the exact object & action in ${languageName}",
-  "description": "Punchy niche SEO description highlighting the real step-by-step action + CTA",
-  "tags": "comma, separated, 8-12, niche, youtube, shorts, tags",
+  "title": "Curiosity-gap, high-CTR Shorts/Reels title (<= 75 chars) in ${languageName}",
+  "description": "Engaging suspenseful niche SEO description summarizing the real twist + CTA",
+  "tags": "comma, separated, 8-12, targeted, niche, youtube, shorts, tags",
   "hashtags": "#Shorts #NicheTag1 #NicheTag2 #NicheTag3 #NicheTag4",
   "posting_time": "Best Upload Window with both USA EST and India IST peak hours"
 }`;

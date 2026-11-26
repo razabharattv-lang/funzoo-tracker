@@ -1,4 +1,7 @@
-import { extractVideoUrl } from '../lib/urlExtractor';
+import {
+  extractVideoUrl,
+  YOUTUBE_DIRECT_FETCH_BLOCKED_MSG,
+} from '../lib/urlExtractor';
 import { probeVideoBlobToSource } from '../lib/videoProbe';
 import type { SourceMediaItem, ViralSegment } from '../types/studio';
 
@@ -31,11 +34,15 @@ async function fetchVideoBlobSafe(
   signal?: AbortSignal
 ): Promise<Blob | null> {
   if (!isSafeHttpUrl(mediaUrl)) return null;
+  const timeoutController = new AbortController();
+  const timeoutId = globalThis.setTimeout(() => timeoutController.abort(), 12000);
+  const onParentAbort = () => timeoutController.abort();
+  signal?.addEventListener('abort', onParentAbort, { once: true });
   try {
     const resp = await fetch(mediaUrl, {
       mode: 'cors',
       credentials: 'omit',
-      signal,
+      signal: timeoutController.signal,
     });
     if (!resp.ok) return null;
     const contentType = (resp.headers.get('content-type') ?? '').toLowerCase();
@@ -54,8 +61,11 @@ async function fetchVideoBlobSafe(
       ? blob
       : new Blob([blob], { type: 'video/mp4' });
   } catch (err) {
-    if ((err as Error).name === 'AbortError') throw err;
+    if (signal?.aborted && (err as Error).name === 'AbortError') throw err;
     return null;
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', onParentAbort);
   }
 }
 
@@ -106,6 +116,10 @@ export async function resolveLinkToSourceMedia(params: {
     throw new Error(
       'No valid public http(s) video link found. Paste a direct MP4/WebM link or upload your local video file below.'
     );
+  }
+
+  if (extracted.isYouTube) {
+    throw new Error(YOUTUBE_DIRECT_FETCH_BLOCKED_MSG);
   }
 
   onStatus?.(`Resolving ${extracted.platform} link...`);

@@ -286,30 +286,38 @@ export async function runSingleClipAiRequest(params: {
           });
         }
 
-        const resp = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key=${encodeURIComponent(
-            staticEnv.geminiApiKey
-          )}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal,
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: systemPrompt }] },
-              contents: [{ role: 'user', parts }],
-              generationConfig: {
-                responseMimeType: 'application/json',
-              },
-            }),
-          }
-        );
+        const callStaticGemini = (modelId: string) =>
+          fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
+              staticEnv.geminiApiKey
+            )}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              signal,
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                contents: [{ role: 'user', parts }],
+                generationConfig: {
+                  responseMimeType: 'application/json',
+                },
+              }),
+            }
+          );
+
+        let usedStaticModel = 'gemini-4-hydrogen';
+        let resp = await callStaticGemini(usedStaticModel);
+        if (resp.status === 404) {
+          usedStaticModel = 'gemini-3.1-flash-lite';
+          resp = await callStaticGemini(usedStaticModel);
+        }
 
         if (!resp.ok) {
           const errText = await resp.text().catch(() => '');
           const quota = isQuotaOrRateLimitStatus(resp.status, errText);
           return {
             rawText: '',
-            modelUsed: 'gemini-4-hydrogen',
+            modelUsed: usedStaticModel,
             provider: 'gemini',
             quotaExhausted: quota,
             errorReason: quota
@@ -327,7 +335,7 @@ export async function runSingleClipAiRequest(params: {
             .join('') ?? '';
         return {
           rawText,
-          modelUsed: 'gemini-4-hydrogen',
+          modelUsed: usedStaticModel,
           provider: 'gemini',
         };
       } catch (err) {
