@@ -60,9 +60,14 @@ export function CloudProgressBar({
       ? 'bg-[#00C853]'
       : 'bg-[#3D5AFE]';
 
+  const nvidiaDisplay =
+    connectionStatus.nvidia === 'CORS-Blocked'
+      ? 'Static-Skip'
+      : connectionStatus.nvidia;
+
   const statusPills = [
     { label: 'Gemini', value: connectionStatus.gemini },
-    { label: 'NVIDIA', value: connectionStatus.nvidia },
+    { label: 'NVIDIA', value: nvidiaDisplay },
     { label: 'YouTube', value: connectionStatus.youtube },
     { label: 'Voice', value: connectionStatus.voice },
   ];
