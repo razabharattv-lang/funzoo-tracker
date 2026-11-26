@@ -21,16 +21,9 @@ export function SourcePreviewCard({
           <span className="w-8 h-8 rounded-lg bg-[#3D5AFE] text-white flex items-center justify-center shrink-0">
             <Film className="w-4 h-4" strokeWidth={2.5} />
           </span>
-          <div className="min-w-0">
-            <h2 className="text-base font-extrabold text-[#0F172A] truncate">
-              Source Video Preview
-            </h2>
-            <p className="text-xs font-medium text-[#64748B] truncate">
-              {sourceMedia
-                ? `${sourceMedia.platform} · ${formatDuration(sourceMedia.durationSec)}`
-                : 'Preview appears here once a video is loaded'}
-            </p>
-          </div>
+          <h2 className="text-base font-extrabold text-[#0F172A] truncate">
+            Source Video Preview
+          </h2>
         </div>
 
         {sourceMedia && (
@@ -100,10 +93,7 @@ export function SourcePreviewCard({
       ) : (
         <div className="rounded-xl border-2 border-dashed border-[#CBD5E1] bg-[#F4F6F9] px-4 py-8 text-center">
           <p className="text-sm font-extrabold text-[#334155]">
-            No source video loaded yet
-          </p>
-          <p className="text-xs font-medium text-[#64748B] mt-1">
-            Paste a link and click Preview Source, or upload a local MP4/MOV/WebM file above.
+            No video loaded yet.
           </p>
         </div>
       )}

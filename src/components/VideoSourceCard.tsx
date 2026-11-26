@@ -76,14 +76,9 @@ export function VideoSourceCard({
             <span className="w-8 h-8 rounded-lg bg-[#3D5AFE] text-white flex items-center justify-center shrink-0">
               <Link2 className="w-4 h-4" strokeWidth={2.5} />
             </span>
-            <div>
-              <h2 className="text-base font-extrabold text-[#0F172A]">
-                1. Video Link or Upload
-              </h2>
-              <p className="text-xs font-medium text-[#64748B]">
-                Paste link/share-text or upload a local video file
-              </p>
-            </div>
+            <h2 className="text-base font-extrabold text-[#0F172A]">
+              1. Video Link or Upload
+            </h2>
           </div>
 
           {sourceType === 'link' && extracted && (
@@ -274,11 +269,7 @@ export function VideoSourceCard({
             }`}
           >
             <UploadCloud className="w-4 h-4 shrink-0" strokeWidth={2.5} />
-            <span>
-              {isDragging
-                ? 'Drop MP4 / MOV clip here'
-                : 'Or drag & drop / choose a local MP4, MOV, or WebM file'}
-            </span>
+            <span>Choose Video File (MP4, MOV, WebM)</span>
           </button>
         )}
       </div>

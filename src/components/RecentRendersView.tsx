@@ -1,5 +1,5 @@
 import { Clock, Copy, Check, Film, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { formatDuration } from '../lib/videoProbe';
 import type { SavedRenderRecord } from '../types/studio';
 
@@ -15,16 +15,46 @@ export function RecentRendersView({
   onBackToStudio,
 }: RecentRendersViewProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  const scheduleCopiedReset = (id: string) => {
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    setCopiedId(id);
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopiedId((prev) => (prev === id ? null : prev));
+      copyTimerRef.current = null;
+    }, 1500);
+  };
 
   const copyText = async (id: string, text: string) => {
     try {
       await navigator.clipboard.writeText(text);
-      setCopiedId(id);
-      window.setTimeout(() => {
-        setCopiedId((prev) => (prev === id ? null : prev));
-      }, 1500);
+      scheduleCopiedReset(id);
     } catch {
-      // ignore clipboard errors
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      try {
+        ta.select();
+        document.execCommand('copy');
+        scheduleCopiedReset(id);
+      } catch {
+        // ignore clipboard fallback failure
+      } finally {
+        if (ta.parentNode) ta.parentNode.removeChild(ta);
+      }
     }
   };
 

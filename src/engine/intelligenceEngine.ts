@@ -18,6 +18,8 @@ import type {
 } from '../types/studio';
 
 interface AiTranslationSeoPayload {
+  detected_topic?: string;
+  youtube_search_query?: string;
   voiceover?: string;
   beats?: { start_sec?: number; end_sec?: number; text?: string }[];
   title?: string;
@@ -108,12 +110,114 @@ function normalizeHashtags(value: string | string[] | undefined, fallback: strin
     .join(' ');
 }
 
+function formatHour12(hour24: number): string {
+  const h = ((hour24 % 24) + 24) % 24;
+  const suffix = h >= 12 ? 'PM' : 'AM';
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:00 ${suffix}`;
+}
+
+function customizeSeoWithNicheYouTubeTrends(params: {
+  detectedTopic: string;
+  title: string;
+  description: string;
+  tags: string;
+  hashtags: string;
+  postingTime: string;
+  trends: YouTubeTrendVideo[];
+}): {
+  title: string;
+  description: string;
+  tags: string;
+  hashtags: string;
+  postingTime: string;
+} {
+  const { detectedTopic, trends } = params;
+  if (trends.length === 0) {
+    return {
+      title: params.title,
+      description: params.description,
+      tags: params.tags,
+      hashtags: params.hashtags,
+      postingTime: params.postingTime,
+    };
+  }
+
+  // Extract real niche keywords from top-viewed US Shorts returned by YouTube Data API v3
+  const nicheKeywords: string[] = [];
+  for (const t of trends) {
+    for (const tg of t.tags ?? []) {
+      const clean = tg.trim().toLowerCase();
+      if (clean.length >= 3 && clean.length <= 32 && !nicheKeywords.includes(clean)) {
+        nicheKeywords.push(clean);
+      }
+    }
+  }
+
+  const existingTags = params.tags
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const mergedTags = [
+    ...(detectedTopic ? [detectedTopic.toLowerCase()] : []),
+    ...existingTags,
+    ...nicheKeywords.slice(0, 6),
+  ]
+    .filter((v, i, arr) => v.length > 1 && arr.findIndex((x) => x.toLowerCase() === v.toLowerCase()) === i)
+    .slice(0, 14)
+    .join(', ');
+
+  const existingHashtags = params.hashtags
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const nicheHashtags = nicheKeywords
+    .slice(0, 3)
+    .map((kw) => `#${kw.replace(/[^\p{L}\p{N}]+/gu, '')}`)
+    .filter((h) => h.length > 3);
+  const mergedHashtags = [...existingHashtags, ...nicheHashtags]
+    .filter((v, i, arr) => arr.findIndex((x) => x.toLowerCase() === v.toLowerCase()) === i)
+    .slice(0, 7)
+    .join(' ');
+
+  let postingTime = params.postingTime;
+  const validPubDates = trends
+    .map((t) => (t.publishedAt ? new Date(t.publishedAt) : null))
+    .filter((d): d is Date => Boolean(d && !Number.isNaN(d.getTime())));
+  if (validPubDates.length > 0) {
+    const avgUtcHour = Math.round(
+      validPubDates.reduce((acc, d) => acc + d.getUTCHours(), 0) / validPubDates.length
+    );
+    const estStart = (avgUtcHour - 5 + 24) % 24;
+    const estEnd = (estStart + 2) % 24;
+    const istStart = (avgUtcHour + 5) % 24;
+    const istEnd = (istStart + 2) % 24;
+    postingTime = `YouTube US Niche Peak (${trends.length} live Shorts · ${detectedTopic || 'Topic'}): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`;
+  }
+
+  const topTrendRef = trends[0]?.title?.trim();
+  const description =
+    topTrendRef && !params.description.toLowerCase().includes(nicheKeywords[0] || '__none__')
+      ? `${params.description}\n\nTrending niche keywords: ${nicheKeywords.slice(0, 4).join(' • ')}`
+      : params.description;
+
+  return {
+    title: params.title,
+    description: description.trim(),
+    tags: mergedTags,
+    hashtags: mergedHashtags,
+    postingTime,
+  };
+}
+
 /**
- * STEP 3 (Direct Translation & SEO):
- * Makes STRICTLY ONE primary AI request per clip (using Gemini 3.8 Flash or the selected
- * NVIDIA NIM model) combined with live US YouTube Data API v3 trend signals.
- * Zero retry loops on 429 — falls back cleanly to natural clip-specific local script + SEO
- * and reports live connection status updates to the UI.
+ * STEP 3 (Real Vision-to-Action + Live Niche YouTube Trend Customization):
+ * 1) Sends the 6-frame aspect-preserving JPEG contact sheet to the vision worker
+ *    (`gemini-4-hydrogen` / `nvidia/nemotron-3.5-super-vl-120b-a12b`) to identify the real
+ *    objects and step-by-step physical actions on screen (never generic filler).
+ * 2) Passes the detected real topic into YouTube Data API v3 (`regionCode=US`,
+ *    `videoDuration=short`, `order=viewCount`, 1 single API call) to fetch real trending
+ *    US Shorts for that exact niche and customize Title, Description, Tags, Hashtags, and EST/IST Upload Time.
  */
 export async function translateClipAndBuildSeoStep3(params: {
   clip: PreparedVisualClip;
@@ -122,17 +226,19 @@ export async function translateClipAndBuildSeoStep3(params: {
   aiEngine: AiEnginePreference;
   customAngle: string;
   trends: YouTubeTrendVideo[];
+  allowYouTubeLookup?: boolean;
   signal?: AbortSignal;
   onStatus?: (detail: string) => void;
   onConnectionPatch?: (patch: Partial<ConnectionStatusState>) => void;
-}): Promise<TrendMetadata> {
+}): Promise<TrendMetadata & { fetchedTrends?: YouTubeTrendVideo[] }> {
   const {
     clip,
     sourceLabel,
     language,
     aiEngine,
     customAngle,
-    trends,
+    trends: preloadedTrends,
+    allowYouTubeLookup = true,
     signal,
     onStatus,
     onConnectionPatch,
@@ -140,61 +246,51 @@ export async function translateClipAndBuildSeoStep3(params: {
 
   const targetDurSec = clip.lockedVisualDurationSec;
   const maxSpeechSec = Math.max(2, targetDurSec - 0.35);
-  // ~2.2 words/sec for commanding broadcast clarity so speech finishes cleanly inside exact clip duration
-  const targetWordCount = Math.max(10, Math.round(maxSpeechSec * 2.2));
-  const safeTopicLabel =
+  // Energetic, crisp explainer pacing (~2.45 words/sec) fitted cleanly inside exact clip duration
+  const targetWordCount = Math.max(12, Math.round(maxSpeechSec * 2.45));
+  const safeTopicHint =
     extractReadableTopicFromLabel(sourceLabel, customAngle) ||
-    'Visual Video Clip (do not mention any raw filename or file ID)';
+    'Identify directly from the 6 video frames (ignore numeric filename)';
 
   const languageName =
     language === 'hi'
-      ? 'Hindi (clear, natural Devanagari Hindi — direct faithful translation)'
-      : 'English (USA — crisp, direct, commanding American broadcast English)';
+      ? 'Hindi (natural, energetic, crystal-clear spoken Devanagari Hindi)'
+      : 'English (USA — crisp, fast-paced, high-retention American Shorts/Reels explainer English)';
 
-  const trendSummary =
-    trends.length > 0
-      ? trends
-          .slice(0, 5)
-          .map(
-            (t, idx) =>
-              `${idx + 1}. "${t.title}" (${t.channel}${t.viewCount ? `, ${t.viewCount.toLocaleString()} views` : ''})`
-          )
-          .join('\n')
-      : 'No live US YouTube trend rows returned — optimize for high-retention US Shorts / Reels search intent.';
+  const systemPrompt = `You are a real-time Vision-to-Action Video Explainer & YouTube Shorts SEO Strategist.
+You are looking at a 3x2 contact sheet of 6 evenly spaced frames (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) taken directly from the user's actual video.
 
-  const systemPrompt = `You are a precision Direct Translation & Video SEO Producer.
-Your job is to inspect the stamped 3x2 keyframe contact sheet (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) and deliver a DIRECT, FAITHFUL translation/narration of the clip's actual on-screen/spoken main points into ${languageName}.
-RULES:
-1. Never mention raw filenames, numeric camera IDs (e.g. 1000179945.mp4), or technical terms like "contact sheet".
-2. Preserve every visible action, on-screen text, and core point faithfully in ${languageName}.
-3. Write with high-authority, punchy, energetic broadcast rhythm—short crisp sentences with natural emphasis, zero flat/monotone filler, sized to ~${targetWordCount} words so narration finishes cleanly before ${maxSpeechSec.toFixed(1)}s.
-4. Return ONLY valid JSON matching the exact schema below.`;
+STRICT VISION-TO-ACTION RULES:
+1. INSPECT EVERY FRAME: Name the exact real objects, people, tools, food, machines, animals, or physical movements visible in Frame 1 through Frame 6.
+2. NEVER USE GENERIC FILLER: Strictly FORBIDDEN phrases include "opening frame", "turning point", "second mark", "core detail", "wasted motion", "main action turns", "full picture comes together", "contact sheet", or raw numeric filenames like "1000179945".
+3. STEP-BY-STEP ACCURACY: Narrate the real physical sequence second-by-second from T=0.0s to T=${maxSpeechSec.toFixed(1)}s in ${languageName} with high-retention hook energy (~${targetWordCount} words total so speech finishes cleanly before ${maxSpeechSec.toFixed(1)}s).
+4. DETECT NICHE FOR YOUTUBE: Return "detected_topic" (2–5 words describing the exact subject/action) and "youtube_search_query" (2–4 clean English search words for finding top-viewed US YouTube Shorts in this exact niche).
+5. Return ONLY valid JSON matching the exact schema.`;
 
-  const userPrompt = `CLIP TOPIC HINT: ${safeTopicLabel}
-CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (${clip.sourceStartSec.toFixed(1)}s–${clip.sourceEndSec.toFixed(1)}s, locked duration: ${targetDurSec.toFixed(1)}s, keyframe stamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
+  const userPrompt = `CLIP HINT: ${safeTopicHint}
+CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (locked duration: ${targetDurSec.toFixed(1)}s, frame timestamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
 OUTPUT LANGUAGE: ${languageName}
-USER CONTEXT / SPOKEN NOTES: ${customAngle.trim() || 'Translate and narrate the main visual/spoken points directly from the stamped frames.'}
-
-LIVE US YOUTUBE TRENDS (regionCode=US):
-${trendSummary}
+KEY POINTS TO KEEP: ${customAngle.trim() || 'Describe the real objects and exact step-by-step physical actions happening across all 6 frames.'}
 
 RETURN STRICT JSON ONLY:
 {
-  "voiceover": "Complete direct-translation commanding narration (~${targetWordCount} words, finishes cleanly by ${maxSpeechSec.toFixed(1)}s)",
+  "detected_topic": "Exact real subject/action visible on screen (2-5 words)",
+  "youtube_search_query": "2-4 clean English YouTube Shorts search words for this exact niche",
+  "voiceover": "Fast, high-retention, second-by-second accurate narration describing the real objects & physical actions (~${targetWordCount} words, finishes before ${maxSpeechSec.toFixed(1)}s)",
   "beats": [
-    { "start_sec": 0.0, "end_sec": ${(maxSpeechSec * 0.33).toFixed(1)}, "text": "Opening beat directly translating first scene" },
-    { "start_sec": ${(maxSpeechSec * 0.33).toFixed(1)}, "end_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "text": "Middle beat directly translating main turning point" },
-    { "start_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Closing beat delivering the exact takeaway" }
+    { "start_sec": 0.0, "end_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "text": "Hook describing the exact object/action in frames 1-2" },
+    { "start_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "end_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "text": "Step-by-step action visible in frames 3-4" },
+    { "start_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Final payoff/result visible in frames 5-6" }
   ],
-  "title": "High-CTR SEO title (<= 78 chars) matching ${languageName}",
-  "description": "Concise SEO description summarizing the clip's real key points + call to action",
-  "tags": "comma, separated, 8-12, targeted, youtube, tags",
-  "hashtags": "#Tag1 #Tag2 #Tag3 #Tag4 #Tag5",
-  "posting_time": "Best Upload Window with both USA EST and India IST peak hours (e.g., 12:00 PM – 2:30 PM EST / 9:30 PM – 11:30 PM IST)"
+  "title": "High-CTR YouTube Shorts / Reels title (<= 75 chars) about the exact object & action in ${languageName}",
+  "description": "Punchy niche SEO description highlighting the real step-by-step action + CTA",
+  "tags": "comma, separated, 8-12, niche, youtube, shorts, tags",
+  "hashtags": "#Shorts #NicheTag1 #NicheTag2 #NicheTag3 #NicheTag4",
+  "posting_time": "Best Upload Window with both USA EST and India IST peak hours"
 }`;
 
   onStatus?.(
-    `Running single-call direct translation & SEO for Clip ${clip.clipIndex}/${clip.totalClips}...`
+    `Analyzing 6 video frames for real objects & actions (Clip ${clip.clipIndex}/${clip.totalClips})...`
   );
 
   const aiResponse = await runSingleClipAiRequest({
@@ -222,26 +318,38 @@ RETURN STRICT JSON ONLY:
       });
     }
 
-    return generateOfflineDirectTranslationAndMetadata({
+    let fallbackTrends = preloadedTrends;
+    if (allowYouTubeLookup && fallbackTrends.length === 0) {
+      const fallbackQuery =
+        extractReadableTopicFromLabel(sourceLabel, customAngle) ||
+        (language === 'hi' ? 'viral shorts explainer hindi' : 'viral shorts explained');
+      const ytRes = await fetchYouTubeTrendsFromApi(fallbackQuery, signal);
+      fallbackTrends = ytRes.items;
+      onConnectionPatch?.({ youtube: ytRes.connected ? 'Connected' : 'Fallback' });
+    }
+
+    const offlineOut = generateOfflineDirectTranslationAndMetadata({
       clip,
       sourceLabel,
       language,
       customAngle,
-      trends,
+      trends: fallbackTrends,
       fallbackReason: aiResponse?.errorReason ?? 'Local mode',
     });
+    return { ...offlineOut, fetchedTrends: fallbackTrends };
   }
 
   const parsed = extractJsonObject<AiTranslationSeoPayload>(aiResponse.rawText);
   if (!parsed || !parsed.voiceover || parsed.voiceover.trim().length < 8) {
-    return generateOfflineDirectTranslationAndMetadata({
+    const offlineOut = generateOfflineDirectTranslationAndMetadata({
       clip,
       sourceLabel,
       language,
       customAngle,
-      trends,
+      trends: preloadedTrends,
       fallbackReason: `${aiResponse.modelUsed} returned non-JSON`,
     });
+    return { ...offlineOut, fetchedTrends: preloadedTrends };
   }
 
   if (aiResponse.provider === 'gemini') {
@@ -250,26 +358,55 @@ RETURN STRICT JSON ONLY:
     onConnectionPatch?.({ nvidia: 'Connected' });
   }
 
+  // Pass the REAL vision-detected topic into YouTube Data API v3 (1 single API call)
+  const detectedTopic = (parsed.detected_topic ?? '').trim();
+  const nicheQuery =
+    (parsed.youtube_search_query ?? '').trim() ||
+    detectedTopic ||
+    extractReadableTopicFromLabel(sourceLabel, customAngle) ||
+    'viral shorts explained';
+
+  let activeTrends = preloadedTrends;
+  if (allowYouTubeLookup && activeTrends.length === 0) {
+    onStatus?.(
+      `Fetching live US YouTube Shorts trends for "${nicheQuery}" (1 API call)...`
+    );
+    const ytRes = await fetchYouTubeTrendsFromApi(nicheQuery, signal);
+    activeTrends = ytRes.items;
+    onConnectionPatch?.({ youtube: ytRes.connected ? 'Connected' : 'Fallback' });
+  }
+
   const offlineDefaults = generateOfflineDirectTranslationAndMetadata({
     clip,
     sourceLabel,
     language,
-    customAngle,
-    trends,
+    customAngle: detectedTopic || customAngle,
+    trends: activeTrends,
   });
 
   const voiceover = parsed.voiceover.trim();
   const beats = normalizeBeats(parsed.beats, voiceover, targetDurSec);
 
-  return {
-    voiceover,
-    beats,
+  const customizedSeo = customizeSeoWithNicheYouTubeTrends({
+    detectedTopic,
     title: (parsed.title?.trim() || offlineDefaults.title).slice(0, 100),
     description: parsed.description?.trim() || offlineDefaults.description,
     tags: normalizeCommaList(parsed.tags, offlineDefaults.tags),
     hashtags: normalizeHashtags(parsed.hashtags, offlineDefaults.hashtags),
     postingTime: parsed.posting_time?.trim() || offlineDefaults.postingTime,
-    scriptEngine: `${aiResponse.modelUsed} (1-Call Direct Translation)`,
-    youtubeTrendsCount: trends.length,
+    trends: activeTrends,
+  });
+
+  return {
+    voiceover,
+    beats,
+    title: customizedSeo.title.slice(0, 100),
+    description: customizedSeo.description,
+    tags: customizedSeo.tags,
+    hashtags: customizedSeo.hashtags,
+    postingTime: customizedSeo.postingTime,
+    scriptEngine: `${aiResponse.modelUsed}${detectedTopic ? ` · Topic: ${detectedTopic}` : ''}${activeTrends.length > 0 ? ` + YouTube US (${activeTrends.length})` : ''}`,
+    youtubeTrendsCount: activeTrends.length,
+    fetchedTrends: activeTrends,
   };
 }

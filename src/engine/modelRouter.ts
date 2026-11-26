@@ -252,6 +252,7 @@ export async function runSingleClipAiRequest(params: {
   const staticEnv = getBuildRuntimeEnv();
 
   let targetModel: AiEnginePreference = preference;
+  const allowCrossProviderFallback = preference === 'auto';
   if (targetModel === 'auto') {
     if (health.geminiConfigured) {
       targetModel = 'gemini-3.8-flash';
@@ -286,7 +287,7 @@ export async function runSingleClipAiRequest(params: {
         }
 
         const resp = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${encodeURIComponent(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key=${encodeURIComponent(
             staticEnv.geminiApiKey
           )}`,
           {
@@ -298,7 +299,6 @@ export async function runSingleClipAiRequest(params: {
               contents: [{ role: 'user', parts }],
               generationConfig: {
                 responseMimeType: 'application/json',
-                temperature: 0.4,
               },
             }),
           }
@@ -309,7 +309,7 @@ export async function runSingleClipAiRequest(params: {
           const quota = isQuotaOrRateLimitStatus(resp.status, errText);
           return {
             rawText: '',
-            modelUsed: 'gemini-3.8-flash',
+            modelUsed: 'gemini-4-hydrogen',
             provider: 'gemini',
             quotaExhausted: quota,
             errorReason: quota
@@ -327,14 +327,14 @@ export async function runSingleClipAiRequest(params: {
             .join('') ?? '';
         return {
           rawText,
-          modelUsed: 'gemini-3.8-flash',
+          modelUsed: 'gemini-4-hydrogen',
           provider: 'gemini',
         };
       } catch (err) {
         if ((err as Error).name === 'AbortError') throw err;
         return {
           rawText: '',
-          modelUsed: 'gemini-3.8-flash',
+          modelUsed: 'gemini-4-hydrogen',
           provider: 'gemini',
           errorReason: 'Gemini network unreachable',
         };
@@ -356,37 +356,49 @@ export async function runSingleClipAiRequest(params: {
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
         const quota = isQuotaOrRateLimitStatus(resp.status, errText);
+        if (allowCrossProviderFallback && health.nvidiaConfigured && health.backendAvailable && !health.nvidiaStaticKeyOnly) {
+          targetModel = imageBase64Jpeg
+            ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
+            : 'nvidia/nemotron-3.5-lightning-30b-a3b';
+        } else {
+          return {
+            rawText: '',
+            modelUsed: 'gemini-3.8-flash',
+            provider: 'gemini',
+            quotaExhausted: quota,
+            errorReason: quota ? 'Gemini 429 quota limit' : `Gemini HTTP ${resp.status}`,
+          };
+        }
+      } else {
+        const payload = (await resp.json()) as {
+          parsed?: Record<string, unknown>;
+          text?: string;
+          modelUsed?: string;
+        };
+        const rawText = payload.parsed
+          ? JSON.stringify(payload.parsed)
+          : payload.text ?? '';
+
+        return {
+          rawText,
+          modelUsed: payload.modelUsed ?? 'gemini-3.8-flash',
+          provider: 'gemini',
+        };
+      }
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') throw err;
+      if (allowCrossProviderFallback && health.nvidiaConfigured && health.backendAvailable && !health.nvidiaStaticKeyOnly) {
+        targetModel = imageBase64Jpeg
+          ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
+          : 'nvidia/nemotron-3.5-lightning-30b-a3b';
+      } else {
         return {
           rawText: '',
           modelUsed: 'gemini-3.8-flash',
           provider: 'gemini',
-          quotaExhausted: quota,
-          errorReason: quota ? 'Gemini 429 quota limit' : `Gemini HTTP ${resp.status}`,
+          errorReason: 'Gemini network unreachable',
         };
       }
-
-      const payload = (await resp.json()) as {
-        parsed?: Record<string, unknown>;
-        text?: string;
-        modelUsed?: string;
-      };
-      const rawText = payload.parsed
-        ? JSON.stringify(payload.parsed)
-        : payload.text ?? '';
-
-      return {
-        rawText,
-        modelUsed: payload.modelUsed ?? 'gemini-3.8-flash',
-        provider: 'gemini',
-      };
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') throw err;
-      return {
-        rawText: '',
-        modelUsed: 'gemini-3.8-flash',
-        provider: 'gemini',
-        errorReason: 'Gemini network unreachable',
-      };
     }
   }
 
@@ -556,6 +568,7 @@ export async function fetchYouTubeTrendsFromApi(
   if (!staticEnv.youtubeApiKey) return { items: [], connected: false };
 
   try {
+    // Strictly 1 single YouTube Data API v3 call (regionCode=US, videoDuration=short, order=viewCount)
     const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
     searchUrl.searchParams.set('part', 'snippet');
     searchUrl.searchParams.set('type', 'video');
@@ -563,7 +576,7 @@ export async function fetchYouTubeTrendsFromApi(
     searchUrl.searchParams.set('regionCode', 'US');
     searchUrl.searchParams.set('relevanceLanguage', 'en');
     searchUrl.searchParams.set('order', 'viewCount');
-    searchUrl.searchParams.set('maxResults', '6');
+    searchUrl.searchParams.set('maxResults', '8');
     searchUrl.searchParams.set('q', cleanQ);
     searchUrl.searchParams.set('key', staticEnv.youtubeApiKey);
 
@@ -571,18 +584,47 @@ export async function fetchYouTubeTrendsFromApi(
     if (!sResp.ok) return { items: [], connected: false };
     const sJson = (await sResp.json()) as {
       items?: {
-        snippet?: { title?: string; channelTitle?: string; publishedAt?: string };
+        id?: { videoId?: string };
+        snippet?: {
+          title?: string;
+          channelTitle?: string;
+          publishedAt?: string;
+          description?: string;
+        };
       }[];
     };
     const rawItems = sJson.items ?? [];
-    const items = rawItems.map((item) => ({
-      title: item.snippet?.title ?? '',
-      channel: item.snippet?.channelTitle ?? '',
-      publishedAt: item.snippet?.publishedAt ?? '',
-      viewCount: 0,
-      likeCount: 0,
-      tags: [],
-    }));
+    const stopWords = new Set([
+      'the', 'and', 'for', 'this', 'that', 'with', 'from', 'your', 'about',
+      'have', 'what', 'when', 'how', 'why', 'you', 'are', 'was', 'were',
+      'shorts', 'short', 'video', 'viral', 'trending', 'subscribe',
+    ]);
+
+    const items: YouTubeTrendVideo[] = rawItems.map((item) => {
+      const title = item.snippet?.title ?? '';
+      const desc = item.snippet?.description ?? '';
+      const hashTags = (title + ' ' + desc)
+        .match(/#[\p{L}\p{N}_]{2,28}/gu)
+        ?.map((h) => h.slice(1).toLowerCase()) ?? [];
+      const titleTerms = title
+        .replace(/#[\p{L}\p{N}_]+/gu, ' ')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((w) => w.length >= 4 && !stopWords.has(w));
+      const tags = [...hashTags, ...titleTerms]
+        .filter((v, i, arr) => arr.indexOf(v) === i)
+        .slice(0, 10);
+
+      return {
+        title,
+        channel: item.snippet?.channelTitle ?? '',
+        publishedAt: item.snippet?.publishedAt ?? '',
+        viewCount: 0,
+        likeCount: 0,
+        tags,
+      };
+    });
     return { items, connected: items.length > 0 };
   } catch {
     return { items: [], connected: false };

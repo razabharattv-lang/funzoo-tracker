@@ -18,10 +18,7 @@ import {
   cleanAndGradeClipsStep2,
   inspectAndSliceSegmentsStep1,
 } from './engine/visualClipper';
-import {
-  fetchLiveYouTubeTrends,
-  translateClipAndBuildSeoStep3,
-} from './engine/intelligenceEngine';
+import { translateClipAndBuildSeoStep3 } from './engine/intelligenceEngine';
 import { probeInitialConnectionStatus } from './engine/modelRouter';
 import { synthesizeCommandingVoiceover } from './engine/audioEngine';
 import { renderProductionMp4Gpu } from './engine/gpuRenderer';
@@ -35,6 +32,7 @@ import type {
   SourceMediaItem,
   StudioControlsState,
   TrendMetadata,
+  YouTubeTrendVideo,
 } from './types/studio';
 
 const INITIAL_PROGRESS: PipelineProgress = {
@@ -42,7 +40,7 @@ const INITIAL_PROGRESS: PipelineProgress = {
   activeStep: null,
   completedSteps: [],
   percent: 0,
-  statusDetail: 'Paste a video link or upload a local MP4/MOV/WebM file to start.',
+  statusDetail: '',
   clipProgressLabel: null,
   runTag: null,
   startedAtMs: null,
@@ -83,20 +81,38 @@ export function App() {
   );
 
   const abortRef = useRef<AbortController | null>(null);
+  const linkAbortRef = useRef<AbortController | null>(null);
+  const sourceLoadSeqRef = useRef(0);
   const sourceUrlRef = useRef<string | null>(null);
   const renderedUrlsRef = useRef<string[]>([]);
 
-  useEffect(() => {
-    warmOfflineEngines();
-    void probeInitialConnectionStatus().then((snapshot) => {
-      setConnectionStatus(snapshot);
-    });
-    return () => {
-      abortRef.current?.abort();
-      if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
-      renderedUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
-    };
+  const safeRevokeObjectUrl = useCallback((url: string | null | undefined) => {
+    if (!url || !url.startsWith('blob:')) return;
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      // ignore already-revoked object URLs
+    }
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    warmOfflineEngines();
+    void probeInitialConnectionStatus()
+      .then((snapshot) => {
+        if (active) setConnectionStatus(snapshot);
+      })
+      .catch(() => {
+        // Keep safe default connection status if initial probe fails
+      });
+    return () => {
+      active = false;
+      abortRef.current?.abort();
+      linkAbortRef.current?.abort();
+      safeRevokeObjectUrl(sourceUrlRef.current);
+      renderedUrlsRef.current.forEach((u) => safeRevokeObjectUrl(u));
+    };
+  }, [safeRevokeObjectUrl]);
 
   const patchConnectionStatus = useCallback(
     (patch: Partial<ConnectionStatusState>) => {
@@ -105,25 +121,33 @@ export function App() {
     []
   );
 
-  const replaceSourceMedia = useCallback((next: SourceMediaItem | null) => {
-    if (sourceUrlRef.current && sourceUrlRef.current !== next?.objectUrl) {
-      URL.revokeObjectURL(sourceUrlRef.current);
-    }
-    sourceUrlRef.current = next?.objectUrl ?? null;
-    setSourceMedia(next);
-  }, []);
+  const replaceSourceMedia = useCallback(
+    (next: SourceMediaItem | null) => {
+      if (sourceUrlRef.current && sourceUrlRef.current !== next?.objectUrl) {
+        safeRevokeObjectUrl(sourceUrlRef.current);
+      }
+      sourceUrlRef.current = next?.objectUrl ?? null;
+      setSourceMedia(next);
+    },
+    [safeRevokeObjectUrl]
+  );
 
-  const replaceRenderedClips = useCallback((next: RenderedClipOutput[]) => {
-    const nextUrls = new Set(next.map((c) => c.videoUrl));
-    renderedUrlsRef.current.forEach((u) => {
-      if (!nextUrls.has(u)) URL.revokeObjectURL(u);
-    });
-    renderedUrlsRef.current = next.map((c) => c.videoUrl);
-    setRenderedClips(next);
-  }, []);
+  const replaceRenderedClips = useCallback(
+    (next: RenderedClipOutput[]) => {
+      const nextUrls = new Set(next.map((c) => c.videoUrl));
+      renderedUrlsRef.current.forEach((u) => {
+        if (!nextUrls.has(u)) safeRevokeObjectUrl(u);
+      });
+      renderedUrlsRef.current = next.map((c) => c.videoUrl);
+      setRenderedClips(next);
+    },
+    [safeRevokeObjectUrl]
+  );
 
   const handleFileSelected = useCallback(
     async (file: File) => {
+      linkAbortRef.current?.abort();
+      const loadSeq = ++sourceLoadSeqRef.current;
       setSourceError(null);
       try {
         const probed = await probeVideoBlobToSource({
@@ -132,12 +156,17 @@ export function App() {
           label: file.name,
           platform: 'Local Video',
         });
+        if (loadSeq !== sourceLoadSeqRef.current) {
+          safeRevokeObjectUrl(probed.objectUrl);
+          return;
+        }
         replaceSourceMedia(probed);
         setProgress({
           ...INITIAL_PROGRESS,
-          statusDetail: `Video ready (${probed.durationSec.toFixed(1)}s · ${probed.width}×${probed.height}). Click Run 5-Step Pipeline.`,
+          statusDetail: `Video ready (${probed.durationSec.toFixed(1)}s · ${probed.width}×${probed.height}). Click Run Pipeline.`,
         });
       } catch (err) {
+        if (loadSeq !== sourceLoadSeqRef.current) return;
         setSourceError(
           err instanceof Error
             ? err.message
@@ -145,7 +174,7 @@ export function App() {
         );
       }
     },
-    [replaceSourceMedia]
+    [replaceSourceMedia, safeRevokeObjectUrl]
   );
 
   const handleFetchLinkPreview = useCallback(async () => {
@@ -156,31 +185,46 @@ export function App() {
       return;
     }
 
+    linkAbortRef.current?.abort();
+    const controller = new AbortController();
+    linkAbortRef.current = controller;
+    const loadSeq = ++sourceLoadSeqRef.current;
+
     setIsFetchingLink(true);
     try {
       const resolved = await resolveLinkToSourceMedia({
         rawInput: controls.videoUrl,
+        signal: controller.signal,
         onStatus: (msg) =>
           setProgress((prev) => ({
             ...prev,
             statusDetail: msg,
           })),
       });
+      if (loadSeq !== sourceLoadSeqRef.current || controller.signal.aborted) {
+        safeRevokeObjectUrl(resolved.objectUrl);
+        return;
+      }
       replaceSourceMedia(resolved);
       setProgress({
         ...INITIAL_PROGRESS,
         statusDetail: `Source link loaded (${resolved.durationSec.toFixed(1)}s, ${resolved.width}×${resolved.height}). Ready to run all 5 steps.`,
       });
     } catch (err) {
+      if ((err as Error)?.name === 'AbortError' || loadSeq !== sourceLoadSeqRef.current) {
+        return;
+      }
       setSourceError(
         err instanceof Error
           ? err.message
           : 'Could not fetch video from this link. Please upload the local video file.'
       );
     } finally {
-      setIsFetchingLink(false);
+      if (loadSeq === sourceLoadSeqRef.current) {
+        setIsFetchingLink(false);
+      }
     }
-  }, [controls.videoUrl, replaceSourceMedia]);
+  }, [controls.videoUrl, replaceSourceMedia, safeRevokeObjectUrl]);
 
   const handleClearSource = useCallback(() => {
     replaceSourceMedia(null);
@@ -208,6 +252,7 @@ export function App() {
 
   const handleGenerate = useCallback(async () => {
     setSourceError(null);
+    linkAbortRef.current?.abort();
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -284,21 +329,14 @@ export function App() {
       if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       completedSteps.push('step_2_clean_grade');
 
-      // STEP 3: Direct Translation & SEO (1-Call Quota Guardrail per Clip)
+      // STEP 3: Vision-to-Action + Niche YouTube Trends (1 single YouTube call on detected topic)
       markStep(
         'step_3_translate_seo',
         40,
-        'Step 3/5: Fetching live US YouTube trends (regionCode=US)...'
+        'Step 3/5: Inspecting video frames & fetching live US YouTube niche trends...'
       );
 
-      const trendQuery =
-        controls.customAngle.trim() ||
-        activeSource.label.replace(/\.(mp4|mov|webm|mkv)$/i, '');
-      const trendResult = await fetchLiveYouTubeTrends(trendQuery, signal);
-      patchConnectionStatus({
-        youtube: trendResult.connected ? 'Connected' : 'Fallback',
-      });
-
+      let sharedNicheTrends: YouTubeTrendVideo[] = [];
       const clipMetadataList: TrendMetadata[] = [];
       for (let i = 0; i < preparedClips.length; i++) {
         if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
@@ -312,12 +350,16 @@ export function App() {
           language: controls.language,
           aiEngine: controls.aiEngine,
           customAngle: controls.customAngle,
-          trends: trendResult.items,
+          trends: sharedNicheTrends,
+          allowYouTubeLookup: i === 0,
           signal,
           onStatus: (detail) =>
             markStep('step_3_translate_seo', stepPct, `Step 3/5: ${detail}`, clipLabel),
           onConnectionPatch: patchConnectionStatus,
         });
+        if (i === 0 && meta.fetchedTrends && meta.fetchedTrends.length > 0) {
+          sharedNicheTrends = meta.fetchedTrends;
+        }
         clipMetadataList.push(meta);
       }
 
@@ -430,7 +472,7 @@ export function App() {
         errorMessage: null,
       });
     } catch (err) {
-      outputs.forEach((o) => URL.revokeObjectURL(o.videoUrl));
+      outputs.forEach((o) => safeRevokeObjectUrl(o.videoUrl));
       if ((err as Error).name === 'AbortError') return;
       const msg =
         err instanceof Error ? err.message : 'Unexpected pipeline error occurred.';
@@ -446,6 +488,7 @@ export function App() {
     patchConnectionStatus,
     replaceRenderedClips,
     replaceSourceMedia,
+    safeRevokeObjectUrl,
     sourceMedia,
   ]);
 
@@ -537,6 +580,9 @@ export function App() {
                 key={progress.runTag ?? 'empty'}
                 clips={renderedClips}
                 runTag={progress.runTag}
+                renderError={
+                  progress.status === 'error' ? progress.errorMessage : null
+                }
               />
             </div>
           </div>

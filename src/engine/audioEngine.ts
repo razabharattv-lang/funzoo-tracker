@@ -61,10 +61,20 @@ async function decodeTtsAudioToBuffer(params: {
   const bytes = decodeBase64ToBytes(audioBase64);
   const lowerMime = mimeType.toLowerCase();
 
+  // Gemini 3.8 Flash TTS unary generateContent returns a full RIFF/WAVE file (44-byte header).
+  // Detect RIFF magic bytes first so WAV audio is never mis-decoded as raw headerless L16 PCM.
+  const isRiffWav =
+    bytes.length >= 4 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46;
+
   if (
-    lowerMime.includes('l16') ||
-    lowerMime.includes('pcm') ||
-    lowerMime === 'audio/raw'
+    !isRiffWav &&
+    (lowerMime.includes('l16') ||
+      lowerMime.includes('pcm') ||
+      lowerMime === 'audio/raw')
   ) {
     const sampleRate = parseSampleRateFromMime(mimeType);
     const floatSamples = pcm16LeBytesToFloat32(bytes);
@@ -120,9 +130,9 @@ async function masterAndFitVoiceover(params: {
 
   let playbackRate = 1.0;
   if (trimmedDurSec > speechBudgetSec) {
-    playbackRate = Math.min(1.34, trimmedDurSec / speechBudgetSec);
+    playbackRate = Math.min(1.24, trimmedDurSec / speechBudgetSec);
   } else if (trimmedDurSec < speechBudgetSec * 0.72) {
-    playbackRate = Math.max(0.94, trimmedDurSec / (speechBudgetSec * 0.86));
+    playbackRate = Math.max(0.96, trimmedDurSec / (speechBudgetSec * 0.88));
   }
 
   const fittedSpeechDur = trimmedDurSec / playbackRate;
@@ -137,6 +147,7 @@ async function masterAndFitVoiceover(params: {
   src.buffer = trimmedBuf;
   src.playbackRate.value = playbackRate;
 
+  // Balanced Studio EQ: 85Hz HPF, +3dB warmth, +4dB vocal clarity, smooth compression
   const highPass = offlineCtx.createBiquadFilter();
   highPass.type = 'highpass';
   highPass.frequency.value = 85;
@@ -144,24 +155,24 @@ async function masterAndFitVoiceover(params: {
 
   const bassShelf = offlineCtx.createBiquadFilter();
   bassShelf.type = 'lowshelf';
-  bassShelf.frequency.value = 120;
-  bassShelf.gain.value = 4.0;
+  bassShelf.frequency.value = 140;
+  bassShelf.gain.value = 3.0;
 
   const presencePeak = offlineCtx.createBiquadFilter();
   presencePeak.type = 'peaking';
-  presencePeak.frequency.value = 3200;
-  presencePeak.Q.value = 1.1;
-  presencePeak.gain.value = 5.0;
+  presencePeak.frequency.value = 3100;
+  presencePeak.Q.value = 1.0;
+  presencePeak.gain.value = 4.0;
 
   const compressor = offlineCtx.createDynamicsCompressor();
-  compressor.threshold.value = -18;
-  compressor.knee.value = 12;
-  compressor.ratio.value = 6;
-  compressor.attack.value = 0.004;
-  compressor.release.value = 0.14;
+  compressor.threshold.value = -16;
+  compressor.knee.value = 14;
+  compressor.ratio.value = 3.5;
+  compressor.attack.value = 0.006;
+  compressor.release.value = 0.15;
 
   const makeup = offlineCtx.createGain();
-  makeup.gain.value = 1.25;
+  makeup.gain.value = 1.18;
 
   src.connect(highPass);
   highPass.connect(bassShelf);
@@ -189,242 +200,38 @@ async function masterAndFitVoiceover(params: {
   return rendered;
 }
 
-interface FormantTarget {
-  f1: number;
-  f2: number;
-  f3: number;
-  voiced: boolean;
-  noiseLevel: number;
-  noiseFreq: number;
-  weight: number;
-}
-
-function mapCharToFormant(ch: string, isFemale: boolean): FormantTarget {
-  const scale = isFemale ? 1.16 : 1.0;
-  const c = ch.toLowerCase();
-
-  // English & Devanagari Hindi vowels
-  if ('aआअा'.includes(c)) {
-    return { f1: 730 * scale, f2: 1090 * scale, f3: 2440 * scale, voiced: true, noiseLevel: 0.04, noiseFreq: 3200, weight: 1.25 };
-  }
-  if ('eएेै'.includes(c)) {
-    return { f1: 530 * scale, f2: 1840 * scale, f3: 2480 * scale, voiced: true, noiseLevel: 0.04, noiseFreq: 3400, weight: 1.15 };
-  }
-  if ('iyइईिी'.includes(c)) {
-    return { f1: 270 * scale, f2: 2290 * scale, f3: 3010 * scale, voiced: true, noiseLevel: 0.05, noiseFreq: 3600, weight: 1.1 };
-  }
-  if ('oओोौ'.includes(c)) {
-    return { f1: 570 * scale, f2: 840 * scale, f3: 2410 * scale, voiced: true, noiseLevel: 0.04, noiseFreq: 2800, weight: 1.2 };
-  }
-  if ('uउऊुू'.includes(c)) {
-    return { f1: 300 * scale, f2: 870 * scale, f3: 2240 * scale, voiced: true, noiseLevel: 0.04, noiseFreq: 2600, weight: 1.15 };
-  }
-  // Fricatives & sibilants
-  if ('szfvhशषसहफ'.includes(c)) {
-    return { f1: 420 * scale, f2: 1650 * scale, f3: 2700 * scale, voiced: 'zvह'.includes(c), noiseLevel: 0.55, noiseFreq: 'sशष'.includes(c) ? 5400 : 3600, weight: 0.8 };
-  }
-  // Plosives
-  if ('ptkbdgcqकखगघचजटडतदपब'.includes(c)) {
-    return { f1: 360 * scale, f2: 1380 * scale, f3: 2520 * scale, voiced: 'bdgगघजडदब'.includes(c), noiseLevel: 0.42, noiseFreq: 2900, weight: 0.65 };
-  }
-  // Nasals & liquids
-  if ('mnlrwममनलरव'.includes(c)) {
-    return { f1: 340 * scale, f2: 1220 * scale, f3: 2350 * scale, voiced: true, noiseLevel: 0.08, noiseFreq: 2600, weight: 0.9 };
-  }
-  return { f1: 500 * scale, f2: 1450 * scale, f3: 2450 * scale, voiced: true, noiseLevel: 0.08, noiseFreq: 3000, weight: 0.8 };
-}
-
 /**
- * Pure-WebAudio Phoneme-to-Formant Speech Synthesizer (Zero External Network Dependency):
- * Generates a real, non-silent, word-articulated vocal narration AudioBuffer timed strictly
- * to `targetDurationSec - 0.3s` with Male (`114Hz`) / Female (`204Hz`) pitch contour,
- * 3 vocal-tract formant resonators, and consonant burst articulation—then masters it through
- * Broadcast EQ (`+4dB` bass, `+5dB` presence, `-18dB` 6:1 compressor) so exported MP4/WebM
- * files ALWAYS carry real spoken narration energy even in 100% offline/static mode.
+ * Clean, zero-synth-tone silent AudioBuffer used ONLY when cloud Gemini TTS is unavailable
+ * so the browser's natural human OS voice (`Natural`/`Enhanced`/`Google`) plays cleanly
+ * without any robotic or humming synthetic oscillator underneath.
  */
-async function synthesizeWebAudioFormantSpeech(params: {
-  scriptText: string;
-  targetDurationSec: number;
-  voiceGender: VoiceGender;
-}): Promise<AudioBuffer> {
-  const { scriptText, targetDurationSec, voiceGender } = params;
+function createCleanSilentTrack(targetDurationSec: number): AudioBuffer {
   const sampleRate = 48000;
   const safeTargetDur = Math.max(1.5, targetDurationSec);
-  const speechBudgetSec = Math.max(1.2, safeTargetDur - 0.3);
-  const isFemale = voiceGender === 'female';
-  const baseF0 = isFemale ? 204 : 114;
-
-  const words = scriptText
-    .replace(/["“”\n\r]+/g, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-
-  interface SpeechToken {
-    kind: 'phoneme' | 'pause';
-    formant?: FormantTarget;
-    weight: number;
-    pitchFactor: number;
-  }
-
-  const tokens: SpeechToken[] = [];
-  words.forEach((word, wIdx) => {
-    const chars = Array.from(word.replace(/[^\p{L}\p{N}]/gu, ''));
-    const phraseProgress = wIdx / Math.max(1, words.length - 1);
-    // Natural declarative broadcast intonation: confident rise early, authoritative fall at close
-    const sentenceContour = 1.06 - phraseProgress * 0.14;
-    const isSentenceEnd = /[.!?।]$/.test(word);
-    const isClausePause = /[,;:—]$/.test(word);
-
-    const activeChars = chars.length > 0 ? chars : ['a'];
-    // Sample up to 6 phonemes per word so pacing stays crisp and intelligible
-    const step = activeChars.length > 6 ? activeChars.length / 6 : 1;
-    for (let idx = 0; idx < activeChars.length; idx += step) {
-      const ch = activeChars[Math.floor(idx)];
-      const f = mapCharToFormant(ch, isFemale);
-      const localStress = idx === 0 ? 1.05 : 0.98;
-      tokens.push({
-        kind: 'phoneme',
-        formant: f,
-        weight: f.weight,
-        pitchFactor: sentenceContour * localStress,
-      });
-    }
-
-    tokens.push({
-      kind: 'pause',
-      weight: isSentenceEnd ? 3.2 : isClausePause ? 1.7 : 0.65,
-      pitchFactor: sentenceContour,
-    });
-  });
-
-  const totalWeight = tokens.reduce((acc, t) => acc + t.weight, 0) || 1;
-  const offlineCtx = new OfflineAudioContext(
-    1,
-    Math.ceil(safeTargetDur * sampleRate),
-    sampleRate
-  );
-
-  // Create reusable white-noise buffer for fricative/plosive consonant bursts
-  const noiseLen = Math.ceil(safeTargetDur * sampleRate);
-  const noiseBuffer = offlineCtx.createBuffer(1, noiseLen, sampleRate);
-  const noiseData = noiseBuffer.getChannelData(0);
-  let seed = 1337;
-  for (let i = 0; i < noiseLen; i++) {
-    seed = (seed * 16807) % 2147483647;
-    noiseData[i] = (seed / 1073741823.5) - 1;
-  }
-
-  // Glottal pulse oscillator (sawtooth approximates glottal harmonic spectrum cleanly)
-  const glottal = offlineCtx.createOscillator();
-  glottal.type = 'sawtooth';
-  glottal.frequency.setValueAtTime(baseF0, 0);
-
-  const voiceAmp = offlineCtx.createGain();
-  voiceAmp.gain.setValueAtTime(0.0001, 0);
-
-  // 3 parallel vocal-tract formant resonators (F1, F2, F3)
-  const f1 = offlineCtx.createBiquadFilter();
-  f1.type = 'bandpass';
-  f1.Q.value = 5.2;
-  const f1Gain = offlineCtx.createGain();
-  f1Gain.gain.value = 1.0;
-
-  const f2 = offlineCtx.createBiquadFilter();
-  f2.type = 'bandpass';
-  f2.Q.value = 6.5;
-  const f2Gain = offlineCtx.createGain();
-  f2Gain.gain.value = 0.68;
-
-  const f3 = offlineCtx.createBiquadFilter();
-  f3.type = 'bandpass';
-  f3.Q.value = 7.5;
-  const f3Gain = offlineCtx.createGain();
-  f3Gain.gain.value = 0.34;
-
-  // Consonant noise path
-  const noiseSrc = offlineCtx.createBufferSource();
-  noiseSrc.buffer = noiseBuffer;
-  const noiseFilter = offlineCtx.createBiquadFilter();
-  noiseFilter.type = 'bandpass';
-  noiseFilter.Q.value = 2.2;
-  const noiseGain = offlineCtx.createGain();
-  noiseGain.gain.setValueAtTime(0.0001, 0);
-
-  const vocalBus = offlineCtx.createGain();
-  vocalBus.gain.value = 0.9;
-
-  glottal.connect(voiceAmp);
-  voiceAmp.connect(f1);
-  voiceAmp.connect(f2);
-  voiceAmp.connect(f3);
-  f1.connect(f1Gain);
-  f2.connect(f2Gain);
-  f3.connect(f3Gain);
-  f1Gain.connect(vocalBus);
-  f2Gain.connect(vocalBus);
-  f3Gain.connect(vocalBus);
-
-  noiseSrc.connect(noiseFilter);
-  noiseFilter.connect(noiseGain);
-  noiseGain.connect(vocalBus);
-  vocalBus.connect(offlineCtx.destination);
-
-  let cursor = 0.06;
-  for (const tok of tokens) {
-    const dur = Math.max(0.032, (tok.weight / totalWeight) * (speechBudgetSec - 0.1));
-    const endT = Math.min(safeTargetDur - 0.08, cursor + dur);
-    if (cursor >= safeTargetDur - 0.1) break;
-
-    if (tok.kind === 'pause' || !tok.formant) {
-      voiceAmp.gain.setTargetAtTime(0.0001, cursor, 0.012);
-      noiseGain.gain.setTargetAtTime(0.0001, cursor, 0.01);
-    } else {
-      const f = tok.formant;
-      const pitch = baseF0 * tok.pitchFactor;
-      glottal.frequency.setTargetAtTime(pitch, cursor, 0.018);
-      f1.frequency.setTargetAtTime(f.f1, cursor, 0.014);
-      f2.frequency.setTargetAtTime(f.f2, cursor, 0.014);
-      f3.frequency.setTargetAtTime(f.f3, cursor, 0.016);
-
-      voiceAmp.gain.setTargetAtTime(f.voiced ? 0.58 : 0.04, cursor, 0.01);
-      noiseFilter.frequency.setTargetAtTime(f.noiseFreq, cursor, 0.012);
-      noiseGain.gain.setTargetAtTime(f.noiseLevel * 0.36, cursor, 0.008);
-      // Gentle syllable release near phoneme tail
-      if (endT - cursor > 0.045) {
-        voiceAmp.gain.setTargetAtTime(f.voiced ? 0.42 : 0.02, endT - 0.015, 0.01);
-      }
-    }
-
-    cursor = endT;
-  }
-
-  voiceAmp.gain.setTargetAtTime(0.0001, Math.min(safeTargetDur - 0.04, cursor), 0.012);
-  noiseGain.gain.setTargetAtTime(0.0001, Math.min(safeTargetDur - 0.04, cursor), 0.01);
-
-  glottal.start(0);
-  glottal.stop(safeTargetDur);
-  noiseSrc.start(0);
-  noiseSrc.stop(safeTargetDur);
-
-  const rawSpeech = await offlineCtx.startRendering();
-  return masterAndFitVoiceover({
-    rawBuffer: rawSpeech,
-    targetDurationSec: safeTargetDur,
+  const totalSamples = Math.ceil(safeTargetDur * sampleRate);
+  return new AudioBuffer({
+    length: totalSamples,
+    numberOfChannels: 1,
+    sampleRate,
   });
 }
 
 /**
- * Selects the best installed OS SpeechSynthesisVoice matching language (`en-US` / `hi-IN`)
- * and gender (`male` / `female`) for real spoken preview playback in Browser-Speech mode.
+ * Selects the most natural, non-robotic OS SpeechSynthesisVoice matching language
+ * (`en-US` / `hi-IN`) and gender (`male` / `female`) by preferring neural/enhanced voices.
  */
 export function pickBestBrowserSpeechVoice(
   language: OutputLanguage,
   voiceGender: VoiceGender
 ): SpeechSynthesisVoice | null {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null;
-  const voices = window.speechSynthesis.getVoices();
-  if (!voices || voices.length === 0) return null;
+  let voices: SpeechSynthesisVoice[] = [];
+  try {
+    voices = window.speechSynthesis.getVoices() || [];
+  } catch {
+    return null;
+  }
+  if (voices.length === 0) return null;
 
   const langPrefix = language === 'hi' ? 'hi' : 'en';
   const langMatches = voices.filter((v) =>
@@ -432,25 +239,65 @@ export function pickBestBrowserSpeechVoice(
   );
   const pool = langMatches.length > 0 ? langMatches : voices;
 
-  const preferUs =
-    language === 'en'
-      ? pool.filter((v) => v.lang.toLowerCase().includes('us'))
-      : pool;
-  const candidates = preferUs.length > 0 ? preferUs : pool;
+  const femaleHints = [
+    'aria',
+    'jenny',
+    'emma',
+    'ava',
+    'samantha',
+    'swara',
+    'lekha',
+    'google us english',
+    'google हिन्दी',
+    'zira',
+    'victoria',
+    'heera',
+    'kalpana',
+    'female',
+    'kore',
+  ];
+  const maleHints = [
+    'andrew',
+    'brian',
+    'guy',
+    'christopher',
+    'matthew',
+    'daniel',
+    'alex',
+    'madhur',
+    'david',
+    'mark',
+    'hemant',
+    'ravi',
+    'male',
+    'fenrir',
+  ];
+  const naturalBonusHints = ['natural', 'neural', 'online', 'enhanced', 'premium', 'google'];
+  const roboticPenaltyHints = ['espeak', 'compact', 'festival', 'pico', 'whisper', 'bad news', 'zarvox', 'trinoids', 'bells', 'boing'];
+  const preferredHints = voiceGender === 'female' ? femaleHints : maleHints;
 
-  const femaleHints = ['female', 'samantha', 'victoria', 'zira', 'aria', 'jenny', 'google us english', 'heera', 'swara', 'kalpana', 'lekha', 'kore'];
-  const maleHints = ['male', 'daniel', 'alex', 'david', 'mark', 'guy', 'matthew', 'christopher', 'hemant', 'madhur', 'ravi', 'fenrir'];
-  const hints = voiceGender === 'female' ? femaleHints : maleHints;
+  const scored = pool.map((v) => {
+    const name = v.name.toLowerCase();
+    const lang = v.lang.toLowerCase();
+    let score = 0;
 
-  const genderMatch = candidates.find((v) =>
-    hints.some((h) => v.name.toLowerCase().includes(h))
-  );
-  return genderMatch ?? candidates[0] ?? null;
+    if (language === 'en' && lang.includes('us')) score += 18;
+    if (language === 'hi' && lang.includes('in')) score += 18;
+    if (preferredHints.some((h) => name.includes(h))) score += 26;
+    if (naturalBonusHints.some((h) => name.includes(h))) score += 22;
+    if (!v.localService) score += 8; // Cloud/neural OS voices usually sound much cleaner
+    if (roboticPenaltyHints.some((h) => name.includes(h))) score -= 40;
+
+    return { voice: v, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.voice ?? null;
 }
 
 /**
- * Speaks the narration with `window.speechSynthesis` rate-fitted to `targetDurationSec`
- * so the spoken voiceover finishes cleanly inside the clip duration (e.g. 0:17).
+ * Speaks the narration with `window.speechSynthesis` using smooth natural pacing
+ * fitted cleanly inside `targetDurationSec`.
  */
 export function speakWithBrowserSpeech(params: {
   scriptText: string;
@@ -469,14 +316,14 @@ export function speakWithBrowserSpeech(params: {
     const voice = pickBestBrowserSpeechVoice(params.language, params.voiceGender);
     if (voice) utterance.voice = voice;
 
-    // Calibrate speaking rate tightly so narration finishes ~0.4s before clip end with energetic authority
+    // Energetic, crisp explainer pacing (0.98x–1.22x) fitted cleanly inside exact clip duration
     const words = params.scriptText.trim().split(/\s+/).filter(Boolean).length;
-    const estBaseSec = Math.max(1.5, words / 2.45);
-    const budgetSec = Math.max(1.4, params.targetDurationSec - 0.4);
-    const fittedRate = Math.max(0.96, Math.min(1.42, estBaseSec / budgetSec));
+    const estBaseSec = Math.max(1.5, words / 2.55);
+    const budgetSec = Math.max(1.4, params.targetDurationSec - 0.35);
+    const fittedRate = Math.max(0.98, Math.min(1.22, estBaseSec / budgetSec));
 
     utterance.rate = Number(fittedRate.toFixed(2));
-    utterance.pitch = params.voiceGender === 'female' ? 1.08 : 0.9;
+    utterance.pitch = params.voiceGender === 'female' ? 1.02 : 0.95;
     utterance.volume = 1.0;
     window.speechSynthesis.speak(utterance);
     return true;
@@ -532,12 +379,12 @@ export async function synthesizeCommandingVoiceover(params: {
 
   const styleDesc =
     language === 'hi'
-      ? 'Bold, high-authority, energetic Hindi broadcast anchor. Crisp diction, sharp dynamic emphasis on key words, confident forward momentum, never flat or monotone.'
-      : 'Bold, high-authority, energetic American broadcast narrator. Punchy hook energy, crisp articulation, confident vocal dynamics on key moments, never flat or robotic.';
+      ? 'Natural, powerful, energetic Hindi Shorts explainer voice. Crisp diction, warm human authority, lively engaging pacing, never robotic or flat.'
+      : 'Natural, powerful, energetic American Shorts explainer voice. Crisp studio clarity, warm human confidence, lively engaging pacing, never robotic or metallic.';
 
   if (health.geminiConfigured) {
     onStatus?.(
-      `Synthesizing punchy ${voiceGender === 'female' ? 'Female (Kore)' : 'Male (Fenrir)'} voiceover via Gemini 3.8 Flash TTS...`
+      `Synthesizing powerful natural ${voiceGender === 'female' ? 'Female (Kore)' : 'Male (Fenrir)'} voiceover via Gemini 3.8 Flash TTS...`
     );
 
     try {
@@ -562,7 +409,7 @@ export async function synthesizeCommandingVoiceover(params: {
           if (data.audioBase64) {
             rawBuffer = await decodeTtsAudioToBuffer({
               audioBase64: data.audioBase64,
-              mimeType: data.mimeType || 'audio/L16;codec=pcm;rate=24000',
+              mimeType: data.mimeType || 'audio/wav',
             });
             voiceEngine = `${data.modelUsed || 'gemini-3.8-flash-tts'} (${voiceName}) + Studio EQ`;
             voiceSource = 'Gemini-TTS';
@@ -575,32 +422,40 @@ export async function synthesizeCommandingVoiceover(params: {
         }
       } else if (staticEnv.geminiApiKey) {
         // Static GitHub Pages direct Gemini TTS call (1 call, zero 429 retries)
-        const resp = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-tts:generateContent?key=${encodeURIComponent(
-            staticEnv.geminiApiKey
-          )}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal,
-            body: JSON.stringify({
-              contents: [
-                {
-                  role: 'user',
-                  parts: [{ text: `${styleDesc}\n\nSpeak cleanly: ${scriptText}` }],
-                },
-              ],
-              generationConfig: {
-                responseModalities: ['AUDIO'],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName },
+        const requestStaticTts = (modelId: string) =>
+          fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
+              staticEnv.geminiApiKey
+            )}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              signal,
+              body: JSON.stringify({
+                contents: [
+                  {
+                    role: 'user',
+                    parts: [{ text: `${styleDesc}\n\nSpeak naturally: ${scriptText}` }],
+                  },
+                ],
+                generationConfig: {
+                  responseModalities: ['AUDIO'],
+                  speechConfig: {
+                    voiceConfig: {
+                      prebuiltVoiceConfig: { voiceName },
+                    },
                   },
                 },
-              },
-            }),
-          }
-        );
+              }),
+            }
+          );
+
+        let usedTtsModel = 'gemini-3.8-flash-tts';
+        let resp = await requestStaticTts(usedTtsModel);
+        if (resp.status === 404) {
+          usedTtsModel = 'gemini-3.8-flash-lite-tts';
+          resp = await requestStaticTts(usedTtsModel);
+        }
 
         if (resp.ok) {
           const data = (await resp.json()) as {
@@ -616,10 +471,9 @@ export async function synthesizeCommandingVoiceover(params: {
           if (audioPart?.inlineData?.data) {
             rawBuffer = await decodeTtsAudioToBuffer({
               audioBase64: audioPart.inlineData.data,
-              mimeType:
-                audioPart.inlineData.mimeType || 'audio/L16;codec=pcm;rate=24000',
+              mimeType: audioPart.inlineData.mimeType || 'audio/wav',
             });
-            voiceEngine = `gemini-3.8-flash-tts (${voiceName}) + Studio EQ`;
+            voiceEngine = `${usedTtsModel} (${voiceName}) + Studio EQ`;
             voiceSource = 'Gemini-TTS';
           }
         } else {
@@ -637,27 +491,35 @@ export async function synthesizeCommandingVoiceover(params: {
     const osVoice = pickBestBrowserSpeechVoice(language, voiceGender);
     const osVoiceLabel = osVoice ? osVoice.name : voiceGender === 'female' ? 'Female' : 'Male';
     const primaryTtsModel = PIPELINE_15_WORKER_MODELS.step4[0];
-    voiceEngine = `Browser Speech (${osVoiceLabel} · fallback for ${primaryTtsModel}) + Studio EQ`;
+    voiceEngine = `Browser Speech (${osVoiceLabel} · fallback for ${primaryTtsModel})`;
   }
 
-  let masteredBuffer: AudioBuffer;
+  let masteredBuffer: AudioBuffer | null = null;
   if (rawBuffer) {
     onStatus?.(
-      'Mastering broadcast EQ (+4dB bass, +5dB presence) & fitting to clip duration...'
+      'Applying Studio EQ (85Hz HPF, +3dB warmth, +4dB vocal clarity) & fitting to clip duration...'
     );
-    masteredBuffer = await masterAndFitVoiceover({
-      rawBuffer,
-      targetDurationSec,
-    });
-  } else {
+    try {
+      masteredBuffer = await masterAndFitVoiceover({
+        rawBuffer,
+        targetDurationSec,
+      });
+    } catch {
+      masteredBuffer = rawBuffer;
+    }
+  }
+
+  if (!masteredBuffer) {
     onStatus?.(
-      `Synthesizing duration-fitted Browser Speech Voiceover (${targetDurationSec.toFixed(1)}s) + Broadcast EQ...`
+      `Ready for natural human device voiceover (${targetDurationSec.toFixed(1)}s · zero synth tones)...`
     );
-    masteredBuffer = await synthesizeWebAudioFormantSpeech({
-      scriptText,
-      targetDurationSec,
-      voiceGender,
-    });
+    masteredBuffer = createCleanSilentTrack(targetDurationSec);
+    voiceSource = 'Browser-Speech';
+    if (!voiceEngine) {
+      const osVoice = pickBestBrowserSpeechVoice(language, voiceGender);
+      const osVoiceLabel = osVoice ? osVoice.name : voiceGender === 'female' ? 'Female' : 'Male';
+      voiceEngine = `Browser Speech (${osVoiceLabel} · Natural Device Voice)`;
+    }
   }
 
   const pcmSamples = new Float32Array(masteredBuffer.getChannelData(0));

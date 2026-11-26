@@ -213,115 +213,124 @@ export async function analyzeVideoTimelineLocally(
   video.crossOrigin = 'anonymous';
   video.src = source.objectUrl;
 
-  await new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(
-      () => reject(new Error('Timed out while loading video frames for local inspection.')),
-      15000
-    );
-    video.onloadeddata = () => {
-      window.clearTimeout(timer);
-      resolve();
-    };
-    video.onerror = () => {
-      window.clearTimeout(timer);
-      reject(new Error('Browser could not decode this video file for frame inspection.'));
-    };
-    video.load();
-  });
-
-  const sampleW = 160;
-  const sampleH = 90;
-  const canvas = document.createElement('canvas');
-  canvas.width = sampleW;
-  canvas.height = sampleH;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) {
-    return {
-      sceneCutTimestampsSec: [],
-      highActionWindows: [
-        {
-          startSec: 0,
-          endSec: duration,
-          climaxSec: Number((duration * 0.45).toFixed(2)),
-          motionScore: 0.5,
-        },
-      ],
-      detectedWatermarkZones: [],
-      suggestedSafeCropInsets: { top: 0, bottom: 0, left: 0, right: 0 },
-      hasOutroBumper: false,
-      visualSummary: {
-        orientation,
-        pacing: 'dynamic',
-        sceneCutCount: 0,
-        lighting: 'cinematic',
-      },
-    };
-  }
-
-  const sampleCount =
-    duration <= 30 ? 10 : duration <= 120 ? 16 : duration <= 600 ? 22 : 28;
-  const timestamps: number[] = [];
-  for (let i = 0; i < sampleCount; i++) {
-    const frac = i / Math.max(1, sampleCount - 1);
-    const t = Math.min(Math.max(0.15, frac * (duration - 0.25)), Math.max(0.15, duration - 0.15));
-    timestamps.push(Number(t.toFixed(2)));
-  }
-
   const frames: Uint8ClampedArray[] = [];
   const motionScores: { timeSec: number; score: number; luma: number }[] = [];
+  const sampleW = 160;
+  const sampleH = 90;
 
-  for (let i = 0; i < timestamps.length; i++) {
-    const t = timestamps[i];
-    if (onProgress && i % 4 === 0) {
-      onProgress(`Inspecting source timeline (${i + 1}/${timestamps.length} keyframes)...`);
-    }
-
-    await new Promise<void>((resolve) => {
-      const done = () => {
-        video.onseeked = null;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(
+        () => reject(new Error('Timed out while loading video frames for local inspection.')),
+        15000
+      );
+      video.onloadeddata = () => {
+        window.clearTimeout(timer);
         resolve();
       };
-      const timer = window.setTimeout(done, 900);
-      video.onseeked = () => {
+      video.onerror = () => {
         window.clearTimeout(timer);
-        done();
+        reject(new Error('Browser could not decode this video file for frame inspection.'));
       };
-      try {
-        video.currentTime = Math.min(t, Math.max(0, (video.duration || duration) - 0.08));
-      } catch {
-        window.clearTimeout(timer);
-        done();
-      }
+      video.load();
     });
 
-    ctx.drawImage(video, 0, 0, sampleW, sampleH);
-    const img = ctx.getImageData(0, 0, sampleW, sampleH).data;
-    const copy = new Uint8ClampedArray(img);
+    const canvas = document.createElement('canvas');
+    canvas.width = sampleW;
+    canvas.height = sampleH;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) {
+      return {
+        sceneCutTimestampsSec: [],
+        highActionWindows: [
+          {
+            startSec: 0,
+            endSec: duration,
+            climaxSec: Number((duration * 0.45).toFixed(2)),
+            motionScore: 0.5,
+          },
+        ],
+        detectedWatermarkZones: [],
+        suggestedSafeCropInsets: { top: 0, bottom: 0, left: 0, right: 0 },
+        hasOutroBumper: false,
+        visualSummary: {
+          orientation,
+          pacing: 'dynamic',
+          sceneCutCount: 0,
+          lighting: 'cinematic',
+        },
+      };
+    }
 
-    let lumaSum = 0;
-    let diffSum = 0;
-    const prev = frames.length > 0 ? frames[frames.length - 1] : null;
-    for (let p = 0; p < copy.length; p += 16) {
-      const luma = copy[p] * 0.299 + copy[p + 1] * 0.587 + copy[p + 2] * 0.114;
-      lumaSum += luma;
-      if (prev) {
-        diffSum +=
-          Math.abs(copy[p] - prev[p]) +
-          Math.abs(copy[p + 1] - prev[p + 1]) +
-          Math.abs(copy[p + 2] - prev[p + 2]);
+    const sampleCount =
+      duration <= 30 ? 10 : duration <= 120 ? 16 : duration <= 600 ? 22 : 28;
+    const timestamps: number[] = [];
+    for (let i = 0; i < sampleCount; i++) {
+      const frac = i / Math.max(1, sampleCount - 1);
+      const t = Math.min(Math.max(0.15, frac * (duration - 0.25)), Math.max(0.15, duration - 0.15));
+      timestamps.push(Number(t.toFixed(2)));
+    }
+
+    for (let i = 0; i < timestamps.length; i++) {
+      const t = timestamps[i];
+      if (onProgress && i % 4 === 0) {
+        onProgress(`Inspecting source timeline (${i + 1}/${timestamps.length} keyframes)...`);
+      }
+
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          video.onseeked = null;
+          resolve();
+        };
+        const timer = window.setTimeout(done, 900);
+        video.onseeked = () => {
+          window.clearTimeout(timer);
+          done();
+        };
+        try {
+          video.currentTime = Math.min(t, Math.max(0, (video.duration || duration) - 0.08));
+        } catch {
+          window.clearTimeout(timer);
+          done();
+        }
+      });
+
+      try {
+        ctx.drawImage(video, 0, 0, sampleW, sampleH);
+        const img = ctx.getImageData(0, 0, sampleW, sampleH).data;
+        const copy = new Uint8ClampedArray(img);
+
+        let lumaSum = 0;
+        let diffSum = 0;
+        const prev = frames.length > 0 ? frames[frames.length - 1] : null;
+        for (let p = 0; p < copy.length; p += 16) {
+          const luma = copy[p] * 0.299 + copy[p + 1] * 0.587 + copy[p + 2] * 0.114;
+          lumaSum += luma;
+          if (prev) {
+            diffSum +=
+              Math.abs(copy[p] - prev[p]) +
+              Math.abs(copy[p + 1] - prev[p + 1]) +
+              Math.abs(copy[p + 2] - prev[p + 2]);
+          }
+        }
+        const pxCount = copy.length / 16;
+        const avgLuma = lumaSum / Math.max(1, pxCount);
+        const motion = prev ? diffSum / (Math.max(1, pxCount) * 3 * 255) : 0.15;
+
+        frames.push(copy);
+        motionScores.push({ timeSec: t, score: motion, luma: avgLuma });
+      } catch {
+        // Skip unreadable frame without crashing timeline scan
       }
     }
-    const pxCount = copy.length / 16;
-    const avgLuma = lumaSum / Math.max(1, pxCount);
-    const motion = prev ? diffSum / (Math.max(1, pxCount) * 3 * 255) : 0.15;
-
-    frames.push(copy);
-    motionScores.push({ timeSec: t, score: motion, luma: avgLuma });
+  } finally {
+    video.onloadeddata = null;
+    video.onerror = null;
+    video.onseeked = null;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
   }
-
-  video.pause();
-  video.removeAttribute('src');
-  video.load();
 
   const sceneCutTimestampsSec: number[] = [];
   for (let i = 1; i < motionScores.length; i++) {
@@ -507,10 +516,49 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
   const isFast = visual?.pacing === 'fast-cut';
   const formatWord = visual?.orientation === 'landscape' ? 'widescreen' : 'vertical';
 
+  // Mine live YouTube Data API v3 tags, keywords, and upload-hour signals when available
+  const liveTrendTags: string[] = [];
+  for (const t of trends) {
+    if (Array.isArray(t.tags)) {
+      for (const tg of t.tags) {
+        const clean = tg.trim().toLowerCase();
+        if (clean.length >= 3 && clean.length <= 32 && !liveTrendTags.includes(clean)) {
+          liveTrendTags.push(clean);
+        }
+      }
+    }
+  }
   const trendKeyword =
-    trends[0]?.tags?.[0] ||
-    trends[0]?.title?.split(/\s+/).slice(0, 3).join(' ') ||
+    liveTrendTags[0] ||
+    trends[0]?.title
+      ?.replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .trim()
+      .split(/\s+/)
+      .slice(0, 3)
+      .join(' ') ||
     'Breakdown';
+
+  // Derive EST/IST peak window from real YouTube top-video publish hours when available
+  const formatHour12 = (hour24: number): string => {
+    const h = ((hour24 % 24) + 24) % 24;
+    const suffix = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}:00 ${suffix}`;
+  };
+  let liveUploadWindow: string | null = null;
+  const validPubDates = trends
+    .map((t) => (t.publishedAt ? new Date(t.publishedAt) : null))
+    .filter((d): d is Date => Boolean(d && !Number.isNaN(d.getTime())));
+  if (validPubDates.length > 0) {
+    const avgUtcHour = Math.round(
+      validPubDates.reduce((acc, d) => acc + d.getUTCHours(), 0) / validPubDates.length
+    );
+    const estStart = (avgUtcHour - 5 + 24) % 24;
+    const estEnd = (estStart + 2) % 24;
+    const istStart = (avgUtcHour + 5) % 24;
+    const istEnd = (istStart + 2) % 24;
+    liveUploadWindow = `YouTube Trend Peak (${trends.length} live videos): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`;
+  }
 
   // Calibrate number of sentences strictly to clip duration (~2.15 words/sec)
   const sentenceCount = dur <= 10 ? 2 : dur <= 22 ? 3 : 4;
@@ -577,34 +625,48 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
         : `${displayTitleSubject} | हिंदी एक्सप्लेनर`
       : readableTopic
       ? `${readableTopic} — Direct Breakdown & Key Moment`
+      : trends.length > 0
+      ? `${displayTitleSubject} (${trendKeyword})`
       : `${displayTitleSubject} (Direct Breakdown)`;
 
   const description =
     language === 'hi'
-      ? `${displayTitleSubject} का स्पष्ट और सीधा हिंदी विश्लेषण।\n\nइस क्लिप में क्या खास है:\n• शुरुआती फ्रेम से लेकर ${climaxSecRounded} सेकंड के मुख्य मोड़ तक सीधा कवरेज\n• साफ ${formatWord} फ्रेमिंग, सिनेमा कलर ग्रेड और क्रिस्प वॉइसओवर\n\nऐसे और सीधे वीडियो ब्रेकडाउन के लिए सब्सक्राइब करें।`
-      : `Direct English breakdown of ${displayTitleSubject}, keeping every key on-screen moment crystal clear.\n\nWhat happens in this clip:\n• Opening setup leading straight into the ${climaxSecRounded}-second turning point\n• Clean ${formatWord} framing, cinema color grade, and synced commanding narration\n\nSubscribe for daily visual breakdowns and ${trendKeyword} highlights.`;
+      ? `${displayTitleSubject} का स्पष्ट और सीधा हिंदी विश्लेषण।\n\nइस क्लिप में क्या खास है:\n• शुरुआती फ्रेम से लेकर ${climaxSecRounded} सेकंड के मुख्य मोड़ तक सीधा कवरेज\n• साफ ${formatWord} वर्टिकल फ्रेमिंग, सिनेमा कलर ग्रेड और नैचुरल वॉइसओवर\n\nऐसे और सीधे वीडियो ब्रेकडाउन के लिए सब्सक्राइब करें।`
+      : `Direct English breakdown of ${displayTitleSubject}, keeping every key on-screen moment crystal clear.\n\nWhat happens in this clip:\n• Opening setup leading straight into the ${climaxSecRounded}-second turning point\n• Clean vertical framing, cinema color grade, and synced natural narration\n\nSubscribe for daily visual breakdowns and ${trendKeyword} highlights.`;
 
   const tagList = [
     ...(readableTopic ? [readableTopic.toLowerCase()] : []),
+    ...liveTrendTags.slice(0, 6),
     language === 'hi' ? 'hindi explainer' : 'direct breakdown',
     language === 'hi' ? 'hindi voiceover' : 'visual explainer',
     language === 'hi' ? 'viral clip hindi' : 'us shorts explainer',
     'shorts',
     'reels',
     'key moment',
-    'frame by frame',
     trendKeyword.toLowerCase(),
-  ].filter((v, i, arr) => v.length > 1 && arr.indexOf(v) === i);
+  ]
+    .filter((v, i, arr) => v.length > 1 && arr.indexOf(v) === i)
+    .slice(0, 12);
 
-  const hashtags =
+  const dynamicHashtags = liveTrendTags
+    .slice(0, 3)
+    .map((tg) => `#${tg.replace(/[^\p{L}\p{N}]+/gu, '')}`)
+    .filter((h) => h.length > 3);
+
+  const baseHashtags =
     language === 'hi'
-      ? '#Shorts #HindiExplainer #DirectBreakdown #ViralClip #TrendingIndia'
-      : '#Shorts #Explainer #DirectBreakdown #ViralClip #TrendingUS';
+      ? ['#Shorts', '#HindiExplainer', '#DirectBreakdown', '#ViralClip', '#TrendingIndia']
+      : ['#Shorts', '#Explainer', '#DirectBreakdown', '#ViralClip', '#TrendingUS'];
+  const hashtags = [...baseHashtags, ...dynamicHashtags]
+    .filter((v, i, arr) => arr.indexOf(v) === i)
+    .slice(0, 6)
+    .join(' ');
 
   const postingTime =
-    language === 'hi'
+    liveUploadWindow ||
+    (language === 'hi'
       ? 'Best Upload Window: 6:30 PM – 9:00 PM IST (India Peak) | 9:00 AM – 11:30 AM EST (USA Morning)'
-      : 'Best Upload Window: 11:30 AM – 2:00 PM EST & 6:00 PM – 8:30 PM EST (USA Peak) | 9:00 PM – 11:30 PM IST (India Peak)';
+      : 'Best Upload Window: 11:30 AM – 2:00 PM EST & 6:00 PM – 8:30 PM EST (USA Peak) | 9:00 PM – 11:30 PM IST (India Peak)');
 
   return {
     voiceover,

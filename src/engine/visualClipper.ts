@@ -15,13 +15,45 @@ function clamp(v: number, min: number, max: number): number {
 }
 
 function clampSafeCrop(crop: SafeCropInsets): SafeCropInsets {
-  // Never crop more than 3.5% on any side so the main subject is never cut off
+  // Enforce subject-safe anti-copyright edge crop (4%–6.5%) to remove outer border watermarks & sidebars
   return {
-    top: Number(clamp(crop.top || 0, 0, 0.035).toFixed(4)),
-    bottom: Number(clamp(crop.bottom || 0, 0, 0.035).toFixed(4)),
-    left: Number(clamp(crop.left || 0, 0, 0.035).toFixed(4)),
-    right: Number(clamp(crop.right || 0, 0, 0.035).toFixed(4)),
+    top: Number(clamp(Math.max(0.04, crop.top || 0), 0.04, 0.065).toFixed(4)),
+    bottom: Number(clamp(Math.max(0.04, crop.bottom || 0), 0.04, 0.065).toFixed(4)),
+    left: Number(clamp(Math.max(0.04, crop.left || 0), 0.04, 0.065).toFixed(4)),
+    right: Number(clamp(Math.max(0.04, crop.right || 0), 0.04, 0.065).toFixed(4)),
   };
+}
+
+function ensureTopCornerMasks(
+  existing: WatermarkZone[],
+  clipDur: number
+): WatermarkZone[] {
+  const dur = Number(Math.max(1, clipDur).toFixed(2));
+  const defaults: WatermarkZone[] = [
+    {
+      id: 'wm_top_left_cover',
+      startSec: 0,
+      endSec: dur,
+      box: [0.0, 0.0, 0.27, 0.105],
+      action: 'gpu_delogo_patch',
+      label: 'Top-left corner delogo patch',
+    },
+    {
+      id: 'wm_top_right_cover',
+      startSec: 0,
+      endSec: dur,
+      box: [0.73, 0.0, 1.0, 0.105],
+      action: 'gpu_delogo_patch',
+      label: 'Top-right corner delogo patch',
+    },
+  ];
+
+  // Keep detected bottom-corner zones while always guaranteeing clean top-left & top-right delogo patches
+  const extraNonTop = existing.filter((z) => {
+    const cy = (z.box[1] + z.box[3]) / 2;
+    return cy >= 0.5 && z.action === 'gpu_delogo_patch';
+  });
+  return [...defaults, ...extraNonTop].slice(0, 6);
 }
 
 function sanitizeWatermarkZones(
@@ -90,6 +122,18 @@ async function buildStampedContactSheet(params: {
 }): Promise<{ jpegBase64: string; timestampsSec: number[] }> {
   const { source, startSec, endSec, crop } = params;
   const clipDur = Math.max(1, endSec - startSec);
+  const cols = 3;
+  const rows = 2;
+  const totalTiles = cols * rows;
+  const timestampsSec: number[] = [];
+
+  for (let i = 0; i < totalTiles; i++) {
+    const frac = totalTiles === 1 ? 0.5 : i / (totalTiles - 1);
+    const localSec = Number(
+      clamp(frac * Math.max(0.5, clipDur - 0.15) + 0.05, 0, clipDur).toFixed(2)
+    );
+    timestampsSec.push(localSec);
+  }
 
   const video = document.createElement('video');
   video.muted = true;
@@ -98,81 +142,86 @@ async function buildStampedContactSheet(params: {
   video.crossOrigin = 'anonymous';
   video.src = source.objectUrl;
 
-  await new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(
-      () => reject(new Error('Timed out extracting keyframes for contact sheet.')),
-      14000
-    );
-    video.onloadeddata = () => {
-      window.clearTimeout(timer);
-      resolve();
-    };
-    video.onerror = () => {
-      window.clearTimeout(timer);
-      reject(new Error('Unable to decode source video keyframes.'));
-    };
-    video.load();
-  });
-
-  const cols = 3;
-  const rows = 2;
-  const tileW = 320;
-  const tileH = 180;
-  const canvas = document.createElement('canvas');
-  canvas.width = cols * tileW;
-  canvas.height = rows * tileH;
-  const ctx = canvas.getContext('2d');
-
-  const timestampsSec: number[] = [];
-  const totalTiles = cols * rows;
-
-  if (ctx) {
-    ctx.fillStyle = '#0F172A';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const vw = video.videoWidth || source.width || 1280;
-    const vh = video.videoHeight || source.height || 720;
-    const sx = Math.round(vw * crop.left);
-    const sy = Math.round(vh * crop.top);
-    const sw = Math.max(16, Math.round(vw * (1 - crop.left - crop.right)));
-    const sh = Math.max(16, Math.round(vh * (1 - crop.top - crop.bottom)));
-
-    for (let i = 0; i < totalTiles; i++) {
-      const frac = totalTiles === 1 ? 0.5 : i / (totalTiles - 1);
-      const localSec = Number(
-        clamp(frac * Math.max(0.5, clipDur - 0.15) + 0.05, 0, clipDur).toFixed(2)
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(
+        () => reject(new Error('Timed out extracting keyframes for contact sheet.')),
+        14000
       );
-      const absSec = startSec + localSec;
-      timestampsSec.push(localSec);
+      video.onloadeddata = () => {
+        window.clearTimeout(timer);
+        resolve();
+      };
+      video.onerror = () => {
+        window.clearTimeout(timer);
+        reject(new Error('Unable to decode source video keyframes.'));
+      };
+      video.load();
+    });
 
-      await seekVideo(video, absSec);
+    const vw = video.videoWidth || source.width || 1080;
+    const vh = video.videoHeight || source.height || 1920;
+    const isVertical = vh > vw * 1.08;
+    const isSquare = Math.abs(vw - vh) / Math.max(vw, vh) <= 0.12;
+    // Preserve real source proportions so Vision AI accurately recognizes objects & physical actions
+    const tileW = isVertical ? 216 : isSquare ? 256 : 320;
+    const tileH = isVertical ? 384 : isSquare ? 256 : 180;
+    const canvas = document.createElement('canvas');
+    canvas.width = cols * tileW;
+    canvas.height = rows * tileH;
+    const ctx = canvas.getContext('2d');
 
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-      const dx = col * tileW;
-      const dy = row * tileH;
+    if (ctx) {
+      ctx.fillStyle = '#0F172A';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      ctx.save();
-      ctx.filter = 'contrast(1.06) saturate(1.12)';
-      ctx.drawImage(video, sx, sy, sw, sh, dx, dy, tileW, tileH);
-      ctx.restore();
+      const sx = Math.round(vw * crop.left);
+      const sy = Math.round(vh * crop.top);
+      const sw = Math.max(16, Math.round(vw * (1 - crop.left - crop.right)));
+      const sh = Math.max(16, Math.round(vh * (1 - crop.top - crop.bottom)));
 
-      // Timestamp stamp for exact visual beat alignment in Step 3
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-      ctx.fillRect(dx + 8, dy + 8, 86, 24);
-      ctx.fillStyle = '#FFFFFF';
-      ctx.font = '700 13px "JetBrains Mono", monospace';
-      ctx.fillText(`T=${localSec.toFixed(1)}s`, dx + 15, dy + 24);
+      for (let i = 0; i < totalTiles; i++) {
+        const localSec = timestampsSec[i];
+        const absSec = startSec + localSec;
+
+        await seekVideo(video, absSec);
+
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const dx = col * tileW;
+        const dy = row * tileH;
+
+        try {
+          ctx.save();
+          ctx.filter = 'contrast(1.06) saturate(1.12)';
+          ctx.drawImage(video, sx, sy, sw, sh, dx, dy, tileW, tileH);
+          ctx.restore();
+        } catch {
+          // Keep solid dark tile if a single frame decode fails
+        }
+
+        // Timestamp stamp for exact second-by-second action alignment in Step 3
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+        ctx.fillRect(dx + 8, dy + 8, 86, 24);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '700 13px "JetBrains Mono", monospace';
+        ctx.fillText(`T=${localSec.toFixed(1)}s`, dx + 15, dy + 24);
+      }
     }
+
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+    const jpegBase64 = dataUrl.split(',')[1] ?? '';
+    return { jpegBase64, timestampsSec };
+  } catch {
+    return { jpegBase64: '', timestampsSec };
+  } finally {
+    video.onloadeddata = null;
+    video.onerror = null;
+    video.onseeked = null;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
   }
-
-  video.pause();
-  video.removeAttribute('src');
-  video.load();
-
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
-  const jpegBase64 = dataUrl.split(',')[1] ?? '';
-  return { jpegBase64, timestampsSec };
 }
 
 /**
@@ -270,8 +319,9 @@ export async function cleanAndGradeClipsStep2(params: {
     const lockedVisualDurationSec = Number(Math.max(1, endSec - startSec).toFixed(2));
 
     const usableIntervals: TrimRange[] = [{ startSec, endSec }];
-    const delogoZones = seg.watermarkZones.filter(
-      (z) => z.action === 'gpu_delogo_patch'
+    const delogoZones = ensureTopCornerMasks(
+      seg.watermarkZones.filter((z) => z.action === 'gpu_delogo_patch'),
+      lockedVisualDurationSec
     );
     const bumperTrimmedSec =
       i === segments.length - 1

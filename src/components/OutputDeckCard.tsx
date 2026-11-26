@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -21,17 +22,27 @@ import type { RenderedClipOutput } from '../types/studio';
 interface OutputDeckCardProps {
   clips: RenderedClipOutput[];
   runTag: string | null;
+  renderError?: string | null;
 }
 
-export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
+export function OutputDeckCard({
+  clips,
+  runTag,
+  renderError = null,
+}: OutputDeckCardProps) {
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [browserSpeechSyncEnabled, setBrowserSpeechSyncEnabled] = useState(true);
+  const [videoDecodeError, setVideoDecodeError] = useState<string | null>(null);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const copyTimerRef = useRef<number | null>(null);
 
   const safeIdx = Math.min(selectedIdx, Math.max(0, clips.length - 1));
   const activeClip = clips[safeIdx] ?? null;
+  const isBrokenVideo = Boolean(
+    activeClip &&
+      (!activeClip.videoUrl || activeClip.fileSizeBytes <= 1024 || videoDecodeError)
+  );
   const isBrowserSpeechClip = activeClip?.voiceSource === 'Browser-Speech';
   const hasMultipleClips = clips.length > 1;
   const isLandscapeClip = Boolean(activeClip && activeClip.width > activeClip.height * 1.15);
@@ -40,6 +51,7 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
     if (clips.length === 0) return;
     const bounded = (nextIdx + clips.length) % clips.length;
     stopBrowserSpeech();
+    setVideoDecodeError(null);
     setSelectedIdx(bounded);
   };
 
@@ -73,14 +85,20 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-      scheduleCopiedReset(key);
+      try {
+        ta.select();
+        document.execCommand('copy');
+        scheduleCopiedReset(key);
+      } catch {
+        // ignore clipboard fallback failure in locked-down browsers
+      } finally {
+        if (ta.parentNode) ta.parentNode.removeChild(ta);
+      }
     }
   };
 
   const handleDownload = (clip: RenderedClipOutput) => {
+    if (!clip.videoUrl) return;
     const ext = (clip.mimeType ?? '').includes('webm') ? 'webm' : 'mp4';
     const baseName = (runTag || 'studio-clip').replace(/[^a-zA-Z0-9_-]/g, '-');
     const fileName = `${baseName}-clip-${clip.clipIndex}.${ext}`;
@@ -88,8 +106,11 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
     anchor.href = clip.videoUrl;
     anchor.download = fileName;
     document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
+    try {
+      anchor.click();
+    } finally {
+      if (anchor.parentNode) anchor.parentNode.removeChild(anchor);
+    }
   };
 
   const handleVideoPlay = () => {
@@ -112,31 +133,31 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
     ? [
         {
           key: 'title',
-          label: '1. Title',
+          label: 'Title',
           icon: Type,
           value: activeClip.metadata.title,
         },
         {
           key: 'description',
-          label: '2. Description',
+          label: 'Description',
           icon: FileText,
           value: activeClip.metadata.description,
         },
         {
           key: 'tags',
-          label: '3. Tags',
+          label: 'Tags',
           icon: Tag,
           value: activeClip.metadata.tags,
         },
         {
           key: 'hashtags',
-          label: '4. Hashtags',
+          label: 'Hashtags',
           icon: Hash,
           value: activeClip.metadata.hashtags,
         },
         {
           key: 'posting_time',
-          label: '5. Best Upload Time (USA EST + India IST)',
+          label: 'Upload Time (EST/IST)',
           icon: Clock,
           value: activeClip.metadata.postingTime,
         },
@@ -153,16 +174,9 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
           <span className="w-8 h-8 rounded-lg bg-[#00C853] text-white flex items-center justify-center shrink-0">
             <Film className="w-4 h-4" strokeWidth={2.5} />
           </span>
-          <div>
-            <h2 className="text-base font-extrabold text-[#0F172A]">
-              Final Production Output
-            </h2>
-            <p className="text-xs font-medium text-[#64748B]">
-              {activeClip
-                ? `${activeClip.renderEngine} · ${activeClip.width}×${activeClip.height}`
-                : 'Shorts-style preview, MP4 download & 5 copy cards'}
-            </p>
-          </div>
+          <h2 className="text-base font-extrabold text-[#0F172A]">
+            Final Production Output
+          </h2>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
@@ -197,14 +211,31 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
       </div>
 
       {!activeClip ? (
-        <div className="rounded-xl border-2 border-dashed border-[#CBD5E1] bg-[#F4F6F9] px-5 py-10 text-center space-y-1">
-          <p className="text-sm font-extrabold text-[#334155]">
-            No finished clip yet
-          </p>
-          <p className="text-xs font-medium text-[#64748B]">
-            Run the 5-step pipeline to preview clips and copy SEO metadata.
-          </p>
-        </div>
+        renderError ? (
+          <div
+            role="alert"
+            className="rounded-xl border-2 border-[#FF1744] bg-[#FFF1F3] px-4 py-5 flex items-start gap-3 text-left"
+          >
+            <AlertCircle
+              className="w-5 h-5 text-[#FF1744] shrink-0 mt-0.5"
+              strokeWidth={2.5}
+            />
+            <div className="space-y-1">
+              <p className="text-sm font-extrabold text-[#B71C1C]">
+                Video Export Failed
+              </p>
+              <p className="text-xs font-semibold text-[#991B1B] leading-relaxed">
+                {renderError}
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-xl border-2 border-dashed border-[#CBD5E1] bg-[#F4F6F9] px-5 py-10 text-center">
+            <p className="text-sm font-extrabold text-[#334155]">
+              No finished clip yet.
+            </p>
+          </div>
+        )
       ) : (
         <div className="space-y-4">
           {/* Shorts-Style 9:16 Swipeable Multi-Clip Stage */}
@@ -261,25 +292,51 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
               </div>
             )}
 
-            <div
-              className={`w-full overflow-hidden rounded-xl bg-black flex items-center justify-center ${
-                isLandscapeClip
-                  ? 'max-w-[540px] aspect-video'
-                  : 'max-w-[320px] aspect-[9/16]'
-              }`}
-            >
-              <video
-                key={activeClip.videoUrl}
-                src={activeClip.videoUrl}
-                controls
-                playsInline
-                muted={isBrowserSpeechClip && browserSpeechSyncEnabled}
-                onPlay={handleVideoPlay}
-                onPause={handleVideoStop}
-                onEnded={handleVideoStop}
-                className="w-full h-full object-contain"
-              />
-            </div>
+            {isBrokenVideo ? (
+              <div
+                role="alert"
+                className="w-full rounded-xl border-2 border-[#FF1744] bg-[#FFF1F3] px-4 py-6 flex items-start gap-3 text-left"
+              >
+                <AlertCircle
+                  className="w-5 h-5 text-[#FF1744] shrink-0 mt-0.5"
+                  strokeWidth={2.5}
+                />
+                <div className="space-y-1">
+                  <p className="text-sm font-extrabold text-[#B71C1C]">
+                    Video Playback Unavailable
+                  </p>
+                  <p className="text-xs font-semibold text-[#991B1B] leading-relaxed">
+                    {videoDecodeError ||
+                      'Video recorder produced an empty (<= 1 KB) file on this browser. Try Chrome/Safari desktop or a standard MP4 file.'}
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div
+                className={`w-full overflow-hidden rounded-xl bg-black flex items-center justify-center ${
+                  isLandscapeClip
+                    ? 'max-w-[540px] aspect-video'
+                    : 'max-w-[320px] aspect-[9/16]'
+                }`}
+              >
+                <video
+                  key={activeClip.videoUrl}
+                  src={activeClip.videoUrl}
+                  controls
+                  playsInline
+                  muted={isBrowserSpeechClip && browserSpeechSyncEnabled}
+                  onPlay={handleVideoPlay}
+                  onPause={handleVideoStop}
+                  onEnded={handleVideoStop}
+                  onError={() =>
+                    setVideoDecodeError(
+                      'This browser could not decode the recorded video stream. Re-run or test on Chrome/Safari desktop.'
+                    )
+                  }
+                  className="w-full h-full object-contain"
+                />
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] p-3">
@@ -332,15 +389,12 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
 
               <button
                 type="button"
+                disabled={isBrokenVideo}
                 onClick={() => handleDownload(activeClip)}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border-2 border-[#00C853] bg-[#00C853] hover:bg-[#00B248] text-white text-xs font-extrabold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border-2 border-[#00C853] bg-[#00C853] hover:bg-[#00B248] text-white text-xs font-extrabold transition-colors disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap shrink-0"
               >
                 <Download className="w-4 h-4" strokeWidth={2.5} />
-                <span>
-                  {(activeClip.mimeType ?? '').includes('webm')
-                    ? `Download Clip ${activeClip.clipIndex} (WebM)`
-                    : `Download MP4 (Clip ${activeClip.clipIndex})`}
-                </span>
+                <span>Download MP4</span>
               </button>
             </div>
           </div>
@@ -391,13 +445,8 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
             </p>
           </div>
 
-          {/* 5 One-Click Copy SEO Cards */}
-          <div className="space-y-2.5">
-            <h3 className="text-xs font-extrabold uppercase tracking-wide text-[#475569]">
-              5 One-Click Upload Copy Cards
-            </h3>
-
-            <div className="grid grid-cols-1 gap-2.5">
+          {/* 5 One-Click Copy Cards */}
+          <div className="grid grid-cols-1 gap-2.5">
               {copyCards.map((card) => {
                 const Icon = card.icon;
                 const isCopied = copiedKey === card.key;
@@ -444,7 +493,6 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
                   </div>
                 );
               })}
-            </div>
           </div>
         </div>
       )}

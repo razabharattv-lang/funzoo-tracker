@@ -11,8 +11,8 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-const GEMINI_PRIMARY_JSON_MODEL = 'gemini-3.8-flash';
-const GEMINI_FALLBACK_JSON_MODEL = 'gemini-4-hydrogen';
+const GEMINI_PRIMARY_JSON_MODEL = 'gemini-4-hydrogen';
+const GEMINI_FALLBACK_JSON_MODEL = 'gemini-3.1-flash-lite';
 
 const GEMINI_PRIMARY_TTS_MODEL = 'gemini-3.8-flash-tts';
 const GEMINI_FALLBACK_TTS_MODEL = 'gemini-3.8-flash-lite-tts';
@@ -426,15 +426,19 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      const publishedAfter = new Date(
-        Date.now() - 30 * 24 * 60 * 60 * 1000
-      ).toISOString();
-
       const videoIds: string[] = [];
+      const snippetFallback: {
+        title: string;
+        channel: string;
+        publishedAt: string;
+        viewCount: number;
+        likeCount: number;
+        tags: string[];
+      }[] = [];
       const seen = new Set<string>();
 
       await Promise.all(
-        queries.map(async (q) => {
+        queries.slice(0, 1).map(async (q) => {
           const searchUrl = new URL(
             'https://www.googleapis.com/youtube/v3/search'
           );
@@ -444,21 +448,39 @@ async function startServer(): Promise<void> {
           searchUrl.searchParams.set('type', 'video');
           searchUrl.searchParams.set('videoDuration', 'short');
           searchUrl.searchParams.set('order', 'viewCount');
-          searchUrl.searchParams.set('publishedAfter', publishedAfter);
-          searchUrl.searchParams.set('maxResults', '6');
+          searchUrl.searchParams.set('maxResults', '8');
           searchUrl.searchParams.set('key', ytKey);
 
           try {
             const resp = await fetch(searchUrl.toString());
             if (!resp.ok) return;
             const data = (await resp.json()) as {
-              items?: { id?: { videoId?: string } }[];
+              items?: {
+                id?: { videoId?: string };
+                snippet?: {
+                  title?: string;
+                  channelTitle?: string;
+                  publishedAt?: string;
+                  description?: string;
+                };
+              }[];
             };
             for (const item of data.items ?? []) {
               const vid = item.id?.videoId;
               if (vid && !seen.has(vid)) {
                 seen.add(vid);
                 videoIds.push(vid);
+                const descTags = (item.snippet?.description ?? '')
+                  .match(/#[\p{L}\p{N}_]{2,28}/gu)
+                  ?.map((h) => h.slice(1).toLowerCase()) ?? [];
+                snippetFallback.push({
+                  title: item.snippet?.title ?? '',
+                  channel: item.snippet?.channelTitle ?? '',
+                  publishedAt: item.snippet?.publishedAt ?? '',
+                  viewCount: 0,
+                  likeCount: 0,
+                  tags: descTags.slice(0, 10),
+                });
               }
             }
           } catch {
@@ -474,12 +496,12 @@ async function startServer(): Promise<void> {
 
       const detailsUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
       detailsUrl.searchParams.set('part', 'snippet,statistics');
-      detailsUrl.searchParams.set('id', videoIds.slice(0, 12).join(','));
+      detailsUrl.searchParams.set('id', videoIds.slice(0, 8).join(','));
       detailsUrl.searchParams.set('key', ytKey);
 
       const detailsResp = await fetch(detailsUrl.toString());
       if (!detailsResp.ok) {
-        res.json({ trends: [], configured: true });
+        res.json({ trends: snippetFallback, configured: true });
         return;
       }
 

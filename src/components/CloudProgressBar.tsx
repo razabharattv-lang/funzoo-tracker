@@ -18,11 +18,11 @@ interface CloudProgressBarProps {
 }
 
 const STEPS: { id: PipelineStepId; num: string; label: string }[] = [
-  { id: 'step_1_fetch_clip', num: '1', label: 'Fetch & Clip' },
-  { id: 'step_2_clean_grade', num: '2', label: 'Clean & Grade' },
-  { id: 'step_3_translate_seo', num: '3', label: 'Translate & SEO' },
-  { id: 'step_4_voiceover', num: '4', label: 'Voiceover' },
-  { id: 'step_5_mux_output', num: '5', label: 'Mux & Output' },
+  { id: 'step_1_fetch_clip', num: '1', label: 'Fetch' },
+  { id: 'step_2_clean_grade', num: '2', label: 'Clean' },
+  { id: 'step_3_translate_seo', num: '3', label: 'Translate' },
+  { id: 'step_4_voiceover', num: '4', label: 'Voice' },
+  { id: 'step_5_mux_output', num: '5', label: 'Output' },
 ];
 
 function pillStyle(value: string): string {
@@ -79,12 +79,13 @@ export function CloudProgressBar({
           </span>
           <div>
             <h2 className="text-base font-extrabold text-[#0F172A]">
-              5-Step Video Production Pipeline
+              5-Step Pipeline
             </h2>
-            <p className={`text-xs font-bold ${statusColor}`}>
-              {progress.statusDetail ||
-                'Load a video link or local file, then run all 5 steps.'}
-            </p>
+            {progress.status !== 'idle' && progress.statusDetail && (
+              <p className={`text-xs font-bold ${statusColor}`}>
+                {progress.statusDetail}
+              </p>
+            )}
           </div>
         </div>
 
@@ -100,15 +101,12 @@ export function CloudProgressBar({
         </div>
       </div>
 
-      {/* Live Connection Status Pills */}
+      {/* Compact Connection Status Pills */}
       <div
-        aria-label="Live API & Voice Connection Status"
+        aria-label="Connection Status"
         className="flex flex-wrap items-center gap-2 pt-0.5"
       >
-        <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-[#64748B] mr-0.5">
-          <Radio className="w-3.5 h-3.5 text-[#3D5AFE]" strokeWidth={2.5} />
-          <span>Live Status:</span>
-        </span>
+        <Radio className="w-3.5 h-3.5 text-[#3D5AFE] shrink-0" strokeWidth={2.5} />
         {statusPills.map((pill) => (
           <span
             key={pill.label}
