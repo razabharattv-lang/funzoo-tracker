@@ -7,29 +7,42 @@ export default defineConfig(({ mode }) => {
   const isGithubPages =
     process.env.GITHUB_PAGES === 'true' || env.GITHUB_PAGES === 'true';
 
-  const geminiStaticKey = (
-    env.VITE_GEMINI_API_KEY ||
-    (isGithubPages ? env.GEMINI_API_KEY : '') ||
-    ''
-  ).trim();
-  const nvidiaStaticKey = (
-    env.VITE_NVIDIA_API_KEY ||
-    (isGithubPages ? env.NVIDIA_API_KEY : '') ||
-    ''
-  ).trim();
-  const youtubeStaticKey = (
-    env.VITE_YOUTUBE_API_KEY ||
-    (isGithubPages ? env.YOUTUBE_API_KEY : '') ||
-    ''
-  ).trim();
+  const readSafeKey = (
+    viteKey: string,
+    rawKey: string,
+    allowRawOutsidePages = false
+  ): string => {
+    const fromVite = process.env[viteKey] || env[viteKey] || '';
+    const fromRaw =
+      isGithubPages || allowRawOutsidePages
+        ? process.env[rawKey] || env[rawKey] || ''
+        : '';
+    return (fromVite || fromRaw).trim();
+  };
+
+  const geminiStaticKey = readSafeKey('VITE_GEMINI_API_KEY', 'GEMINI_API_KEY');
+  const youtubeStaticKey = readSafeKey('VITE_YOUTUBE_API_KEY', 'YOUTUBE_API_KEY');
+  const nvidiaStaticKey = readSafeKey('VITE_NVIDIA_API_KEY', 'NVIDIA_API_KEY');
+  const cloudinaryCloudName = readSafeKey(
+    'VITE_CLOUDINARY_CLOUD_NAME',
+    'CLOUDINARY_CLOUD_NAME',
+    true
+  );
+  const cloudinaryUploadPreset = readSafeKey(
+    'VITE_CLOUDINARY_UPLOAD_PRESET',
+    'CLOUDINARY_UPLOAD_PRESET',
+    true
+  );
 
   return {
     base: isGithubPages ? '/funzoo-tracker/' : '/',
     plugins: [react(), tailwindcss()],
     define: {
       'import.meta.env.VITE_GEMINI_API_KEY': JSON.stringify(geminiStaticKey),
-      'import.meta.env.VITE_NVIDIA_API_KEY': JSON.stringify(nvidiaStaticKey),
       'import.meta.env.VITE_YOUTUBE_API_KEY': JSON.stringify(youtubeStaticKey),
+      'import.meta.env.VITE_NVIDIA_API_KEY': JSON.stringify(nvidiaStaticKey),
+      'import.meta.env.VITE_CLOUDINARY_CLOUD_NAME': JSON.stringify(cloudinaryCloudName),
+      'import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET': JSON.stringify(cloudinaryUploadPreset),
     },
     worker: {
       format: 'es',

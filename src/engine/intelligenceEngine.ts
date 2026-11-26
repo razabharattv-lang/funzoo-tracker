@@ -85,29 +85,61 @@ function normalizeBeats(
   }));
 }
 
+function isPlaceholderSeoText(value: string): boolean {
+  const lower = value.trim().toLowerCase();
+  if (!lower || lower.length < 3) return true;
+  return (
+    /^(n\/a|na|none|null|undefined|tbd|placeholder|title|description|tags|hashtags|unknown|\.{2,})$/i.test(
+      lower
+    ) ||
+    lower.includes('#nichetag') ||
+    lower.includes('comma-separated niche tags') ||
+    lower.includes('best upload window with both usa est')
+  );
+}
+
+function ensurePopulatedField(
+  candidate: string | undefined,
+  fallback: string,
+  minLen = 4
+): string {
+  const clean = (candidate ?? '').trim();
+  if (clean.length < minLen || isPlaceholderSeoText(clean)) {
+    return fallback;
+  }
+  return clean;
+}
+
 function normalizeCommaList(value: string | string[] | undefined, fallback: string): string {
-  if (Array.isArray(value)) {
-    const joined = value.map((s) => String(s).trim()).filter(Boolean).join(', ');
-    return joined || fallback;
-  }
-  if (typeof value === 'string' && value.trim().length > 0) {
-    return value.trim();
-  }
-  return fallback;
+  const raw = Array.isArray(value)
+    ? value.map((s) => String(s).trim()).filter((s) => !isPlaceholderSeoText(s))
+    : typeof value === 'string' && !isPlaceholderSeoText(value)
+    ? value
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s.length >= 2 && !isPlaceholderSeoText(s))
+    : [];
+
+  if (raw.length < 3) return fallback;
+  return raw.slice(0, 12).join(', ');
 }
 
 function normalizeHashtags(value: string | string[] | undefined, fallback: string): string {
   const raw = Array.isArray(value)
-    ? value.map((s) => String(s).trim()).filter(Boolean)
-    : typeof value === 'string'
-    ? value.trim().split(/[\s,]+/).filter(Boolean)
+    ? value.map((s) => String(s).trim()).filter((s) => !isPlaceholderSeoText(s))
+    : typeof value === 'string' && !isPlaceholderSeoText(value)
+    ? value
+        .trim()
+        .split(/[\s,]+/)
+        .filter((s) => s.length >= 2 && !isPlaceholderSeoText(s))
     : [];
 
-  if (raw.length === 0) return fallback;
-  return raw
+  const cleaned = raw
     .map((tag) => (tag.startsWith('#') ? tag : `#${tag.replace(/^#+/, '')}`))
-    .slice(0, 8)
-    .join(' ');
+    .filter((tag) => tag.length >= 3 && !/^#nichetag\d*$/i.test(tag))
+    .slice(0, 8);
+  if (cleaned.length < 2) return fallback;
+  return cleaned.join(' ');
 }
 
 function formatHour12(hour24: number): string {
@@ -261,8 +293,8 @@ export async function translateClipAndBuildSeoStep3(params: {
 
   const targetDurSec = clip.lockedVisualDurationSec;
   const maxSpeechSec = Math.max(2, targetDurSec - 0.35);
-  // Energetic, crisp explainer pacing (~2.45 words/sec) fitted cleanly inside exact clip duration
-  const targetWordCount = Math.max(12, Math.round(maxSpeechSec * 2.45));
+  // Crisp high-retention pacing (~2.4 words/sec) scaled safely for short clips and 45-120s story arcs
+  const targetWordCount = Math.max(14, Math.min(260, Math.round(maxSpeechSec * 2.4)));
   const safeTopicHint =
     extractReadableTopicFromLabel(sourceLabel, customAngle) ||
     'Identify directly from the 6 video frames (ignore numeric filename)';
@@ -275,8 +307,8 @@ export async function translateClipAndBuildSeoStep3(params: {
     language === 'hi'
       ? 'Write voiceover, beats, title, description, tags, hashtags, and posting_time STRICTLY in Devanagari Hindi (keeping only EST/IST timezone abbreviations).'
       : 'Write voiceover, beats, title, description, tags, hashtags, and posting_time STRICTLY in natural American English (USA).';
-  const hookEndSec = Number(Math.min(1.6, Math.max(1.1, maxSpeechSec * 0.18)).toFixed(1));
-  const targetBeatCount = Math.max(3, Math.min(6, Math.round(maxSpeechSec / 3.5)));
+  const hookEndSec = Number(Math.min(2.0, Math.max(1.5, maxSpeechSec * 0.14)).toFixed(1));
+  const targetBeatCount = Math.max(3, Math.min(8, Math.round(maxSpeechSec / 4.0)));
   const beatSpanSec = Number(((maxSpeechSec - hookEndSec) / Math.max(1, targetBeatCount - 1)).toFixed(1));
   const beat2EndSec = Number(Math.min(maxSpeechSec - 0.8, hookEndSec + beatSpanSec).toFixed(1));
   const beat3EndSec = Number(Math.min(maxSpeechSec - 0.4, beat2EndSec + beatSpanSec).toFixed(1));
@@ -412,25 +444,35 @@ RETURN STRICT JSON ONLY:
   const voiceover = parsed.voiceover.trim();
   const beats = normalizeBeats(parsed.beats, voiceover, targetDurSec);
 
+  const rawPostingTime = ensurePopulatedField(
+    parsed.posting_time,
+    offlineDefaults.postingTime,
+    8
+  );
+  const safePostingTime =
+    rawPostingTime.includes('EST') && rawPostingTime.includes('IST')
+      ? rawPostingTime
+      : offlineDefaults.postingTime;
+
   const customizedSeo = customizeSeoWithNicheYouTubeTrends({
     detectedTopic,
     language,
-    title: (parsed.title?.trim() || offlineDefaults.title).slice(0, 100),
-    description: parsed.description?.trim() || offlineDefaults.description,
+    title: ensurePopulatedField(parsed.title, offlineDefaults.title, 6).slice(0, 100),
+    description: ensurePopulatedField(parsed.description, offlineDefaults.description, 16),
     tags: normalizeCommaList(parsed.tags, offlineDefaults.tags),
     hashtags: normalizeHashtags(parsed.hashtags, offlineDefaults.hashtags),
-    postingTime: parsed.posting_time?.trim() || offlineDefaults.postingTime,
+    postingTime: safePostingTime,
     trends: activeTrends,
   });
 
   return {
     voiceover,
     beats,
-    title: customizedSeo.title.slice(0, 100),
-    description: customizedSeo.description,
-    tags: customizedSeo.tags,
-    hashtags: customizedSeo.hashtags,
-    postingTime: customizedSeo.postingTime,
+    title: ensurePopulatedField(customizedSeo.title, offlineDefaults.title, 6).slice(0, 100),
+    description: ensurePopulatedField(customizedSeo.description, offlineDefaults.description, 16),
+    tags: normalizeCommaList(customizedSeo.tags, offlineDefaults.tags),
+    hashtags: normalizeHashtags(customizedSeo.hashtags, offlineDefaults.hashtags),
+    postingTime: ensurePopulatedField(customizedSeo.postingTime, offlineDefaults.postingTime, 8),
     scriptEngine: `${aiResponse.modelUsed}${detectedTopic ? ` · Topic: ${detectedTopic}` : ''}${activeTrends.length > 0 ? ` + YouTube US (${activeTrends.length})` : ''}`,
     youtubeTrendsCount: activeTrends.length,
     fetchedTrends: activeTrends,

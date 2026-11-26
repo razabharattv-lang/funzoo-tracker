@@ -129,18 +129,17 @@ async function masterAndFitVoiceover(params: {
   const trimmedLen = Math.max(1, lastActive - firstActive + 1);
   const trimmedDurSec = trimmedLen / rawBuffer.sampleRate;
 
-  // Keep playbackRate tightly bounded (0.95x–1.06x) so AudioBufferSourceNode never pitches
-  // the voice up into a thin, squeaky, or childlike tone.
-  let playbackRate = 0.985;
+  // Keep playbackRate smoothly bounded (0.95x–1.12x) so narration fits the exact edited clip
+  // duration without squeaky chipmunk pitch shift or overflowing past visual end.
+  let playbackRate = 0.99;
   if (trimmedDurSec > speechBudgetSec) {
-    playbackRate = Math.min(1.06, trimmedDurSec / speechBudgetSec);
+    playbackRate = Math.min(1.12, trimmedDurSec / speechBudgetSec);
   } else if (trimmedDurSec < speechBudgetSec * 0.72) {
     playbackRate = Math.max(0.95, trimmedDurSec / (speechBudgetSec * 0.88));
   }
 
-  const fittedSpeechDur = trimmedDurSec / playbackRate;
-  const finalDurSec = Math.max(safeTargetDur, fittedSpeechDur + 0.12);
-  const totalOutSamples = Math.ceil(finalDurSec * outSampleRate);
+  // Lock mastered buffer length strictly to the edited clip duration (exact 1:1 visual sync)
+  const totalOutSamples = Math.ceil(safeTargetDur * outSampleRate);
 
   const offlineCtx = new OfflineAudioContext(1, totalOutSamples, outSampleRate);
   const trimmedBuf = offlineCtx.createBuffer(1, trimmedLen, rawBuffer.sampleRate);
@@ -214,8 +213,15 @@ async function masterAndFitVoiceover(params: {
   }
   if (peak > 0.001) {
     const scale = Math.min(2.4, 0.92 / peak);
+    const fadeSamples = Math.min(Math.floor(outSampleRate * 0.025), Math.floor(data.length / 4));
     for (let i = 0; i < data.length; i++) {
-      data[i] = Math.max(-0.98, Math.min(0.98, data[i] * scale));
+      let sample = Math.max(-0.98, Math.min(0.98, data[i] * scale));
+      if (i < fadeSamples) {
+        sample *= i / Math.max(1, fadeSamples);
+      } else if (i > data.length - fadeSamples) {
+        sample *= (data.length - i) / Math.max(1, fadeSamples);
+      }
+      data[i] = sample;
     }
   }
 
@@ -660,19 +666,20 @@ export async function synthesizeCommandingVoiceover(params: {
   }
 
   const pcmSamples = new Float32Array(masteredBuffer.getChannelData(0));
+  const alignedDurSec = Math.max(1.5, targetDurationSec);
   const wordTimings = alignCaptionsOffline({
     audioBuffer: masteredBuffer,
     scriptText,
     beats,
     language,
-    targetDurationSec: masteredBuffer.duration,
+    targetDurationSec: alignedDurSec,
   });
 
   return {
     audioBuffer: masteredBuffer,
     pcmSamples,
     sampleRate: masteredBuffer.sampleRate,
-    durationSec: Number(masteredBuffer.duration.toFixed(2)),
+    durationSec: Number(alignedDurSec.toFixed(2)),
     voiceEngine,
     voiceSource,
     wordTimings,

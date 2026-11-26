@@ -50,6 +50,41 @@ function computeTargetDimensions(
   return isMobile ? { width: 720, height: 1280 } : { width: 1080, height: 1920 };
 }
 
+async function waitForVideoFrameReady(
+  video: HTMLVideoElement,
+  timeoutMs = 3500
+): Promise<boolean> {
+  if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+    return true;
+  }
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      window.clearInterval(poll);
+      video.removeEventListener('loadeddata', onReady);
+      video.removeEventListener('canplay', onReady);
+      video.removeEventListener('seeked', onReady);
+      resolve(ok);
+    };
+    const onReady = () => {
+      if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        finish(true);
+      }
+    };
+    const timer = window.setTimeout(
+      () => finish(video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0),
+      timeoutMs
+    );
+    const poll = window.setInterval(onReady, 40);
+    video.addEventListener('loadeddata', onReady);
+    video.addEventListener('canplay', onReady);
+    video.addEventListener('seeked', onReady);
+  });
+}
+
 async function seekVideoPrecise(
   video: HTMLVideoElement,
   targetSec: number
@@ -58,7 +93,12 @@ async function seekVideoPrecise(
     0,
     Math.min(targetSec, Math.max(0, (video.duration || targetSec + 0.1) - 0.04))
   );
-  if (Math.abs(video.currentTime - clamped) < 0.008 && video.readyState >= 2) {
+  if (
+    Math.abs(video.currentTime - clamped) < 0.008 &&
+    video.readyState >= 2 &&
+    video.videoWidth > 0 &&
+    video.videoHeight > 0
+  ) {
     return;
   }
 
@@ -67,7 +107,7 @@ async function seekVideoPrecise(
       video.onseeked = null;
       resolve();
     };
-    const timer = window.setTimeout(done, 1000);
+    const timer = window.setTimeout(done, 1200);
     video.onseeked = () => {
       window.clearTimeout(timer);
       done();
@@ -79,6 +119,10 @@ async function seekVideoPrecise(
       done();
     }
   });
+
+  if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
+    await waitForVideoFrameReady(video, 1200);
+  }
 }
 
 /**
@@ -182,17 +226,27 @@ async function renderSinglePassWebCodecsWorker(params: {
     onProgress,
   } = params;
 
-  const durationSec = Math.max(
-    1.5,
-    Math.min(clip.lockedVisualDurationSec, voice.durationSec)
-  );
+  // Preserve full trimmed clip duration — never truncate a 15s clip down to shorter audio
+  const durationSec = Math.max(1.5, clip.lockedVisualDurationSec);
   const totalFrames = Math.max(1, Math.round(durationSec * fps));
 
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
   video.preload = 'auto';
   video.crossOrigin = 'anonymous';
+  video.style.position = 'fixed';
+  video.style.left = '-9999px';
+  video.style.top = '0';
+  video.style.width = '2px';
+  video.style.height = '2px';
+  video.style.opacity = '0.001';
+  video.style.pointerEvents = 'none';
+  if (document.body) {
+    document.body.appendChild(video);
+  }
   video.src = source.objectUrl;
 
   let worker: Worker | null = null;
@@ -214,6 +268,9 @@ async function renderSinglePassWebCodecsWorker(params: {
     video.pause();
     video.removeAttribute('src');
     video.load();
+    if (video.parentNode) {
+      video.parentNode.removeChild(video);
+    }
   };
 
   try {
@@ -232,6 +289,10 @@ async function renderSinglePassWebCodecsWorker(params: {
       };
       video.load();
     });
+    await waitForVideoFrameReady(video, 3500);
+    if (video.videoWidth <= 0 || video.videoHeight <= 0) {
+      throw new Error('Source video had no decodable frame dimensions for GPU render.');
+    }
 
     worker = new Worker(new URL('./renderWorker.ts', import.meta.url), {
       type: 'module',
@@ -303,8 +364,13 @@ async function renderSinglePassWebCodecsWorker(params: {
         };
       });
 
-    // Copy PCM buffer for zero-copy transfer into worker
-    const pcmCopy = new Float32Array(voice.pcmSamples);
+    // Pad PCM buffer to at least full clip duration so audio track aligns cleanly without truncating video
+    const targetPcmSamples = Math.max(
+      voice.pcmSamples.length,
+      Math.ceil(durationSec * voice.sampleRate)
+    );
+    const pcmCopy = new Float32Array(targetPcmSamples);
+    pcmCopy.set(voice.pcmSamples, 0);
     const readyPromise = nextWorkerReply(25_000);
     worker.postMessage(
       {
@@ -327,7 +393,7 @@ async function renderSinglePassWebCodecsWorker(params: {
     );
     await readyPromise;
 
-    const PACE_FACTOR = 1.035;
+    const PACE_FACTOR = 1.0;
     const maxOffsetSec = Math.max(0.05, clip.lockedVisualDurationSec - 0.04);
 
     for (let i = 0; i < totalFrames; i++) {
@@ -340,6 +406,9 @@ async function renderSinglePassWebCodecsWorker(params: {
       const sourceTimeSec =
         clip.trimRange.startSec + Math.min(maxOffsetSec, timeSec * PACE_FACTOR);
       await seekVideoPrecise(video, sourceTimeSec);
+      if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
+        await waitForVideoFrameReady(video, 1200);
+      }
 
       const bitmap = await createImageBitmap(video);
       try {
@@ -438,11 +507,10 @@ async function runSingleMediaRecorderAttempt(params: {
     onProgress,
   } = params;
 
-  const durationSec = Math.max(
-    1.5,
-    Math.min(clip.lockedVisualDurationSec, voice.durationSec)
-  );
+  // Preserve full trimmed clip duration — never truncate a 15s clip down to shorter audio
+  const durationSec = Math.max(1.5, clip.lockedVisualDurationSec);
 
+  // Attach hidden off-screen video element so mobile browsers decode real hardware frames
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
@@ -450,6 +518,16 @@ async function runSingleMediaRecorderAttempt(params: {
   video.setAttribute('webkit-playsinline', '');
   video.preload = 'auto';
   video.crossOrigin = 'anonymous';
+  video.style.position = 'fixed';
+  video.style.left = '-9999px';
+  video.style.top = '0';
+  video.style.width = '2px';
+  video.style.height = '2px';
+  video.style.opacity = '0.001';
+  video.style.pointerEvents = 'none';
+  if (document.body) {
+    document.body.appendChild(video);
+  }
   video.src = source.objectUrl;
 
   // Keep capture canvas attached off-screen during recording so mobile browsers
@@ -527,8 +605,12 @@ async function runSingleMediaRecorderAttempt(params: {
     }
 
     await seekVideoPrecise(video, clip.trimRange.startSec);
+    const frameReady = await waitForVideoFrameReady(video, 3500);
+    if (!frameReady || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      throw new Error('Source video frames were not ready for canvas recording.');
+    }
 
-    const PACE_FACTOR = 1.035;
+    const PACE_FACTOR = 1.0;
     try {
       video.playbackRate = PACE_FACTOR;
     } catch {
@@ -554,78 +636,95 @@ async function runSingleMediaRecorderAttempt(params: {
     gradeWash.addColorStop(0.5, 'rgba(255, 190, 110, 0.10)');
     gradeWash.addColorStop(1, 'rgba(12, 20, 38, 0.20)');
 
-    let drawnFrames = 0;
+    let drawnRealVideoFrames = 0;
     const paintFrame = (elapsedSec: number) => {
       try {
-        ctx.fillStyle = '#0F172A';
+        const hasValidFrame =
+          video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+
+        if (!hasValidFrame) {
+          // Never overwrite an already-painted real video frame with a black rectangle during seeks
+          if (drawnRealVideoFrames === 0) {
+            ctx.fillStyle = '#0F172A';
+            ctx.fillRect(0, 0, width, height);
+          }
+          return;
+        }
+
+        // Full-bleed 9:16 anti-copyright push-in (1.08x -> 1.15x) + subtle motion drift (no dark sidebars)
+        const tFrac = Math.max(0, Math.min(1, elapsedSec / Math.max(0.1, durationSec)));
+        const smoothT = tFrac * tFrac * (3 - 2 * tFrac);
+        const zoom = 1.08 + 0.07 * smoothT;
+        const zoomSw = Math.max(16, Math.round(drawSw / zoom));
+        const zoomSh = Math.max(16, Math.round(drawSh / zoom));
+        const zoomSx = Math.max(
+          0,
+          Math.min(
+            vw - zoomSw,
+            drawSx + Math.round((drawSw - zoomSw) * (0.48 + 0.04 * smoothT))
+          )
+        );
+        const zoomSy = Math.max(
+          0,
+          Math.min(
+            vh - zoomSh,
+            drawSy + Math.round((drawSh - zoomSh) * (0.47 + 0.06 * smoothT))
+          )
+        );
+
+        ctx.save();
+        ctx.filter = 'contrast(1.24) saturate(1.34) brightness(1.04)';
+        ctx.drawImage(video, zoomSx, zoomSy, zoomSw, zoomSh, 0, 0, width, height);
+        ctx.restore();
+
+        // Visible cinema split-tone wash + balanced clarity vignette
+        ctx.save();
+        ctx.globalCompositeOperation = 'soft-light';
+        ctx.fillStyle = gradeWash;
+        ctx.fillRect(0, 0, width, height);
+        ctx.restore();
+
+        ctx.fillStyle = vignetteGrad;
         ctx.fillRect(0, 0, width, height);
 
-        if (video.readyState >= 2) {
-          // Full-bleed 9:16 anti-copyright push-in (1.08x -> 1.15x) + subtle motion drift (no dark sidebars)
-          const tFrac = Math.max(0, Math.min(1, elapsedSec / Math.max(0.1, durationSec)));
-          const smoothT = tFrac * tFrac * (3 - 2 * tFrac);
-          const zoom = 1.08 + 0.07 * smoothT;
-          const zoomSw = Math.max(16, Math.round(drawSw / zoom));
-          const zoomSh = Math.max(16, Math.round(drawSh / zoom));
-          const zoomSx = Math.max(
-            0,
-            Math.min(
-              vw - zoomSw,
-              drawSx + Math.round((drawSw - zoomSw) * (0.48 + 0.04 * smoothT))
-            )
-          );
-          const zoomSy = Math.max(
-            0,
-            Math.min(
-              vh - zoomSh,
-              drawSy + Math.round((drawSh - zoomSh) * (0.47 + 0.06 * smoothT))
-            )
-          );
-
-          ctx.save();
-          ctx.filter = 'contrast(1.24) saturate(1.34) brightness(1.04)';
-          ctx.drawImage(video, zoomSx, zoomSy, zoomSw, zoomSh, 0, 0, width, height);
-          ctx.restore();
-
-          // Visible cinema split-tone wash + balanced clarity vignette
-          ctx.save();
-          ctx.globalCompositeOperation = 'soft-light';
-          ctx.fillStyle = gradeWash;
-          ctx.fillRect(0, 0, width, height);
-          ctx.restore();
-
-          ctx.fillStyle = vignetteGrad;
-          ctx.fillRect(0, 0, width, height);
-
-          // Seamless blended corner delogo patch (samples adjacent clean video area with matching color grade)
-          for (const z of clip.watermarkZones) {
-            if (elapsedSec >= z.startSec && elapsedSec <= z.endSec) {
-              const zx = Math.round(z.box[0] * width);
-              const zy = Math.round(z.box[1] * height);
-              const zw = Math.max(12, Math.round((z.box[2] - z.box[0]) * width));
-              const zh = Math.max(12, Math.round((z.box[3] - z.box[1]) * height));
-              const radius = Math.min(22, Math.round(Math.min(zw, zh) * 0.3));
-              const isTop = (z.box[1] + z.box[3]) * 0.5 < 0.5;
-              const shiftPx = isTop ? -Math.round(zh * 1.18) : Math.round(zh * 1.18);
-              ctx.save();
-              ctx.beginPath();
-              ctx.roundRect(zx, zy, zw, zh, radius);
-              ctx.clip();
-              ctx.filter = 'blur(18px) contrast(1.22) saturate(1.30) brightness(1.03)';
-              ctx.drawImage(
-                video,
-                zoomSx,
-                zoomSy,
-                zoomSw,
-                zoomSh,
-                0,
-                shiftPx,
-                width,
-                height
-              );
-              ctx.restore();
-            }
+        // Seamless blended corner delogo patch (samples adjacent clean video area with matching color grade)
+        for (const z of clip.watermarkZones) {
+          if (elapsedSec >= z.startSec && elapsedSec <= z.endSec) {
+            const zx = Math.round(z.box[0] * width);
+            const zy = Math.round(z.box[1] * height);
+            const zw = Math.max(12, Math.round((z.box[2] - z.box[0]) * width));
+            const zh = Math.max(12, Math.round((z.box[3] - z.box[1]) * height));
+            const radius = Math.min(22, Math.round(Math.min(zw, zh) * 0.3));
+            const isTop = (z.box[1] + z.box[3]) * 0.5 < 0.5;
+            const shiftPx = isTop ? -Math.round(zh * 1.18) : Math.round(zh * 1.18);
+            ctx.save();
+            ctx.beginPath();
+            ctx.roundRect(zx, zy, zw, zh, radius);
+            ctx.clip();
+            ctx.filter = 'blur(18px) contrast(1.22) saturate(1.30) brightness(1.03)';
+            ctx.drawImage(
+              video,
+              zoomSx,
+              zoomSy,
+              zoomSw,
+              zoomSh,
+              0,
+              shiftPx,
+              width,
+              height
+            );
+            ctx.restore();
           }
+        }
+
+        // Clean outro/end-card mask fade in the final 0.25s when bumper trimming is active
+        if (clip.bumperTrimmedSec > 0 && durationSec - elapsedSec < 0.25) {
+          const fadeAlpha = Math.max(
+            0,
+            Math.min(0.85, (0.25 - (durationSec - elapsedSec)) / 0.25)
+          );
+          ctx.fillStyle = `rgba(9, 14, 26, ${fadeAlpha.toFixed(3)})`;
+          ctx.fillRect(0, 0, width, height);
         }
 
         drawCapCutPopCaption({
@@ -636,7 +735,7 @@ async function runSingleMediaRecorderAttempt(params: {
           canvasWidth: width,
           canvasHeight: height,
         });
-        drawnFrames++;
+        drawnRealVideoFrames++;
       } catch {
         // Skip transient frame draw failure without breaking recording loop
       }
@@ -839,9 +938,9 @@ async function runSingleMediaRecorderAttempt(params: {
       : 'video/webm';
     const blob = new Blob(chunks, { type: cleanMime });
 
-    if (drawnFrames < 2 || blob.size <= 1024) {
+    if (drawnRealVideoFrames < 2 || blob.size <= 4096) {
       throw new Error(
-        `MediaRecorder produced an empty output (${blob.size} bytes, ${drawnFrames} drawn frames).`
+        `MediaRecorder produced an empty or black output (${blob.size} bytes, ${drawnRealVideoFrames} real video frames).`
       );
     }
 
@@ -892,6 +991,9 @@ async function runSingleMediaRecorderAttempt(params: {
     video.pause();
     video.removeAttribute('src');
     video.load();
+    if (video.parentNode) {
+      video.parentNode.removeChild(video);
+    }
     if (canvas.parentNode) {
       canvas.parentNode.removeChild(canvas);
     }
@@ -1010,10 +1112,8 @@ function verifyClipSequenceTiming(params: {
   metadata: TrendMetadata;
   voice: SynthesizedVoiceResult;
 }): { clip: PreparedVisualClip; metadata: TrendMetadata; voice: SynthesizedVoiceResult } {
-  const maxDur = Math.max(
-    1.5,
-    Math.min(params.clip.lockedVisualDurationSec, params.voice.durationSec)
-  );
+  // Keep full trimmed visual clip duration intact so short clips are never cut prematurely
+  const maxDur = Math.max(1.5, params.clip.lockedVisualDurationSec);
 
   const boundedZones = params.clip.watermarkZones.map((z) => {
     const startSec = Math.max(0, Math.min(maxDur - 0.1, z.startSec));

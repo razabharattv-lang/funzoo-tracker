@@ -114,19 +114,21 @@ export function drawCapCutPopCaption(params: {
   canvasHeight: number;
 }): void {
   const { ctx, chunks, timeSec, language, canvasWidth, canvasHeight } = params;
-  const active = chunks.find((c) => timeSec >= c.startSec && timeSec < c.endSec);
+  const active =
+    chunks.find((c) => timeSec >= c.startSec && timeSec < c.endSec) ??
+    chunks.find((c) => timeSec >= c.startSec - 0.04 && timeSec <= c.endSec + 0.06);
   if (!active || active.words.length === 0) return;
 
   const scaleFactor = canvasWidth / 1080;
-  const localT = timeSec - active.startSec;
+  const localT = Math.max(0, timeSec - active.startSec);
   const popScale =
     localT < 0.08
-      ? 0.85 + (localT / 0.08) * 0.22
+      ? 0.88 + (localT / 0.08) * 0.18
       : localT < 0.14
-      ? 1.07 - ((localT - 0.08) / 0.06) * 0.07
+      ? 1.06 - ((localT - 0.08) / 0.06) * 0.06
       : 1.0;
 
-  const fontSize = Math.round((language === 'hi' ? 66 : 72) * scaleFactor);
+  const fontSize = Math.round((language === 'hi' ? 62 : 68) * scaleFactor);
   const fontFamily =
     language === 'hi'
       ? '"Noto Sans Devanagari", "Plus Jakarta Sans", sans-serif'
@@ -137,7 +139,7 @@ export function drawCapCutPopCaption(params: {
   ctx.textBaseline = 'middle';
   ctx.lineJoin = 'round';
   ctx.lineWidth = Math.max(6, Math.round(14 * scaleFactor));
-  ctx.strokeStyle = '#0F172A';
+  ctx.strokeStyle = '#090E1A';
 
   const spacing = Math.round(20 * scaleFactor);
   const widths = active.words.map((w) => ctx.measureText(w).width);
@@ -145,24 +147,45 @@ export function drawCapCutPopCaption(params: {
     widths.reduce((acc, w) => acc + w, 0) +
     spacing * Math.max(0, active.words.length - 1);
 
+  // Safe vertical margin (74% height keeps captions well above Shorts/Reels bottom UI and right icons)
   const centerX = canvasWidth / 2;
-  const centerY = Math.round(canvasHeight * 0.82);
+  const centerY = Math.round(canvasHeight * 0.74);
 
-  const maxAllowedW = canvasWidth - Math.round(84 * scaleFactor);
+  const safeHorizontalMargin = Math.round(136 * scaleFactor);
+  const maxAllowedW = Math.max(120, canvasWidth - safeHorizontalMargin);
   const fitScale = totalW > maxAllowedW ? maxAllowedW / totalW : 1.0;
   const finalScale = popScale * fitScale;
 
   ctx.translate(centerX, centerY);
   ctx.scale(finalScale, finalScale);
 
+  // Clean high-contrast translucent backing pill so text pops over bright/busy frames
+  const padX = Math.round(26 * scaleFactor);
+  const padY = Math.round(16 * scaleFactor);
+  const boxW = totalW + padX * 2;
+  const boxH = fontSize + padY * 2;
+  const boxR = Math.round(20 * scaleFactor);
+  ctx.fillStyle = 'rgba(9, 14, 26, 0.64)';
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(-boxW / 2, -boxH / 2, boxW, boxH, boxR);
+  } else {
+    ctx.rect(-boxW / 2, -boxH / 2, boxW, boxH);
+  }
+  ctx.fill();
+
   // Highlight active word based on exact offline word timing if available
   let activeWordIdx = active.words.length - 1;
   if (active.wordTimings && active.wordTimings.length === active.words.length) {
     const foundIdx = active.wordTimings.findIndex(
-      (wt) => timeSec >= wt.startSec - 0.02 && timeSec <= wt.endSec + 0.04
+      (wt) => timeSec >= wt.startSec - 0.03 && timeSec <= wt.endSec + 0.05
     );
     if (foundIdx !== -1) activeWordIdx = foundIdx;
   }
+
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.65)';
+  ctx.shadowBlur = Math.round(12 * scaleFactor);
+  ctx.shadowOffsetY = Math.round(4 * scaleFactor);
 
   let cursorX = -totalW / 2;
   active.words.forEach((word, idx) => {

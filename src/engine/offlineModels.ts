@@ -450,7 +450,7 @@ export async function analyzeVideoTimelineLocally(
   const effectiveDuration = Math.max(1.5, duration - usableStart);
 
   const highActionWindows: LocalSceneScanResult['highActionWindows'] = [];
-  if (duration <= 30) {
+  if (duration <= 45) {
     const peak = motionScores.reduce(
       (best, cur) => (cur.score > best.score ? cur : best),
       motionScores[0] ?? { timeSec: duration * 0.45, score: 0.25, luma: 120 }
@@ -462,13 +462,13 @@ export async function analyzeVideoTimelineLocally(
       motionScore: Number(peak.score.toFixed(3)),
     });
   } else {
-    // Long videos (>30s): slice into 2 strongest high-action clips (30-65s) or 3 clips (>65s)
-    const targetClips = duration <= 65 ? 2 : 3;
+    // Longer videos: slice 2 strong clips (45-135s) or 3 strong 45-120s segments (>135s)
+    const targetClips = duration <= 135 ? 2 : 3;
     const regionSpan = effectiveDuration / targetClips;
     const targetClipLen =
-      duration <= 65
-        ? Math.min(26, Math.max(13, regionSpan * 0.88))
-        : Math.min(38, Math.max(20, regionSpan * 0.78));
+      duration <= 135
+        ? Math.min(65, Math.max(22, regionSpan * 0.9))
+        : Math.min(120, Math.max(45, regionSpan * 0.85));
 
     for (let c = 0; c < targetClips; c++) {
       const regStart = usableStart + c * regionSpan;

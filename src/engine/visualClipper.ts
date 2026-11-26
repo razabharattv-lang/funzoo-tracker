@@ -161,11 +161,9 @@ async function buildStampedContactSheet(params: {
 
     const vw = video.videoWidth || source.width || 1080;
     const vh = video.videoHeight || source.height || 1920;
-    const isVertical = vh > vw * 1.08;
-    const isSquare = Math.abs(vw - vh) / Math.max(vw, vh) <= 0.12;
-    // Preserve real source proportions so Vision AI accurately recognizes objects & physical actions
-    const tileW = isVertical ? 216 : isSquare ? 256 : 320;
-    const tileH = isVertical ? 384 : isSquare ? 256 : 180;
+    // Match exact 9:16 edited vertical framing so Step 3 scripts strictly from the edited clip frames
+    const tileW = 216;
+    const tileH = 384;
     const canvas = document.createElement('canvas');
     canvas.width = cols * tileW;
     canvas.height = rows * tileH;
@@ -179,6 +177,19 @@ async function buildStampedContactSheet(params: {
       const sy = Math.round(vh * crop.top);
       const sw = Math.max(16, Math.round(vw * (1 - crop.left - crop.right)));
       const sh = Math.max(16, Math.round(vh * (1 - crop.top - crop.bottom)));
+      const srcAspect = sw / Math.max(1, sh);
+      const dstAspect = tileW / tileH;
+      let coverSx = sx;
+      let coverSy = sy;
+      let coverSw = sw;
+      let coverSh = sh;
+      if (srcAspect > dstAspect) {
+        coverSw = Math.round(sh * dstAspect);
+        coverSx = sx + Math.round((sw - coverSw) / 2);
+      } else {
+        coverSh = Math.round(sw / dstAspect);
+        coverSy = sy + Math.round((sh - coverSh) / 2);
+      }
 
       for (let i = 0; i < totalTiles; i++) {
         const localSec = timestampsSec[i];
@@ -193,8 +204,8 @@ async function buildStampedContactSheet(params: {
 
         try {
           ctx.save();
-          ctx.filter = 'contrast(1.06) saturate(1.12)';
-          ctx.drawImage(video, sx, sy, sw, sh, dx, dy, tileW, tileH);
+          ctx.filter = 'contrast(1.2) saturate(1.28) brightness(1.03)';
+          ctx.drawImage(video, coverSx, coverSy, coverSw, coverSh, dx, dy, tileW, tileH);
           ctx.restore();
         } catch {
           // Keep solid dark tile if a single frame decode fails
@@ -239,15 +250,17 @@ export async function inspectAndSliceSegmentsStep1(params: {
   try {
     const scan = await analyzeVideoTimelineLocally(source, onProgress);
     const totalDur = Math.max(1, source.durationSec);
+    // Keep short clips (~15s) intact; only trim detected outro end-cards on >=20s clips
     const outroTrim =
-      (scan.hasOutroBumper || source.trimSocialEndCard) && totalDur >= 7
-        ? Math.min(1.6, Math.max(1.0, totalDur * 0.08))
+      scan.hasOutroBumper && totalDur >= 20
+        ? Math.min(1.0, Math.max(0.6, totalDur * 0.04))
         : 0;
     const usableEnd = Math.max(2, totalDur - outroTrim);
     const safeCrop = clampSafeCrop(scan.suggestedSafeCropInsets);
 
     const segments: ViralSegment[] = scan.highActionWindows.map((win, idx) => {
-      const startSec = Number(clamp(win.startSec, 0, usableEnd - 1.2).toFixed(2));
+      const rawStart = totalDur <= 20 ? 0 : win.startSec;
+      const startSec = Number(clamp(rawStart, 0, usableEnd - 1.2).toFixed(2));
       const endSec = Number(clamp(win.endSec, startSec + 1.2, usableEnd).toFixed(2));
       const climaxSec = Number(clamp(win.climaxSec, startSec, endSec).toFixed(2));
       const clipZones = sanitizeWatermarkZones(
@@ -283,13 +296,13 @@ export async function inspectAndSliceSegmentsStep1(params: {
   }
 
   const totalDur = Math.max(1, source.durationSec);
-  if (totalDur > 30) {
-    const clipCount = totalDur <= 65 ? 2 : 3;
+  if (totalDur > 45) {
+    const clipCount = totalDur <= 135 ? 2 : 3;
     const span = totalDur / clipCount;
     const targetLen =
-      totalDur <= 65
-        ? Math.min(26, Math.max(13, span * 0.88))
-        : Math.min(38, Math.max(20, span * 0.78));
+      totalDur <= 135
+        ? Math.min(65, Math.max(22, span * 0.9))
+        : Math.min(120, Math.max(45, span * 0.85));
     const safeCrop = clampSafeCrop({ top: 0, bottom: 0, left: 0, right: 0 });
     return {
       segments: Array.from({ length: clipCount }, (_, i) => {
@@ -300,7 +313,7 @@ export async function inspectAndSliceSegmentsStep1(params: {
           startSec,
           endSec,
           climaxSec: Number((startSec + (endSec - startSec) * 0.45).toFixed(2)),
-          reason: `High-retention clip ${i + 1} of ${clipCount} (${(endSec - startSec).toFixed(1)}s)`,
+          reason: `High-retention story segment ${i + 1} of ${clipCount} (${(endSec - startSec).toFixed(1)}s)`,
           trimRange: { startSec, endSec },
           safeCropInsets: safeCrop,
           watermarkZones: [],

@@ -86,6 +86,7 @@ export function App() {
   const abortRef = useRef<AbortController | null>(null);
   const linkAbortRef = useRef<AbortController | null>(null);
   const sourceLoadSeqRef = useRef(0);
+  const pipelineRunSeqRef = useRef(0);
   const sourceUrlRef = useRef<string | null>(null);
   const renderedUrlsRef = useRef<string[]>([]);
 
@@ -164,6 +165,7 @@ export function App() {
           return;
         }
         replaceSourceMedia(probed);
+        replaceRenderedClips([]);
         setProgress({
           ...INITIAL_PROGRESS,
           statusDetail: `Video ready (${probed.durationSec.toFixed(1)}s · ${probed.width}×${probed.height}). Click Run Pipeline.`,
@@ -177,7 +179,7 @@ export function App() {
         );
       }
     },
-    [replaceSourceMedia, safeRevokeObjectUrl]
+    [replaceRenderedClips, replaceSourceMedia, safeRevokeObjectUrl]
   );
 
   const handleFetchLinkPreview = useCallback(async () => {
@@ -214,6 +216,7 @@ export function App() {
         return;
       }
       replaceSourceMedia(resolved);
+      replaceRenderedClips([]);
       setProgress({
         ...INITIAL_PROGRESS,
         statusDetail: `Source link loaded (${resolved.durationSec.toFixed(1)}s, ${resolved.width}×${resolved.height}). Ready to run all 5 steps.`,
@@ -232,7 +235,7 @@ export function App() {
         setIsFetchingLink(false);
       }
     }
-  }, [controls.videoUrl, replaceSourceMedia, safeRevokeObjectUrl]);
+  }, [controls.videoUrl, replaceRenderedClips, replaceSourceMedia, safeRevokeObjectUrl]);
 
   const handleClearSource = useCallback(() => {
     replaceSourceMedia(null);
@@ -266,6 +269,10 @@ export function App() {
     abortRef.current = controller;
     const { signal } = controller;
 
+    // Clear stale previous outputs atomically at run start so Output Deck always matches this run
+    const runSeq = ++pipelineRunSeqRef.current;
+    replaceRenderedClips([]);
+
     const runTag = `studio-${Date.now().toString(36)}`;
     const runStartedAtMs = Date.now();
     const completedSteps: PipelineStepId[] = [];
@@ -276,6 +283,7 @@ export function App() {
       statusDetail: string,
       clipProgressLabel: string | null = null
     ) => {
+      if (runSeq !== pipelineRunSeqRef.current) return;
       setProgress({
         status: 'running',
         activeStep,
@@ -377,6 +385,9 @@ export function App() {
         clipMetadataList.push(meta);
       }
 
+      if (clipMetadataList.length !== preparedClips.length) {
+        throw new Error('Step 3 script/SEO count did not match edited clips.');
+      }
       completedSteps.push('step_3_translate_seo');
 
       // STEP 4: Commanding Voiceover (Gemini 3.8 Flash TTS or Real Browser Speech Voiceover)
@@ -406,6 +417,9 @@ export function App() {
         voiceResults.push(voice);
       }
 
+      if (voiceResults.length !== preparedClips.length) {
+        throw new Error('Step 4 voiceover count did not match edited clips.');
+      }
       completedSteps.push('step_4_voiceover');
 
       // STEP 5: Fast, Phone-Safe Mux & Output Deck
@@ -460,6 +474,10 @@ export function App() {
         });
       }
 
+      if (runSeq !== pipelineRunSeqRef.current || signal.aborted) {
+        outputs.forEach((o) => safeRevokeObjectUrl(o.videoUrl));
+        return;
+      }
       if (outputs.length === 0) {
         throw new Error('Step 5 produced no playable output clips.');
       }
@@ -490,7 +508,7 @@ export function App() {
       });
     } catch (err) {
       outputs.forEach((o) => safeRevokeObjectUrl(o.videoUrl));
-      if ((err as Error).name === 'AbortError') return;
+      if (runSeq !== pipelineRunSeqRef.current || (err as Error).name === 'AbortError') return;
       const msg =
         err instanceof Error ? err.message : 'Unexpected pipeline error occurred.';
       setProgress((prev) => ({
