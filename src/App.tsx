@@ -17,25 +17,22 @@ import {
 } from './lib/env';
 import { formatDuration, probeLocalVideoFile } from './lib/videoProbe';
 import { extractVideoUrl } from './lib/urlExtractor';
-import {
-  fetchRenderResultManifest,
-  uploadCharacterPortraitToCloudinary,
-  uploadRawVideoToCloudinary,
-} from './lib/cloudinary';
-import {
-  cancelWorkflowRun,
-  dispatchCloudRender,
-  extractRunTagFromRunName,
-  fetchRecentWorkflowRuns,
-  fetchWorkflowRunJobs,
-  findWorkflowRunByTag,
-  mapGitHubStepsToStudioProgress,
-} from './lib/github';
+import { uploadCharacterPortraitToCloudinary } from './lib/cloudinary';
 import {
   deleteRenderRecord,
   loadSavedRenders,
   saveRenderRecord,
 } from './lib/storage';
+import { resolveSourceStream } from './engine/streamResolver';
+import {
+  analyzeContactSheetOneCall,
+  applyFaceLockedOutfitChange,
+  buildContactSheetJpeg,
+  fetchLiveYouTubeTrends,
+  generateViralScriptAndMetadata,
+} from './engine/intelligenceEngine';
+import { synthesizeStudioVoiceover } from './engine/audioEngine';
+import { renderProductionMp4Gpu } from './engine/gpuRenderer';
 import type {
   LocalClipInfo,
   PipelineProgressState,
@@ -53,10 +50,8 @@ const IDLE_PROGRESS: PipelineProgressState = {
   completedSteps: [],
   percent: 0,
   statusDetail:
-    'Paste any video link or Chinese share-text (or upload a file), then click Generate Production Video.',
+    'Paste any video link or share-text (or upload a file), then click Generate Production Video — runs 100% on your device GPU.',
   runTag: null,
-  githubRunId: null,
-  githubRunUrl: null,
   startedAtMs: null,
   errorMessage: null,
 };
@@ -64,24 +59,6 @@ const IDLE_PROGRESS: PipelineProgressState = {
 function createRunTag(): string {
   const hex = Math.random().toString(16).slice(2, 8);
   return `exp_${Date.now()}_${hex}`;
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DOMException('Cancelled', 'AbortError'));
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      window.clearTimeout(timer);
-      reject(new DOMException('Cancelled', 'AbortError'));
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 function normalizeManifestClips(
@@ -96,14 +73,14 @@ function normalizeManifestClips(
       clip_index: 1,
       start_sec: 0,
       end_sec: manifest.duration_sec,
-      reason: 'Short Video Full Cut',
+      reason: 'Short Video Main Scene',
       video_url: manifest.video_url,
-      video_public_id: manifest.video_public_id,
       duration_sec: manifest.duration_sec,
       width: manifest.width,
       height: manifest.height,
       file_size_bytes: manifest.file_size_bytes,
       voice_engine: manifest.voice_engine,
+      render_engine: manifest.render_engine || 'WebCodecs GPU',
       character_mode: manifest.character_mode,
       watermark_boxes_removed: manifest.watermark_boxes_removed,
       climax_second: manifest.mid_twist_second,
@@ -123,7 +100,9 @@ export default function App() {
   const [studioConfig, setStudioConfig] = useState<StudioConfig>(() =>
     loadStudioConfig()
   );
-  const [isConfigExpanded, setIsConfigExpanded] = useState(false);
+  const [isConfigExpanded, setIsConfigExpanded] = useState(
+    () => getMissingConfigFields(loadStudioConfig()).length > 0
+  );
 
   const [localClip, setLocalClip] = useState<LocalClipInfo | null>(null);
   const [clipError, setClipError] = useState<string | null>(null);
@@ -153,13 +132,23 @@ export default function App() {
   );
 
   const abortRef = useRef<AbortController | null>(null);
-  const activeRunIdRef = useRef<number | null>(null);
+  const activeOutputBlobUrlsRef = useRef<string[]>([]);
+
+  const revokeOutputBlobUrls = useCallback(() => {
+    for (const url of activeOutputBlobUrlsRef.current) {
+      if (url.startsWith('blob:')) {
+        URL.revokeObjectURL(url);
+      }
+    }
+    activeOutputBlobUrlsRef.current = [];
+  }, []);
 
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      revokeOutputBlobUrls();
     };
-  }, []);
+  }, [revokeOutputBlobUrls]);
 
   const renderedClips = useMemo(
     () => normalizeManifestClips(result),
@@ -182,8 +171,8 @@ export default function App() {
         }));
       }
     }
-    if (getMissingConfigFields(saved, true).length === 0) {
-      window.setTimeout(() => setIsConfigExpanded(false), 700);
+    if (getMissingConfigFields(saved).length === 0) {
+      window.setTimeout(() => setIsConfigExpanded(false), 600);
     }
   }, []);
 
@@ -218,21 +207,11 @@ export default function App() {
   const handleUploadPortrait = useCallback(
     async (file: File) => {
       setPortraitError(null);
-      if (
-        !studioConfig.cloudinaryCloudName ||
-        !studioConfig.cloudinaryUploadPreset
-      ) {
-        setIsConfigExpanded(true);
-        setPortraitError(
-          'Add your Cloudinary Cloud Name and Unsigned Upload Preset in Studio Config first.'
-        );
-        return;
-      }
-
       setIsUploadingPortrait(true);
       try {
         const res = await uploadCharacterPortraitToCloudinary(file, studioConfig);
-        const cleanName = file.name.replace(/\.[^.]+$/, '').slice(0, 32) || 'Portrait';
+        const cleanName =
+          file.name.replace(/\.[^.]+$/, '').slice(0, 32) || 'Portrait';
         const newAsset: SavedCharacterAsset = {
           id: `char_${Date.now()}`,
           name: cleanName,
@@ -243,7 +222,10 @@ export default function App() {
         const nextConfig = saveStudioConfig({
           ...studioConfig,
           characterImageUrl: res.secure_url,
-          savedCharacters: [newAsset, ...studioConfig.savedCharacters].slice(0, 8),
+          savedCharacters: [newAsset, ...studioConfig.savedCharacters].slice(
+            0,
+            8
+          ),
         });
         setStudioConfig(nextConfig);
         setControls((prev) => ({
@@ -301,6 +283,7 @@ export default function App() {
   const handleResetWorkspace = useCallback(() => {
     if (progress.status === 'running') return;
     clearLocalClip();
+    revokeOutputBlobUrls();
     setControls((prev) => ({
       ...prev,
       videoUrl: '',
@@ -311,31 +294,17 @@ export default function App() {
     setResult(null);
     setSelectedClipIndex(0);
     setActiveTab('studio');
-  }, [clearLocalClip, progress.status]);
+  }, [clearLocalClip, progress.status, revokeOutputBlobUrls]);
 
-  const handleCancelRender = useCallback(async () => {
+  const handleCancelRender = useCallback(() => {
     abortRef.current?.abort();
-    const runId = activeRunIdRef.current;
-    if (
-      runId &&
-      studioConfig.githubToken &&
-      studioConfig.repoOwner &&
-      studioConfig.repoName
-    ) {
-      try {
-        await cancelWorkflowRun(studioConfig, runId);
-      } catch {
-        // ignore cancel error after abort
-      }
-    }
-    activeRunIdRef.current = null;
     setProgress((prev) => ({
       ...prev,
       status: 'cancelled',
-      statusDetail: 'Cloud render cancelled. Ready for your next video.',
+      statusDetail: 'GPU render cancelled. Ready for your next video.',
       errorMessage: null,
     }));
-  }, [studioConfig]);
+  }, []);
 
   const activeCharacter =
     studioConfig.savedCharacters.find(
@@ -357,32 +326,34 @@ export default function App() {
   const handleStartRender = useCallback(async () => {
     if (!canGenerate || progress.status === 'running') return;
 
-    const requireUnsignedPreset = controls.sourceType === 'upload';
-    const missing = getMissingConfigFields(studioConfig, requireUnsignedPreset);
+    const missing = getMissingConfigFields(studioConfig);
     if (missing.length > 0) {
       setIsConfigExpanded(true);
       setProgress({
         ...IDLE_PROGRESS,
         status: 'error',
-        activeStep: 'fetching_link',
-        statusDetail: 'Complete Studio Config before starting a cloud render.',
-        errorMessage: `Missing Studio Config fields: ${missing.join(
+        activeStep: 'resolving_stream',
+        statusDetail: 'Add your Gemini API Key in Studio API Config above.',
+        errorMessage: `Missing required config: ${missing.join(
           ', '
-        )}. Enter them in the collapsible Studio Config bar above.`,
+        )}. Enter your key in the Studio API Config bar above.`,
       });
       return;
     }
 
     if (controls.characterEnabled && !activeCharacterUrl) {
-      setPortraitError('Upload a character portrait or turn Talking Character OFF.');
+      setPortraitError(
+        'Upload a character portrait or turn Talking Character OFF.'
+      );
       return;
     }
 
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
-    activeRunIdRef.current = null;
+    const { signal } = controller;
 
+    revokeOutputBlobUrls();
     const runTag = createRunTag();
     const startedAtMs = Date.now();
     setResult(null);
@@ -391,149 +362,267 @@ export default function App() {
 
     setProgress({
       status: 'running',
-      activeStep: 'fetching_link',
+      activeStep: 'resolving_stream',
       completedSteps: [],
-      percent: 4,
+      percent: 5,
       statusDetail:
         controls.sourceType === 'upload'
-          ? 'Uploading raw clip to Cloudinary...'
-          : 'Dispatching pasted video URL to 7GB GitHub Actions runner...',
+          ? 'Loading local video clip into browser engine...'
+          : 'Racing parallel no-watermark stream resolvers...',
       runTag,
-      githubRunId: null,
-      githubRunUrl: null,
       startedAtMs,
       errorMessage: null,
     });
 
+    let sourceObjectUrlToRevoke: string | null = null;
+    const newOutputBlobUrls: string[] = [];
+
     try {
-      let videoSourceForWorkflow = extractedLink?.cleanUrl ?? controls.videoUrl.trim();
-      let sourceLabel = videoSourceForWorkflow;
-
-      if (controls.sourceType === 'upload' && localClip) {
-        sourceLabel = localClip.name;
-        const uploadRes = await uploadRawVideoToCloudinary(
-          localClip.file,
-          runTag,
-          studioConfig,
-          (uploadPct) => {
-            const scaled = Math.max(4, Math.min(18, Math.round((uploadPct / 100) * 18)));
-            setProgress((prev) => ({
-              ...prev,
-              percent: scaled,
-              statusDetail: `Uploading raw clip to Cloudinary (${uploadPct}%)...`,
-            }));
-          },
-          controller.signal
-        );
-        videoSourceForWorkflow = uploadRes.secure_url;
-      }
-
-      const dispatchedAtMs = Date.now();
-      setProgress((prev) => ({
-        ...prev,
-        percent: Math.max(prev.percent, 18),
-        statusDetail: 'Triggering 7GB GitHub Actions workflow...',
-      }));
-
-      await dispatchCloudRender(
-        studioConfig,
-        {
-          videoSource: videoSourceForWorkflow,
-          sourceType: controls.sourceType,
-          language: controls.language,
-          voiceGender: controls.voiceGender,
-          customAngle: controls.customAngle,
-          characterEnabled: controls.characterEnabled,
-          characterUrl: controls.characterEnabled ? activeCharacterUrl : '',
-          outfitPrompt: controls.characterEnabled ? controls.outfitPrompt : '',
-          runTag,
-          sessionCookie: studioConfig.sessionCookie,
+      // CORE 1: Resolving Stream & Smart Clipping (5% -> 20%)
+      const resolved = await resolveSourceStream({
+        sourceType: controls.sourceType,
+        videoUrl: controls.videoUrl,
+        localClip,
+        config: studioConfig,
+        onStatus: (msg) => {
+          setProgress((prev) => ({
+            ...prev,
+            activeStep: 'resolving_stream',
+            percent: Math.min(18, prev.percent + 2),
+            statusDetail: msg,
+          }));
         },
-        controller.signal
-      );
+        signal,
+      });
+      sourceObjectUrlToRevoke = resolved.objectUrl;
 
-      // Locate matching workflow run by run_tag
-      let matchedRun = null;
-      for (let attempt = 0; attempt < 24; attempt++) {
-        await sleep(2500, controller.signal);
-        matchedRun = await findWorkflowRunByTag(
-          studioConfig,
-          runTag,
-          dispatchedAtMs,
-          controller.signal
-        );
-        if (matchedRun) break;
+      if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+      const totalSegments = resolved.segments.length;
+
+      // Optional Face-Locked Outfit Change (executed once before sequential clips)
+      let effectivePortraitUrl = activeCharacterUrl;
+      if (
+        controls.characterEnabled &&
+        activeCharacterUrl &&
+        controls.outfitPrompt.trim()
+      ) {
+        setProgress((prev) => ({
+          ...prev,
+          activeStep: 'ai_trends',
+          completedSteps: ['resolving_stream'],
+          percent: 21,
+          statusDetail:
+            'Applying face-locked outfit change to your talking character...',
+        }));
+        effectivePortraitUrl = await applyFaceLockedOutfitChange({
+          portraitUrl: activeCharacterUrl,
+          outfitPrompt: controls.outfitPrompt,
+          geminiApiKey: studioConfig.geminiApiKey,
+          signal,
+        });
       }
 
-      if (!matchedRun) {
-        throw new Error(
-          'Workflow dispatched, but the GitHub Actions run did not appear within 60 seconds. Check your repository Actions tab.'
-        );
-      }
+      const clipOutputs: RenderedClipItem[] = [];
 
-      activeRunIdRef.current = matchedRun.id;
-      setProgress((prev) => ({
-        ...prev,
-        githubRunId: matchedRun.id,
-        githubRunUrl: matchedRun.html_url,
-        statusDetail: '7GB runner started. Fetching source video...',
-      }));
+      // Strictly sequential multi-clip processing so mobile RAM stays flat between clips
+      for (let idx = 0; idx < totalSegments; idx++) {
+        if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+        const seg = resolved.segments[idx];
+        const segDuration = Math.max(3, seg.endSec - seg.startSec);
+        const clipPrefix =
+          totalSegments > 1 ? `[Clip ${idx + 1}/${totalSegments}] ` : '';
 
-      let finishedOk = false;
-      for (let poll = 0; poll < 360; poll++) {
-        const { run, jobs } = await fetchWorkflowRunJobs(
-          studioConfig,
-          matchedRun.id,
-          controller.signal
+        const segStartPct = 22 + Math.round((idx / totalSegments) * 75);
+        const segSpanPct = Math.round(75 / totalSegments);
+
+        // CORE 2: 1-Call Contact-Sheet Vision + Live YouTube Trends + NVIDIA Script
+        setProgress((prev) => ({
+          ...prev,
+          activeStep: 'ai_trends',
+          completedSteps: ['resolving_stream'],
+          percent: segStartPct,
+          statusDetail: `${clipPrefix}Sampling 9 keyframes onto lightweight OffscreenCanvas contact sheet...`,
+        }));
+
+        const { base64Jpeg } = await buildContactSheetJpeg(
+          resolved.objectUrl,
+          seg.startSec,
+          seg.endSec,
+          signal
         );
-        const mapped = mapGitHubStepsToStudioProgress(run, jobs);
 
         setProgress((prev) => ({
           ...prev,
-          activeStep: mapped.activeStep,
-          completedSteps: mapped.completedSteps,
-          percent: mapped.percent,
-          statusDetail: mapped.detail,
-          githubRunUrl: run.html_url,
+          percent: segStartPct + Math.round(segSpanPct * 0.12),
+          statusDetail: `${clipPrefix}1-Call Gemini Vision scanning beats, climax & watermark boxes...`,
         }));
 
-        if (run.status === 'completed') {
-          if (run.conclusion === 'success') {
-            finishedOk = true;
-            break;
-          }
-          throw new Error(
-            `GitHub Actions workflow finished with "${run.conclusion ?? 'failure'}". Open GitHub Run logs to inspect details.`
-          );
-        }
+        const vision = await analyzeContactSheetOneCall({
+          base64Jpeg,
+          clipDurationSec: segDuration,
+          customAngle: controls.customAngle,
+          geminiApiKey: studioConfig.geminiApiKey,
+          signal,
+        });
 
-        await sleep(3000, controller.signal);
+        setProgress((prev) => ({
+          ...prev,
+          percent: segStartPct + Math.round(segSpanPct * 0.22),
+          statusDetail: `${clipPrefix}Fetching live US YouTube Shorts trends (YouTube Data API v3)...`,
+        }));
+
+        const trends = await fetchLiveYouTubeTrends(
+          vision.search_queries,
+          studioConfig.youtubeApiKey,
+          signal
+        );
+
+        setProgress((prev) => ({
+          ...prev,
+          percent: segStartPct + Math.round(segSpanPct * 0.3),
+          statusDetail: `${clipPrefix}Generating suspense loop narration & viral SEO metadata...`,
+        }));
+
+        const scriptPack = await generateViralScriptAndMetadata({
+          vision,
+          trends,
+          clipDurationSec: segDuration,
+          language: controls.language,
+          customAngle: controls.customAngle,
+          config: studioConfig,
+          signal,
+        });
+
+        // CORE 3: Studio WebAudio DSP & Real Male/Female Voiceover + Lip-Sync Envelope
+        setProgress((prev) => ({
+          ...prev,
+          activeStep: 'voice_lipsync',
+          completedSteps: ['resolving_stream', 'ai_trends'],
+          percent: segStartPct + Math.round(segSpanPct * 0.4),
+          statusDetail: `${clipPrefix}Synthesizing high-energy voiceover & OfflineAudioContext vocal DSP...`,
+        }));
+
+        const audio = await synthesizeStudioVoiceover({
+          scriptText: scriptPack.voiceover,
+          language: controls.language,
+          voiceGender: controls.voiceGender,
+          geminiApiKey: studioConfig.geminiApiKey,
+          onStatus: (msg) => {
+            setProgress((prev) => ({
+              ...prev,
+              statusDetail: `${clipPrefix}${msg}`,
+            }));
+          },
+          signal,
+        });
+
+        // CORE 4: Off-Main-Thread WebWorker + WebGL2 + WebCodecs GPU Render (lazy FFmpeg fallback)
+        const gpuBasePct = segStartPct + Math.round(segSpanPct * 0.52);
+        const gpuSpanPct = Math.max(12, Math.round(segSpanPct * 0.45));
+
+        setProgress((prev) => ({
+          ...prev,
+          activeStep: 'gpu_render',
+          completedSteps: ['resolving_stream', 'ai_trends', 'voice_lipsync'],
+          percent: gpuBasePct,
+          statusDetail: `${clipPrefix}Launching background WebGL2 + WebCodecs GPU Worker...`,
+        }));
+
+        const rendered = await renderProductionMp4Gpu({
+          sourceVideoBlob: resolved.blob,
+          sourceWidth: resolved.width,
+          sourceHeight: resolved.height,
+          startSec: seg.startSec,
+          endSec: seg.endSec,
+          audio,
+          scriptText: scriptPack.voiceover,
+          language: controls.language,
+          watermarkBoxes: vision.watermark_boxes,
+          climaxSecond: vision.climax_second,
+          characterEnabled: controls.characterEnabled,
+          characterPortraitUrl: controls.characterEnabled
+            ? effectivePortraitUrl
+            : '',
+          onStatus: (msg) => {
+            setProgress((prev) => ({
+              ...prev,
+              statusDetail: `${clipPrefix}${msg}`,
+            }));
+          },
+          onProgressPct: (localPct) => {
+            const mappedPct = Math.min(
+              98,
+              gpuBasePct + Math.round((localPct / 100) * gpuSpanPct)
+            );
+            setProgress((prev) => ({
+              ...prev,
+              percent: Math.max(prev.percent, mappedPct),
+            }));
+          },
+          signal,
+        });
+
+        newOutputBlobUrls.push(rendered.blobUrl);
+
+        clipOutputs.push({
+          clip_index: seg.clipIndex,
+          start_sec: seg.startSec,
+          end_sec: seg.endSec,
+          reason: seg.reason,
+          video_url: rendered.blobUrl,
+          duration_sec: rendered.durationSec,
+          width: rendered.width,
+          height: rendered.height,
+          file_size_bytes: rendered.sizeBytes,
+          voice_engine: `${audio.engineLabel} · ${scriptPack.scriptEngine}`,
+          render_engine: rendered.renderEngine,
+          character_mode: rendered.characterMode,
+          watermark_boxes_removed: rendered.delogoCount,
+          climax_second: vision.climax_second,
+          youtube_trends_count: trends.length,
+          voiceover: scriptPack.voiceover,
+          title: scriptPack.title,
+          description: scriptPack.description,
+          tags: scriptPack.tags,
+          hashtags: scriptPack.hashtags,
+          posting_time: scriptPack.posting_time,
+        });
       }
 
-      if (!finishedOk) {
-        throw new Error('Cloud render polling timed out after 18 minutes.');
+      const first = clipOutputs[0];
+      if (!first) {
+        throw new Error('No output clips were generated.');
       }
 
-      setProgress((prev) => ({
-        ...prev,
-        activeStep: 'ready',
-        completedSteps: [
-          'fetching_link',
-          'scan_trends',
-          'voice_character',
-          'anti_copyright_render',
-        ],
-        percent: 98,
-        statusDetail: 'Loading finished 1080×1920 MP4 clip(s) and grounded metadata...',
-      }));
+      const manifest: RenderResultManifest = {
+        run_tag: runTag,
+        video_url: first.video_url,
+        duration_sec: first.duration_sec,
+        width: first.width,
+        height: first.height,
+        file_size_bytes: first.file_size_bytes,
+        language: controls.language,
+        voice_gender: controls.voiceGender,
+        voice_engine: first.voice_engine,
+        render_engine: first.render_engine,
+        character_mode: first.character_mode,
+        watermark_boxes_removed: first.watermark_boxes_removed,
+        mid_twist_second: first.climax_second,
+        youtube_trends_count: first.youtube_trends_count,
+        voiceover: first.voiceover,
+        title: first.title,
+        description: first.description,
+        tags: first.tags,
+        hashtags: first.hashtags,
+        posting_time: first.posting_time,
+        completed_at: new Date().toISOString(),
+        is_long_video_split: resolved.isLongVideoSplit,
+        source_total_duration: resolved.durationSec,
+        clips: clipOutputs,
+      };
 
-      const manifest = await fetchRenderResultManifest(
-        studioConfig.cloudinaryCloudName,
-        runTag,
-        controller.signal
-      );
-
-      const clipsCount = manifest.clips?.length ?? 1;
+      activeOutputBlobUrlsRef.current = newOutputBlobUrls;
       setResult(manifest);
       setSelectedClipIndex(0);
       setProgress((prev) => ({
@@ -541,44 +630,46 @@ export default function App() {
         status: 'completed',
         activeStep: 'ready',
         completedSteps: [
-          'fetching_link',
-          'scan_trends',
-          'voice_character',
-          'anti_copyright_render',
+          'resolving_stream',
+          'ai_trends',
+          'voice_lipsync',
+          'gpu_render',
           'ready',
         ],
         percent: 100,
         statusDetail:
-          clipsCount > 1
-            ? `Long video sliced into ${clipsCount} viral 1080×1920 MP4 clips with live YouTube-grounded metadata.`
-            : 'Finished 1080×1920 explainer MP4 and live YouTube-grounded metadata are ready.',
+          clipOutputs.length > 1
+            ? `Hardware-rendered ${clipOutputs.length} viral ${first.width}×${first.height} MP4 clips directly in your browser.`
+            : `Finished ${first.width}×${first.height} explainer MP4 (${first.render_engine}) — ready for instant download.`,
       }));
 
       const updated = saveRenderRecord({
         manifest,
-        sourceLabel,
+        sourceLabel: resolved.sourceLabel,
         customAngle: controls.customAngle,
-        githubRunUrl: matchedRun.html_url,
       });
       setSavedRenders(updated);
-      activeRunIdRef.current = null;
     } catch (err) {
+      for (const u of newOutputBlobUrls) URL.revokeObjectURL(u);
       if ((err as Error).name === 'AbortError') return;
-      activeRunIdRef.current = null;
       setProgress((prev) => ({
         ...prev,
         status: 'error',
-        statusDetail: 'Cloud render stopped with an error.',
+        statusDetail: 'In-browser render stopped with an error.',
         errorMessage: (err as Error).message || 'Unexpected render failure.',
       }));
+    } finally {
+      if (sourceObjectUrlToRevoke) {
+        URL.revokeObjectURL(sourceObjectUrlToRevoke);
+      }
     }
   }, [
     activeCharacterUrl,
     canGenerate,
     controls,
-    extractedLink,
     localClip,
     progress.status,
+    revokeOutputBlobUrls,
     studioConfig,
   ]);
 
@@ -590,20 +681,18 @@ export default function App() {
       status: 'completed',
       activeStep: 'ready',
       completedSteps: [
-        'fetching_link',
-        'scan_trends',
-        'voice_character',
-        'anti_copyright_render',
+        'resolving_stream',
+        'ai_trends',
+        'voice_lipsync',
+        'gpu_render',
         'ready',
       ],
       percent: 100,
       statusDetail:
         clipsCount > 1
-          ? `Loaded ${clipsCount}-clip render (${record.manifest.run_tag}).`
-          : `Loaded completed render (${record.manifest.run_tag}).`,
+          ? `Loaded ${clipsCount}-clip render metadata (${record.manifest.run_tag}).`
+          : `Loaded saved render metadata (${record.manifest.run_tag}).`,
       runTag: record.manifest.run_tag,
-      githubRunId: null,
-      githubRunUrl: record.githubRunUrl ?? null,
       startedAtMs: null,
       errorMessage: null,
     });
@@ -613,52 +702,6 @@ export default function App() {
   const handleDeleteRecord = useCallback((runTag: string) => {
     setSavedRenders(deleteRenderRecord(runTag));
   }, []);
-
-  const handleSyncFromGitHub = useCallback(async (): Promise<string> => {
-    const missing = getMissingConfigFields(studioConfig, false);
-    if (missing.length > 0) {
-      setIsConfigExpanded(true);
-      throw new Error(
-        `Add ${missing.join(', ')} in Studio Config above to sync GitHub Actions runs.`
-      );
-    }
-
-    const runs = await fetchRecentWorkflowRuns(studioConfig);
-    const completedRuns = runs.filter(
-      (r) => r.status === 'completed' && r.conclusion === 'success'
-    );
-
-    let synced = 0;
-    let latestList = loadSavedRenders();
-    const existingTags = new Set(latestList.map((r) => r.manifest.run_tag));
-
-    for (const run of completedRuns) {
-      const tag = extractRunTagFromRunName(run.name);
-      if (!tag || existingTags.has(tag)) continue;
-      try {
-        const manifest = await fetchRenderResultManifest(
-          studioConfig.cloudinaryCloudName,
-          tag
-        );
-        latestList = saveRenderRecord({
-          manifest,
-          sourceLabel: tag,
-          customAngle: '',
-          githubRunUrl: run.html_url,
-        });
-        existingTags.add(tag);
-        synced += 1;
-      } catch {
-        // skip runs without manifest
-      }
-    }
-
-    setSavedRenders(latestList);
-    if (synced === 0) {
-      return `Checked ${completedRuns.length} completed GitHub Actions runs — history is up to date.`;
-    }
-    return `Synced ${synced} completed cloud render${synced === 1 ? '' : 's'} from GitHub Actions.`;
-  }, [studioConfig]);
 
   return (
     <div className="min-h-screen bg-[#F4F6F9] text-[#0F172A] flex flex-col">
@@ -731,7 +774,7 @@ export default function App() {
             <div className="lg:col-span-7 space-y-5">
               <CloudProgressBar
                 progress={progress}
-                onCancelRender={() => void handleCancelRender()}
+                onCancelRender={handleCancelRender}
                 onDismissError={() => setProgress(IDLE_PROGRESS)}
               />
 
@@ -828,7 +871,6 @@ export default function App() {
             records={savedRenders}
             onLoadRecord={handleLoadRecord}
             onDeleteRecord={handleDeleteRecord}
-            onSyncFromGitHub={handleSyncFromGitHub}
             onGoToStudio={() => setActiveTab('studio')}
           />
         )}

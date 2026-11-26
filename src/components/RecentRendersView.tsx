@@ -1,11 +1,4 @@
-import { useState } from 'react';
-import {
-  ArrowUpRight,
-  Film,
-  Loader2,
-  RefreshCw,
-  Trash2,
-} from 'lucide-react';
+import { ArrowUpRight, Film, Trash2 } from 'lucide-react';
 import type { SavedRenderRecord } from '../types/studio';
 import { formatBytes, formatDuration } from '../lib/videoProbe';
 
@@ -13,7 +6,6 @@ interface RecentRendersViewProps {
   records: SavedRenderRecord[];
   onLoadRecord: (record: SavedRenderRecord) => void;
   onDeleteRecord: (runTag: string) => void;
-  onSyncFromGitHub: () => Promise<string>;
   onGoToStudio: () => void;
 }
 
@@ -21,57 +13,28 @@ export function RecentRendersView({
   records,
   onLoadRecord,
   onDeleteRecord,
-  onSyncFromGitHub,
   onGoToStudio,
 }: RecentRendersViewProps) {
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [syncMessage, setSyncMessage] = useState<string | null>(null);
-
-  const handleSync = async () => {
-    setIsSyncing(true);
-    setSyncMessage(null);
-    try {
-      const msg = await onSyncFromGitHub();
-      setSyncMessage(msg);
-    } catch (err) {
-      setSyncMessage((err as Error).message);
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
   return (
     <div className="space-y-5">
       <div className="rounded-2xl border-2 border-[#E2E8F0] bg-white p-5 flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-xl font-extrabold text-[#0F172A]">
-            Recent Cloud Renders
+            Recent Studio Renders
           </h1>
           <p className="text-xs font-medium text-[#64748B] mt-0.5">
-            Reload any finished 1080×1920 explainer video and its YouTube-grounded metadata deck.
+            Reload saved titles, descriptions, tags, hashtags, and scripts from your browser history.
           </p>
         </div>
 
         <button
           type="button"
-          onClick={() => void handleSync()}
-          disabled={isSyncing}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border-2 border-[#3D5AFE] bg-[#EEF2FF] text-[#3D5AFE] hover:bg-[#3D5AFE] hover:text-white text-xs font-extrabold transition-colors disabled:opacity-55 cursor-pointer whitespace-nowrap"
+          onClick={onGoToStudio}
+          className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border-2 border-[#3D5AFE] bg-[#EEF2FF] text-[#3D5AFE] hover:bg-[#3D5AFE] hover:text-white text-xs font-extrabold transition-colors cursor-pointer whitespace-nowrap"
         >
-          {isSyncing ? (
-            <Loader2 className="w-4 h-4 animate-spin" strokeWidth={2.5} />
-          ) : (
-            <RefreshCw className="w-4 h-4" strokeWidth={2.5} />
-          )}
-          <span>Sync GitHub Actions Runs</span>
+          <span>Back to Studio</span>
         </button>
       </div>
-
-      {syncMessage && (
-        <div className="rounded-xl border-2 border-[#3D5AFE] bg-[#EEF2FF] px-4 py-2.5 text-xs font-bold text-[#1E3A8A]">
-          {syncMessage}
-        </div>
-      )}
 
       {records.length === 0 ? (
         <div className="rounded-2xl border-2 border-[#E2E8F0] bg-white p-12 text-center">
@@ -82,7 +45,7 @@ export function RecentRendersView({
             No completed renders yet
           </h2>
           <p className="text-sm font-medium text-[#64748B] max-w-md mx-auto mt-1.5">
-            Upload a clip or paste a video link in the Studio Workspace to generate your first viral explainer video.
+            Paste a video link or upload a clip in the Studio Workspace to render your first viral explainer video directly in the browser.
           </p>
           <button
             type="button"

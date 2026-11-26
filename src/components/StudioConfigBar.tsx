@@ -27,15 +27,16 @@ export function StudioConfigBar({
   onClearKeys,
 }: StudioConfigBarProps) {
   const [draft, setDraft] = useState<StudioConfig>(config);
-  const [showToken, setShowToken] = useState(false);
-  const [showCookie, setShowCookie] = useState(false);
+  const [showGemini, setShowGemini] = useState(false);
+  const [showNvidia, setShowNvidia] = useState(false);
+  const [showYoutube, setShowYoutube] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
 
   useEffect(() => {
     setDraft(config);
   }, [config]);
 
-  const missing = getMissingConfigFields(config, false);
+  const missing = getMissingConfigFields(config);
   const isConfigured = missing.length === 0;
   const autoWired = isAutoWiredFromBuild();
 
@@ -50,9 +51,17 @@ export function StudioConfigBar({
 
   const isDiscreet = autoWired && isConfigured && !isExpanded;
 
+  const connectedServices: string[] = [];
+  if (config.geminiApiKey) connectedServices.push('Gemini');
+  if (config.nvidiaApiKey) connectedServices.push('NVIDIA');
+  if (config.youtubeApiKey) connectedServices.push('YouTube');
+  if (config.cloudinaryCloudName && config.cloudinaryUploadPreset) {
+    connectedServices.push('Cloudinary');
+  }
+
   return (
     <section
-      aria-label="Studio Fallback Configuration"
+      aria-label="In-Browser Studio API Configuration"
       className={`rounded-2xl border-2 bg-white overflow-hidden transition-colors ${
         isExpanded
           ? 'border-[#3D5AFE]'
@@ -96,7 +105,7 @@ export function StudioConfigBar({
                 isDiscreet ? 'text-xs' : 'text-sm'
               }`}
             >
-              {autoWired ? 'Auto-Wired Ready' : 'Studio Fallback Config'}
+              {autoWired ? 'Browser Engine Ready' : 'Studio API Config'}
             </span>
             {!isDiscreet && (
               <span
@@ -109,18 +118,15 @@ export function StudioConfigBar({
                 {isConfigured ? 'Ready' : `${missing.length} Missing`}
               </span>
             )}
-            <span className="font-mono-tabular text-xs font-semibold text-[#64748B] truncate">
-              {config.repoOwner}/{config.repoName}
-            </span>
+            {connectedServices.length > 0 && (
+              <span className="font-mono-tabular text-xs font-semibold text-[#64748B] truncate">
+                {connectedServices.join(' · ')}
+              </span>
+            )}
             {config.savedCharacters.length > 0 && (
               <span className="text-xs font-semibold text-[#64748B] whitespace-nowrap">
                 · {config.savedCharacters.length} Character
                 {config.savedCharacters.length === 1 ? '' : 's'}
-              </span>
-            )}
-            {config.sessionCookie && (
-              <span className="text-xs font-semibold text-[#3D5AFE] whitespace-nowrap">
-                · Cookie Set
               </span>
             )}
           </div>
@@ -131,8 +137,8 @@ export function StudioConfigBar({
             {isExpanded
               ? 'Close'
               : autoWired
-              ? 'Fallback Drawer'
-              : 'Fallback Setup'}
+              ? 'API Keys'
+              : 'Configure Keys'}
           </span>
           {isExpanded ? (
             <ChevronUp className="w-3.5 h-3.5" strokeWidth={2.5} />
@@ -145,32 +151,36 @@ export function StudioConfigBar({
       {isExpanded && (
         <form onSubmit={handleSubmit} className="p-5 space-y-4 bg-white">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Gemini API Key (Required) */}
             <div>
               <label
-                htmlFor="studio-github-token"
+                htmlFor="studio-gemini-key"
                 className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
               >
-                GitHub Token (actions &amp; workflow scope)
+                Gemini API Key (Required — Vision, TTS &amp; Outfit)
               </label>
               <div className="relative">
                 <input
-                  id="studio-github-token"
-                  type={showToken ? 'text' : 'password'}
+                  id="studio-gemini-key"
+                  type={showGemini ? 'text' : 'password'}
                   autoComplete="off"
-                  value={draft.githubToken}
+                  value={draft.geminiApiKey}
                   onChange={(e) =>
-                    setDraft((prev) => ({ ...prev, githubToken: e.target.value }))
+                    setDraft((prev) => ({
+                      ...prev,
+                      geminiApiKey: e.target.value,
+                    }))
                   }
-                  placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                  placeholder="AIzaSy..."
                   className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] pl-3.5 pr-10 py-2.5 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
                 />
                 <button
                   type="button"
-                  onClick={() => setShowToken((v) => !v)}
-                  aria-label={showToken ? 'Hide GitHub token' : 'Show GitHub token'}
+                  onClick={() => setShowGemini((v) => !v)}
+                  aria-label={showGemini ? 'Hide Gemini key' : 'Show Gemini key'}
                   className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-[#64748B] hover:text-[#0F172A] cursor-pointer"
                 >
-                  {showToken ? (
+                  {showGemini ? (
                     <EyeOff className="w-4 h-4" strokeWidth={2.25} />
                   ) : (
                     <Eye className="w-4 h-4" strokeWidth={2.25} />
@@ -179,12 +189,93 @@ export function StudioConfigBar({
               </div>
             </div>
 
+            {/* NVIDIA NIM API Key (Optional) */}
+            <div>
+              <label
+                htmlFor="studio-nvidia-key"
+                className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
+              >
+                NVIDIA API Key (Optional — Llama-3.3-70B)
+              </label>
+              <div className="relative">
+                <input
+                  id="studio-nvidia-key"
+                  type={showNvidia ? 'text' : 'password'}
+                  autoComplete="off"
+                  value={draft.nvidiaApiKey}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      nvidiaApiKey: e.target.value,
+                    }))
+                  }
+                  placeholder="nvapi-..."
+                  className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] pl-3.5 pr-10 py-2.5 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNvidia((v) => !v)}
+                  aria-label={showNvidia ? 'Hide NVIDIA key' : 'Show NVIDIA key'}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-[#64748B] hover:text-[#0F172A] cursor-pointer"
+                >
+                  {showNvidia ? (
+                    <EyeOff className="w-4 h-4" strokeWidth={2.25} />
+                  ) : (
+                    <Eye className="w-4 h-4" strokeWidth={2.25} />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* YouTube Data API v3 Key (Optional) */}
+            <div>
+              <label
+                htmlFor="studio-youtube-key"
+                className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
+              >
+                YouTube Data API v3 Key (US Trends &amp; Chapters)
+              </label>
+              <div className="relative">
+                <input
+                  id="studio-youtube-key"
+                  type={showYoutube ? 'text' : 'password'}
+                  autoComplete="off"
+                  value={draft.youtubeApiKey}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      youtubeApiKey: e.target.value,
+                    }))
+                  }
+                  placeholder="AIzaSy..."
+                  className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] pl-3.5 pr-10 py-2.5 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowYoutube((v) => !v)}
+                  aria-label={
+                    showYoutube ? 'Hide YouTube key' : 'Show YouTube key'
+                  }
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-[#64748B] hover:text-[#0F172A] cursor-pointer"
+                >
+                  {showYoutube ? (
+                    <EyeOff className="w-4 h-4" strokeWidth={2.25} />
+                  ) : (
+                    <Eye className="w-4 h-4" strokeWidth={2.25} />
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Optional Cloudinary Portrait Storage & Character URL */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <label
                 htmlFor="studio-cloudinary-cloud"
-                className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
+                className="block text-xs font-bold text-[#475569] mb-1"
               >
-                Cloudinary Cloud Name
+                Cloudinary Cloud Name (Optional — Portraits)
               </label>
               <input
                 id="studio-cloudinary-cloud"
@@ -197,17 +288,17 @@ export function StudioConfigBar({
                     cloudinaryCloudName: e.target.value,
                   }))
                 }
-                placeholder="e.g. dxyz12345"
-                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2.5 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
+                placeholder="e.g. dxyz12345 (blank = browser storage)"
+                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
               />
             </div>
 
             <div>
               <label
                 htmlFor="studio-cloudinary-preset"
-                className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
+                className="block text-xs font-bold text-[#475569] mb-1"
               >
-                Cloudinary Unsigned Upload Preset
+                Cloudinary Unsigned Preset (Optional)
               </label>
               <input
                 id="studio-cloudinary-preset"
@@ -221,53 +312,16 @@ export function StudioConfigBar({
                   }))
                 }
                 placeholder="e.g. explainer_unsigned"
-                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2.5 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
+                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
               />
-            </div>
-          </div>
-
-          {/* Optional Session Cookie & Character Portrait URL */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label
-                htmlFor="studio-session-cookie"
-                className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
-              >
-                Session Cookie (Optional — Restricted Links Only)
-              </label>
-              <div className="relative">
-                <input
-                  id="studio-session-cookie"
-                  type={showCookie ? 'text' : 'password'}
-                  autoComplete="off"
-                  value={draft.sessionCookie}
-                  onChange={(e) =>
-                    setDraft((prev) => ({ ...prev, sessionCookie: e.target.value }))
-                  }
-                  placeholder="Optional Cookie header (a1=...; web_session=...) for login-walled links"
-                  className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] pl-3.5 pr-10 py-2.5 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowCookie((v) => !v)}
-                  aria-label={showCookie ? 'Hide session cookie' : 'Show session cookie'}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-[#64748B] hover:text-[#0F172A] cursor-pointer"
-                >
-                  {showCookie ? (
-                    <EyeOff className="w-4 h-4" strokeWidth={2.25} />
-                  ) : (
-                    <Eye className="w-4 h-4" strokeWidth={2.25} />
-                  )}
-                </button>
-              </div>
             </div>
 
             <div>
               <label
                 htmlFor="studio-character-url"
-                className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
+                className="block text-xs font-bold text-[#475569] mb-1"
               >
-                Character Portrait URL (Auto-Synced on Upload)
+                Character Portrait URL (Auto-Synced)
               </label>
               <input
                 id="studio-character-url"
@@ -281,63 +335,7 @@ export function StudioConfigBar({
                   }))
                 }
                 placeholder="https://res.cloudinary.com/.../portrait.jpg"
-                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2.5 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#FFAB00] focus:outline-none"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div>
-              <label
-                htmlFor="studio-repo-owner"
-                className="block text-xs font-bold text-[#475569] mb-1"
-              >
-                Repo Owner
-              </label>
-              <input
-                id="studio-repo-owner"
-                type="text"
-                value={draft.repoOwner}
-                onChange={(e) =>
-                  setDraft((prev) => ({ ...prev, repoOwner: e.target.value }))
-                }
-                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="studio-repo-name"
-                className="block text-xs font-bold text-[#475569] mb-1"
-              >
-                Repo Name
-              </label>
-              <input
-                id="studio-repo-name"
-                type="text"
-                value={draft.repoName}
-                onChange={(e) =>
-                  setDraft((prev) => ({ ...prev, repoName: e.target.value }))
-                }
-                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="studio-repo-branch"
-                className="block text-xs font-bold text-[#475569] mb-1"
-              >
-                Branch
-              </label>
-              <input
-                id="studio-repo-branch"
-                type="text"
-                value={draft.githubBranch}
-                onChange={(e) =>
-                  setDraft((prev) => ({ ...prev, githubBranch: e.target.value }))
-                }
-                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
+                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#FFAB00] focus:outline-none"
               />
             </div>
           </div>
@@ -345,8 +343,8 @@ export function StudioConfigBar({
           <div className="pt-3 border-t-2 border-[#F1F5F9] flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs font-medium text-[#64748B]">
               {autoWired
-                ? 'Auto-wired from GitHub Secrets at build time. Use this drawer only for fallback overrides or optional Session Cookies.'
-                : 'Saved locally in browser localStorage. On GitHub Pages, GH_PAT & Cloudinary secrets auto-wire automatically.'}
+                ? 'API keys are auto-wired from GitHub Secrets on GitHub Pages. Everything runs 100% inside your browser GPU (WebGL2 + WebCodecs Worker) with zero GitHub Actions wait.'
+                : 'Saved locally in browser localStorage for instant preview. On GitHub Pages, repository secrets auto-wire automatically.'}
             </p>
 
             <div className="flex items-center gap-2.5 shrink-0">
@@ -356,7 +354,7 @@ export function StudioConfigBar({
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border-2 border-[#E2E8F0] bg-white text-xs font-extrabold text-[#475569] hover:border-[#FF1744] hover:text-[#FF1744] hover:bg-[#FFF1F3] transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Trash2 className="w-3.5 h-3.5" strokeWidth={2.25} />
-                <span>Clear Keys</span>
+                <span>Reset Keys</span>
               </button>
 
               <button

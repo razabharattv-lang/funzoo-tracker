@@ -141,7 +141,7 @@ export function ExplainerControls({
           disabled={isRendering}
           value={controls.customAngle}
           onChange={(e) => onChange({ ...controls, customAngle: e.target.value })}
-          placeholder="Optional: Write a specific hook or story angle to steer the script. Leave blank and Gemini Vision will scan every second at 1 FPS automatically..."
+          placeholder="Optional: Write a specific hook or story angle to steer the script. Leave blank and Gemini Vision will scan your clip automatically..."
           className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2.5 text-sm font-medium text-[#0F172A] placeholder:text-[#64748B] focus:bg-white focus:border-[#3D5AFE] focus:outline-none disabled:opacity-55 resize-none transition-colors"
         />
       </div>
@@ -156,7 +156,7 @@ export function ExplainerControls({
         {isRendering ? (
           <>
             <Loader2 className="w-5 h-5 animate-spin" strokeWidth={2.5} />
-            <span>Rendering on 7GB Cloud Engine...</span>
+            <span>Rendering on Browser GPU...</span>
           </>
         ) : (
           <>

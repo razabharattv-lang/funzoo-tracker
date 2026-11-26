@@ -1,4 +1,4 @@
-name: Deploy US Explainer Studio to GitHub Pages
+name: Deploy Explainer Video Studio to GitHub Pages
 
 on:
   push:
@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Vite Studio
+    name: Build In-Browser Vite Studio
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -35,23 +35,13 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
-      - name: Encode GitHub PAT for Pages Auto-Wiring
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          if [ -n "$GH_PAT" ]; then
-            ENCODED_PAT=$(printf '%s' "$GH_PAT" | base64 | tr -d '\n')
-            echo "::add-mask::$ENCODED_PAT"
-            echo "VITE_GH_PAT_B64=$ENCODED_PAT" >> "$GITHUB_ENV"
-          fi
-
       - name: Build Production Bundle
         env:
+          VITE_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          VITE_NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          VITE_YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           VITE_CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
           VITE_CLOUDINARY_UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
-          VITE_REPO_OWNER: razabharattv-lang
-          VITE_REPO_NAME: funzoo-tracker
-          VITE_GITHUB_BRANCH: main
         run: npm run build
 
       - name: Configure GitHub Pages

@@ -1,11 +1,5 @@
 import { useEffect, useState } from 'react';
-import {
-  AlertCircle,
-  Check,
-  ExternalLink,
-  Loader2,
-  XCircle,
-} from 'lucide-react';
+import { AlertCircle, Check, Loader2, XCircle } from 'lucide-react';
 import type { PipelineProgressState, PipelineStepId } from '../types/studio';
 
 interface CloudProgressBarProps {
@@ -15,21 +9,25 @@ interface CloudProgressBarProps {
 }
 
 const PIPELINE_STEPS: { id: PipelineStepId; label: string; shortLabel: string }[] = [
-  { id: 'fetching_link', label: 'Fetching Link', shortLabel: 'Fetching Link' },
   {
-    id: 'scan_trends',
-    label: '1-FPS Scan & Trend Research',
-    shortLabel: '1-FPS Scan & Trends',
+    id: 'resolving_stream',
+    label: 'Resolving Stream',
+    shortLabel: 'Resolving Stream',
   },
   {
-    id: 'voice_character',
-    label: 'Suspense Voice & Character',
-    shortLabel: 'Voice & Character',
+    id: 'ai_trends',
+    label: '1-Call AI & US Trends',
+    shortLabel: '1-Call AI & Trends',
   },
   {
-    id: 'anti_copyright_render',
-    label: 'Anti-Copyright Render',
-    shortLabel: 'Anti-Copyright Render',
+    id: 'voice_lipsync',
+    label: 'Voice & Lip-Sync',
+    shortLabel: 'Voice & Lip-Sync',
+  },
+  {
+    id: 'gpu_render',
+    label: 'GPU Hardware Render',
+    shortLabel: 'GPU Render',
   },
   { id: 'ready', label: 'Ready', shortLabel: 'Ready' },
 ];
@@ -81,14 +79,14 @@ export function CloudProgressBar({
 
   return (
     <section
-      aria-label="7GB Cloud Render Progress"
+      aria-label="In-Browser GPU Production Progress"
       className={`rounded-2xl border-2 bg-white p-5 transition-colors ${cardBorder}`}
     >
       <div className="flex flex-wrap items-center justify-between gap-3 mb-3.5">
         <div className="min-w-0">
           <div className="flex items-center gap-2.5 flex-wrap">
             <h2 className="text-base font-extrabold text-[#0F172A]">
-              7GB Cloud Render Pipeline
+              In-Browser GPU Engine
             </h2>
             {isCompleted && (
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-[#00C853] text-white text-xs font-extrabold whitespace-nowrap">
@@ -97,7 +95,7 @@ export function CloudProgressBar({
             )}
             {isRunning && (
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-[#3D5AFE] text-white text-xs font-extrabold whitespace-nowrap">
-                Running
+                GPU Active
               </span>
             )}
             {isError && (
@@ -120,17 +118,6 @@ export function CloudProgressBar({
           <span className="font-mono-tabular text-sm font-extrabold text-[#0F172A] min-w-[3.2rem] text-right">
             {progress.percent}%
           </span>
-          {progress.githubRunUrl && (
-            <a
-              href={progress.githubRunUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#3D5AFE] bg-[#EEF2FF] text-[#3D5AFE] text-xs font-bold hover:bg-[#3D5AFE] hover:text-white transition-colors whitespace-nowrap"
-            >
-              <span>GitHub Run</span>
-              <ExternalLink className="w-3.5 h-3.5" strokeWidth={2.25} />
-            </a>
-          )}
           {isRunning && (
             <button
               type="button"
