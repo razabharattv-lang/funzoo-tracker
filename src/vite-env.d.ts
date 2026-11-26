@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
+  readonly VITE_GH_PAT_B64?: string;
   readonly VITE_GITHUB_TOKEN?: string;
   readonly VITE_REPO_OWNER?: string;
   readonly VITE_REPO_NAME?: string;

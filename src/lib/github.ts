@@ -1,19 +1,22 @@
 import type {
-  CaptionTheme,
-  CloudEnvConfig,
+  OutputLanguage,
   PipelineStepId,
-  ShieldFlag,
+  SourceType,
+  StudioConfig,
   VoiceGender,
 } from '../types/studio';
 
 export interface WorkflowDispatchPayload {
-  jobId: string;
-  rawVideoUrl: string;
-  rawPublicId: string;
-  customPrompt: string;
+  videoSource: string;
+  sourceType: SourceType;
+  language: OutputLanguage;
   voiceGender: VoiceGender;
-  shieldFlags: Record<ShieldFlag, boolean>;
-  captionTheme: CaptionTheme;
+  customAngle: string;
+  characterEnabled: boolean;
+  characterUrl: string;
+  outfitPrompt: string;
+  runTag: string;
+  sessionCookie?: string;
 }
 
 export interface GitHubWorkflowRun {
@@ -52,7 +55,7 @@ function githubHeaders(token: string): HeadersInit {
 }
 
 export async function dispatchCloudRender(
-  config: CloudEnvConfig,
+  config: StudioConfig,
   payload: WorkflowDispatchPayload,
   signal?: AbortSignal
 ): Promise<void> {
@@ -62,24 +65,22 @@ export async function dispatchCloudRender(
     config.repoName
   )}/actions/workflows/scheduler.yml/dispatches`;
 
-  const enabledShields = (Object.entries(payload.shieldFlags) as [ShieldFlag, boolean][])
-    .filter(([, enabled]) => enabled)
-    .map(([key]) => key)
-    .join(',');
-
   const response = await fetch(url, {
     method: 'POST',
     headers: githubHeaders(config.githubToken),
     body: JSON.stringify({
       ref: config.githubBranch,
       inputs: {
-        job_id: payload.jobId,
-        raw_video_url: payload.rawVideoUrl,
-        raw_public_id: payload.rawPublicId,
-        custom_prompt: payload.customPrompt.trim(),
+        video_source: payload.videoSource,
+        source_type: payload.sourceType,
+        language: payload.language,
         voice_gender: payload.voiceGender,
-        shield_options: enabledShields,
-        caption_theme: payload.captionTheme,
+        custom_angle: payload.customAngle.trim(),
+        character_enabled: payload.characterEnabled ? 'true' : 'false',
+        character_url: payload.characterEnabled ? payload.characterUrl : '',
+        outfit_prompt: payload.characterEnabled ? payload.outfitPrompt.trim() : '',
+        run_tag: payload.runTag,
+        session_cookie: payload.sessionCookie?.trim() ?? '',
       },
     }),
     signal,
@@ -93,9 +94,9 @@ export async function dispatchCloudRender(
   }
 }
 
-export async function findWorkflowRunByJobId(
-  config: CloudEnvConfig,
-  jobId: string,
+export async function findWorkflowRunByTag(
+  config: StudioConfig,
+  runTag: string,
   dispatchedAtMs: number,
   signal?: AbortSignal
 ): Promise<GitHubWorkflowRun | null> {
@@ -119,7 +120,7 @@ export async function findWorkflowRunByJobId(
   const data = (await response.json()) as { workflow_runs?: GitHubWorkflowRun[] };
   const runs = data.workflow_runs ?? [];
 
-  const exactMatch = runs.find((run) => run.name?.includes(jobId));
+  const exactMatch = runs.find((run) => run.name?.includes(runTag));
   if (exactMatch) return exactMatch;
 
   const recentFallback = runs.find((run) => {
@@ -131,7 +132,7 @@ export async function findWorkflowRunByJobId(
 }
 
 export async function fetchWorkflowRunJobs(
-  config: CloudEnvConfig,
+  config: StudioConfig,
   runId: number,
   signal?: AbortSignal
 ): Promise<{ run: GitHubWorkflowRun; jobs: GitHubRunJob[] }> {
@@ -168,7 +169,7 @@ export async function fetchWorkflowRunJobs(
 }
 
 export async function cancelWorkflowRun(
-  config: CloudEnvConfig,
+  config: StudioConfig,
   runId: number
 ): Promise<void> {
   const url = `https://api.github.com/repos/${encodeURIComponent(
@@ -182,7 +183,7 @@ export async function cancelWorkflowRun(
 }
 
 export async function fetchRecentWorkflowRuns(
-  config: CloudEnvConfig
+  config: StudioConfig
 ): Promise<GitHubWorkflowRun[]> {
   const url = `https://api.github.com/repos/${encodeURIComponent(
     config.repoOwner
@@ -204,7 +205,7 @@ export async function fetchRecentWorkflowRuns(
   return data.workflow_runs ?? [];
 }
 
-export function extractJobIdFromRunName(runName: string): string | null {
+export function extractRunTagFromRunName(runName: string): string | null {
   const match = runName.match(/\[([^\]]+)\]/);
   return match ? match[1] : null;
 }
@@ -220,88 +221,97 @@ export function mapGitHubStepsToStudioProgress(
   run: GitHubWorkflowRun,
   jobs: GitHubRunJob[]
 ): MappedStepProgress {
-  const completed: PipelineStepId[] = ['uploading'];
   const steps = jobs[0]?.steps ?? [];
-
   const findStep = (name: string) =>
     steps.find((s) => s.name.toLowerCase() === name.toLowerCase());
 
-  const analyzeStep = findStep('AI Vision & Script');
-  const voiceStep = findStep('Voice & Captions');
-  const renderStep = findStep('FFmpeg Anti-Copyright Render');
-  const publishStep = findStep('Upload Output & Cleanup');
+  const fetchStep = findStep('Fetching Link');
+  const analyzeStep = findStep('1-FPS Scan & Trend Research');
+  const voiceCharStep = findStep('Suspense Voice & Character');
+  const renderStep = findStep('Anti-Copyright Render');
+  const publishStep = findStep('Publish & Cleanup');
 
   if (run.status === 'completed' && run.conclusion === 'success') {
     return {
       activeStep: 'ready',
       completedSteps: [
-        'uploading',
-        'vision_script',
-        'voice_captions',
-        'ffmpeg_render',
+        'fetching_link',
+        'scan_trends',
+        'voice_character',
+        'anti_copyright_render',
         'ready',
       ],
       percent: 100,
-      detail: 'Finished 1080x1920 MP4 and US metadata are ready.',
+      detail: 'Finished 1080×1920 MP4 clip(s) and live YouTube-grounded metadata are ready.',
     };
   }
 
-  if (publishStep && (publishStep.status === 'in_progress' || publishStep.status === 'completed')) {
-    completed.push('vision_script', 'voice_captions', 'ffmpeg_render');
+  if (
+    publishStep &&
+    (publishStep.status === 'in_progress' || publishStep.status === 'completed')
+  ) {
     return {
       activeStep: 'ready',
-      completedSteps: completed,
+      completedSteps: [
+        'fetching_link',
+        'scan_trends',
+        'voice_character',
+        'anti_copyright_render',
+      ],
       percent: 94,
-      detail: 'Uploading finished 1080x1920 MP4 to Cloudinary and removing raw clip...',
+      detail:
+        'Uploading finished 1080×1920 MP4 clip(s) to Cloudinary and deleting temporary raw files...',
     };
   }
 
   if (renderStep && renderStep.status === 'in_progress') {
-    completed.push('vision_script', 'voice_captions');
     return {
-      activeStep: 'ffmpeg_render',
-      completedSteps: completed,
+      activeStep: 'anti_copyright_render',
+      completedSteps: ['fetching_link', 'scan_trends', 'voice_character'],
       percent: 78,
-      detail: 'Applying FFmpeg anti-copyright transforms and burning captions...',
+      detail:
+        'Applying watermark delogo, 15% crop, dynamic zoom, CapCut captions & timed character pop-ins...',
     };
   }
 
-  if (voiceStep && voiceStep.status === 'in_progress') {
-    completed.push('vision_script');
+  if (voiceCharStep && voiceCharStep.status === 'in_progress') {
     return {
-      activeStep: 'voice_captions',
-      completedSteps: completed,
-      percent: 56,
-      detail: 'Synthesizing natural American voiceover and ASS pop-up captions...',
+      activeStep: 'voice_character',
+      completedSteps: ['fetching_link', 'scan_trends'],
+      percent: 58,
+      detail:
+        'Generating deep suspense voiceover and face-locked talking character segments...',
     };
   }
 
   if (analyzeStep && analyzeStep.status === 'in_progress') {
     return {
-      activeStep: 'vision_script',
-      completedSteps: completed,
-      percent: 36,
-      detail: 'Gemini Vision is analyzing video frames and writing US explainer script...',
+      activeStep: 'scan_trends',
+      completedSteps: ['fetching_link'],
+      percent: 38,
+      detail:
+        'Scanning video at 1 FPS with Gemini Vision and querying live YouTube Data API v3 trends...',
     };
   }
 
-  if (analyzeStep && analyzeStep.status === 'completed') {
-    completed.push('vision_script');
+  if (fetchStep && fetchStep.status === 'completed') {
     return {
-      activeStep: 'voice_captions',
-      completedSteps: completed,
-      percent: 48,
-      detail: 'Starting voice synthesis and caption generation...',
+      activeStep: 'scan_trends',
+      completedSteps: ['fetching_link'],
+      percent: 30,
+      detail: 'Source video acquired. Starting 1-FPS Scan & Trend Research...',
     };
   }
 
   return {
-    activeStep: 'vision_script',
-    completedSteps: completed,
-    percent: 24,
+    activeStep: 'fetching_link',
+    completedSteps: [],
+    percent: fetchStep?.status === 'in_progress' ? 22 : 16,
     detail:
-      run.status === 'queued'
-        ? 'Waiting for 7GB GitHub Actions runner to boot...'
-        : 'Preparing FFmpeg & Python environment on 7GB runner...',
+      fetchStep?.status === 'in_progress'
+        ? 'Extracting clean source video via 3-layer link engine on 7GB runner...'
+        : run.status === 'queued'
+        ? 'Waiting for 7GB GitHub Actions runner to start...'
+        : 'Booting FFmpeg, yt-dlp, Playwright Chromium & ONNX cache on 7GB runner...',
   };
 }

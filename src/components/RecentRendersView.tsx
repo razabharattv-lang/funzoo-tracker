@@ -12,7 +12,7 @@ import { formatBytes, formatDuration } from '../lib/videoProbe';
 interface RecentRendersViewProps {
   records: SavedRenderRecord[];
   onLoadRecord: (record: SavedRenderRecord) => void;
-  onDeleteRecord: (jobId: string) => void;
+  onDeleteRecord: (runTag: string) => void;
   onSyncFromGitHub: () => Promise<string>;
   onGoToStudio: () => void;
 }
@@ -48,7 +48,7 @@ export function RecentRendersView({
             Recent Cloud Renders
           </h1>
           <p className="text-xs font-medium text-[#64748B] mt-0.5">
-            Load any completed 1080×1920 render back into the player and metadata deck.
+            Reload any finished 1080×1920 explainer video and its YouTube-grounded metadata deck.
           </p>
         </div>
 
@@ -63,7 +63,7 @@ export function RecentRendersView({
           ) : (
             <RefreshCw className="w-4 h-4" strokeWidth={2.5} />
           )}
-          <span>Sync GitHub Actions History</span>
+          <span>Sync GitHub Actions Runs</span>
         </button>
       </div>
 
@@ -82,7 +82,7 @@ export function RecentRendersView({
             No completed renders yet
           </h2>
           <p className="text-sm font-medium text-[#64748B] max-w-md mx-auto mt-1.5">
-            Drop a clip in the Studio Workspace and run a 7GB cloud render. Every finished MP4 and its US metadata deck will appear here automatically.
+            Upload a clip or paste a video link in the Studio Workspace to generate your first viral explainer video.
           </p>
           <button
             type="button"
@@ -102,17 +102,24 @@ export function RecentRendersView({
 
             return (
               <article
-                key={manifest.job_id}
+                key={manifest.run_tag}
                 className="rounded-2xl border-2 border-[#E2E8F0] bg-white p-4 flex flex-col justify-between gap-4 hover:border-[#3D5AFE] transition-colors"
               >
                 <div className="space-y-2.5">
                   <div className="flex items-start justify-between gap-2">
                     <h3 className="text-sm font-extrabold text-[#0F172A] leading-snug line-clamp-2">
-                      {manifest.title || record.sourceFileName}
+                      {manifest.title || record.sourceLabel}
                     </h3>
-                    <span className="px-2 py-0.5 rounded-full bg-[#00C853] text-white text-[11px] font-extrabold whitespace-nowrap shrink-0">
-                      Ready
-                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {manifest.clips && manifest.clips.length > 1 && (
+                        <span className="px-2 py-0.5 rounded-full bg-[#3D5AFE] text-white text-[11px] font-extrabold whitespace-nowrap">
+                          {manifest.clips.length} Clips
+                        </span>
+                      )}
+                      <span className="px-2 py-0.5 rounded-full bg-[#00C853] text-white text-[11px] font-extrabold whitespace-nowrap">
+                        {manifest.language === 'hi' ? 'Hindi' : 'US EN'}
+                      </span>
+                    </div>
                   </div>
 
                   <p className="text-xs font-medium text-[#475569] line-clamp-2">
@@ -145,8 +152,8 @@ export function RecentRendersView({
                   </button>
                   <button
                     type="button"
-                    onClick={() => onDeleteRecord(manifest.job_id)}
-                    aria-label={`Remove ${manifest.title || manifest.job_id} from history`}
+                    onClick={() => onDeleteRecord(manifest.run_tag)}
+                    aria-label={`Remove ${manifest.title || manifest.run_tag}`}
                     className="p-2 rounded-lg border-2 border-[#E2E8F0] text-[#64748B] hover:border-[#FF1744] hover:text-[#FF1744] hover:bg-[#FFF1F3] transition-colors cursor-pointer"
                   >
                     <Trash2 className="w-4 h-4" strokeWidth={2.25} />

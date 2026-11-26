@@ -26,12 +26,32 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
       - name: Install Dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Encode GitHub PAT for Pages Auto-Wiring
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            ENCODED_PAT=$(printf '%s' "$GH_PAT" | base64 | tr -d '\n')
+            echo "::add-mask::$ENCODED_PAT"
+            echo "VITE_GH_PAT_B64=$ENCODED_PAT" >> "$GITHUB_ENV"
+          fi
 
       - name: Build Production Bundle
+        env:
+          VITE_CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          VITE_CLOUDINARY_UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
+          VITE_REPO_OWNER: razabharattv-lang
+          VITE_REPO_NAME: funzoo-tracker
+          VITE_GITHUB_BRANCH: main
         run: npm run build
 
       - name: Configure GitHub Pages

@@ -1,97 +1,171 @@
-name: US Explainer Video Studio Cloud Engine
-run-name: "US Explainer Render [${{ inputs.job_id }}]"
+name: High-Retention Explainer Cloud Engine
+run-name: "${{ github.event_name == 'schedule' && 'Scheduled 24h Cloudinary Cleanup' || format('Explainer Render [{0}]', inputs.run_tag) }}"
 
 on:
+  schedule:
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
-      job_id:
-        description: 'Unique Studio Render Job ID'
+      video_source:
+        description: 'Raw Video URL, Messy Share-Text, or Cloudinary Upload URL'
         required: true
         type: string
-      raw_video_url:
-        description: 'Temporary Cloudinary Raw Video URL'
+      source_type:
+        description: 'link or upload'
         required: true
+        default: 'link'
         type: string
-      raw_public_id:
-        description: 'Cloudinary Raw Video Public ID (deleted after render)'
-        required: true
+      language:
+        description: 'Output Language (en or hi)'
+        required: false
+        default: 'en'
         type: string
-      custom_prompt:
-        description: 'Optional Custom US Explainer Angle / Hook'
+      voice_gender:
+        description: 'Voice Gender (male or female)'
+        required: false
+        default: 'male'
+        type: string
+      custom_angle:
+        description: 'Optional Custom Suspense Hook or Explanation Angle'
         required: false
         default: ''
         type: string
-      voice_gender:
-        description: 'Voice Gender (female or male)'
+      character_enabled:
+        description: 'Enable Talking Character Pattern Interrupts (true or false)'
         required: false
-        default: 'female'
+        default: 'false'
         type: string
-      shield_options:
-        description: 'Comma-separated Anti-Copyright Shield flags'
+      character_url:
+        description: 'Cloudinary URL of Character Portrait'
         required: false
-        default: 'crop_watermark,micro_zoom,color_grade,strip_metadata'
+        default: ''
         type: string
-      caption_theme:
-        description: 'ASS Pop-up Caption Theme'
+      outfit_prompt:
+        description: 'Optional Outfit Change Prompt (Face-Locked)'
         required: false
-        default: 'capcut_yellow_white'
+        default: ''
+        type: string
+      run_tag:
+        description: 'Unique Studio Run Tag for Cloudinary & Correlation'
+        required: true
+        type: string
+      session_cookie:
+        description: 'Optional Session Cookie for Restricted Links'
+        required: false
+        default: ''
         type: string
 
 jobs:
-  render-explainer:
-    name: 7GB Cloud US Explainer Render
+  cloudinary-cleanup:
+    name: 24-Hour Cloudinary Auto-Cleanup
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+    env:
+      CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+      CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+      CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Cleanup Dependencies
+        run: pip install --quiet cloudinary requests
+
+      - name: Purge Expired 24h Cloudinary Assets
+        run: python process_video.py --cleanup-only
+
+  render-explainer:
+    name: 7GB Cloud Production Video Engine
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
       CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
       CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
       CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
       CLOUDINARY_UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
-      JOB_ID: ${{ github.event.inputs.job_id }}
-      RAW_VIDEO_URL: ${{ github.event.inputs.raw_video_url }}
-      RAW_PUBLIC_ID: ${{ github.event.inputs.raw_public_id }}
-      CUSTOM_PROMPT: ${{ github.event.inputs.custom_prompt }}
+      WAV2LIP_ONNX_URL: ${{ secrets.WAV2LIP_ONNX_URL }}
+      VIDEO_SOURCE: ${{ github.event.inputs.video_source }}
+      SOURCE_TYPE: ${{ github.event.inputs.source_type }}
+      LANGUAGE: ${{ github.event.inputs.language }}
       VOICE_GENDER: ${{ github.event.inputs.voice_gender }}
-      SHIELD_OPTIONS: ${{ github.event.inputs.shield_options }}
-      CAPTION_THEME: ${{ github.event.inputs.caption_theme }}
+      CUSTOM_ANGLE: ${{ github.event.inputs.custom_angle }}
+      CHARACTER_ENABLED: ${{ github.event.inputs.character_enabled }}
+      CHARACTER_URL: ${{ github.event.inputs.character_url }}
+      OUTFIT_PROMPT: ${{ github.event.inputs.outfit_prompt }}
+      RUN_TAG: ${{ github.event.inputs.run_tag }}
+      SESSION_COOKIE: ${{ github.event.inputs.session_cookie }}
+      MODEL_CACHE_DIR: /home/runner/.cache/explainer-models
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python & FFmpeg
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install Render Dependencies
+      - name: Cache ONNX & Playwright Chromium Browsers
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/runner/.cache/explainer-models
+            /home/runner/.cache/ms-playwright
+          key: explainer-runtime-v4-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            explainer-runtime-v4-
+
+      - name: Install FFmpeg, Latest yt-dlp, Playwright Chromium & Dependencies
         run: |
+          if [ -n "$SESSION_COOKIE" ]; then
+            echo "::add-mask::$SESSION_COOKIE"
+          fi
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core fonts-noto-core fonts-lohit-deva
           pip install --quiet --upgrade pip
           pip install --quiet -r requirements.txt
+          pip install --quiet -U yt-dlp
+          playwright install chromium --with-deps
 
-      - name: AI Vision & Script
+      - name: Fetching Link
+        run: |
+          if [ -n "$SESSION_COOKIE" ]; then
+            echo "::add-mask::$SESSION_COOKIE"
+          fi
+          python process_video.py --stage fetch
+
+      - name: 1-FPS Scan & Trend Research
         run: python process_video.py --stage analyze
 
-      - name: Voice & Captions
-        run: python process_video.py --stage voice
+      - name: Suspense Voice & Character
+        run: python process_video.py --stage voice_character
 
-      - name: FFmpeg Anti-Copyright Render
+      - name: Anti-Copyright Render
         run: python process_video.py --stage render
 
-      - name: Upload Output & Cleanup
+      - name: Publish & Cleanup
         run: python process_video.py --stage publish
 
       - name: Save Render Manifest Artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: render-result-${{ github.event.inputs.job_id }}
+          name: render-manifest-${{ github.event.inputs.run_tag }}
           path: result_manifest.json
           retention-days: 7
 
-      - name: Cleanup Raw Input on Failure
+      - name: Cleanup Raw Upload on Failure
         if: failure()
         run: python process_video.py --stage cleanup_raw

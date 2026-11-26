@@ -1,6 +1,6 @@
 import type { SavedRenderRecord } from '../types/studio';
 
-const STORAGE_KEY = 'us_explainer_studio_renders_v1';
+const STORAGE_KEY = 'explainer_studio_renders_v2';
 
 export function loadSavedRenders(): SavedRenderRecord[] {
   try {
@@ -15,7 +15,7 @@ export function loadSavedRenders(): SavedRenderRecord[] {
 
 export function saveRenderRecord(record: SavedRenderRecord): SavedRenderRecord[] {
   const existing = loadSavedRenders().filter(
-    (item) => item.manifest.job_id !== record.manifest.job_id
+    (item) => item.manifest.run_tag !== record.manifest.run_tag
   );
   const next = [record, ...existing].slice(0, 25);
   try {
@@ -26,8 +26,8 @@ export function saveRenderRecord(record: SavedRenderRecord): SavedRenderRecord[]
   return next;
 }
 
-export function deleteRenderRecord(jobId: string): SavedRenderRecord[] {
-  const next = loadSavedRenders().filter((item) => item.manifest.job_id !== jobId);
+export function deleteRenderRecord(runTag: string): SavedRenderRecord[] {
+  const next = loadSavedRenders().filter((item) => item.manifest.run_tag !== runTag);
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch {

@@ -1,4 +1,4 @@
-import type { CloudEnvConfig, RenderResultManifest } from '../types/studio';
+import type { RenderResultManifest, StudioConfig } from '../types/studio';
 
 export interface CloudinaryUploadResponse {
   secure_url: string;
@@ -9,8 +9,8 @@ export interface CloudinaryUploadResponse {
 
 export function uploadRawVideoToCloudinary(
   file: File,
-  jobId: string,
-  config: CloudEnvConfig,
+  runTag: string,
+  config: StudioConfig,
   onProgress: (percent: number) => void,
   signal?: AbortSignal
 ): Promise<CloudinaryUploadResponse> {
@@ -22,8 +22,9 @@ export function uploadRawVideoToCloudinary(
     const formData = new FormData();
     formData.append('file', file);
     formData.append('upload_preset', config.cloudinaryUploadPreset);
-    formData.append('folder', 'us-explainer-studio/raw');
-    formData.append('public_id', `raw_${jobId}`);
+    formData.append('folder', 'explainer-studio/raw');
+    formData.append('public_id', `raw_${runTag}`);
+    formData.append('tags', `${runTag},temp_raw`);
 
     const xhr = new XMLHttpRequest();
 
@@ -76,7 +77,7 @@ export function uploadRawVideoToCloudinary(
 
     xhr.onerror = () => {
       signal?.removeEventListener('abort', onAbort);
-      reject(new Error('Network error while uploading raw video to Cloudinary.'));
+      reject(new Error('Network error while uploading video to Cloudinary.'));
     };
 
     xhr.open('POST', endpoint, true);
@@ -84,16 +85,61 @@ export function uploadRawVideoToCloudinary(
   });
 }
 
+export async function uploadCharacterPortraitToCloudinary(
+  file: File,
+  config: StudioConfig
+): Promise<CloudinaryUploadResponse> {
+  if (!config.cloudinaryCloudName || !config.cloudinaryUploadPreset) {
+    throw new Error(
+      'Enter your Cloudinary Cloud Name and Unsigned Upload Preset in Studio Config first.'
+    );
+  }
+
+  const endpoint = `https://api.cloudinary.com/v1_1/${encodeURIComponent(
+    config.cloudinaryCloudName
+  )}/image/upload`;
+
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('upload_preset', config.cloudinaryUploadPreset);
+  formData.append('folder', 'explainer-studio/characters');
+  formData.append('tags', 'keep_character');
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!response.ok) {
+    let message = `Character portrait upload failed (HTTP ${response.status}).`;
+    try {
+      const errJson = (await response.json()) as { error?: { message?: string } };
+      if (errJson.error?.message) {
+        message = `Cloudinary error: ${errJson.error.message}`;
+      }
+    } catch {
+      // keep default
+    }
+    throw new Error(message);
+  }
+
+  const parsed = (await response.json()) as CloudinaryUploadResponse;
+  if (!parsed.secure_url) {
+    throw new Error('Cloudinary did not return an image URL.');
+  }
+  return parsed;
+}
+
 export async function fetchRenderResultManifest(
   cloudName: string,
-  jobId: string,
+  runTag: string,
   signal?: AbortSignal
 ): Promise<RenderResultManifest> {
   const baseUrl = `https://res.cloudinary.com/${encodeURIComponent(
     cloudName
-  )}/raw/upload/us-explainer-studio/results/${encodeURIComponent(jobId)}.json`;
+  )}/raw/upload/explainer-studio/results/${encodeURIComponent(runTag)}.json`;
 
-  let lastError = 'Manifest not available yet.';
+  let lastError = 'Manifest not ready yet.';
   for (let attempt = 1; attempt <= 6; attempt++) {
     if (signal?.aborted) {
       throw new DOMException('Cancelled by user.', 'AbortError');
@@ -115,5 +161,7 @@ export async function fetchRenderResultManifest(
     await new Promise((r) => setTimeout(r, attempt * 1500));
   }
 
-  throw new Error(`Could not retrieve finished render manifest from Cloudinary (${lastError}).`);
+  throw new Error(
+    `Could not retrieve render manifest from Cloudinary (${lastError}).`
+  );
 }

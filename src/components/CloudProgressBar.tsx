@@ -15,13 +15,21 @@ interface CloudProgressBarProps {
 }
 
 const PIPELINE_STEPS: { id: PipelineStepId; label: string; shortLabel: string }[] = [
-  { id: 'uploading', label: 'Uploading', shortLabel: 'Uploading' },
-  { id: 'vision_script', label: 'AI Vision & Script', shortLabel: 'AI Vision & Script' },
-  { id: 'voice_captions', label: 'Voice & Captions', shortLabel: 'Voice & Captions' },
+  { id: 'fetching_link', label: 'Fetching Link', shortLabel: 'Fetching Link' },
   {
-    id: 'ffmpeg_render',
-    label: 'FFmpeg Anti-Copyright Render',
-    shortLabel: 'FFmpeg Render',
+    id: 'scan_trends',
+    label: '1-FPS Scan & Trend Research',
+    shortLabel: '1-FPS Scan & Trends',
+  },
+  {
+    id: 'voice_character',
+    label: 'Suspense Voice & Character',
+    shortLabel: 'Voice & Character',
+  },
+  {
+    id: 'anti_copyright_render',
+    label: 'Anti-Copyright Render',
+    shortLabel: 'Anti-Copyright Render',
   },
   { id: 'ready', label: 'Ready', shortLabel: 'Ready' },
 ];
@@ -84,17 +92,17 @@ export function CloudProgressBar({
             </h2>
             {isCompleted && (
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-[#00C853] text-white text-xs font-extrabold whitespace-nowrap">
-                Render Complete
+                Ready
               </span>
             )}
             {isRunning && (
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-[#3D5AFE] text-white text-xs font-extrabold whitespace-nowrap">
-                Live Cloud Job
+                Running
               </span>
             )}
             {isError && (
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-[#FF1744] text-white text-xs font-extrabold whitespace-nowrap">
-                Render Failed
+                Failed
               </span>
             )}
           </div>
@@ -136,7 +144,7 @@ export function CloudProgressBar({
         </div>
       </div>
 
-      {/* Solid-fill Flat Material Progress Bar */}
+      {/* Solid-Fill Progress Bar */}
       <div
         role="progressbar"
         aria-valuenow={progress.percent}
@@ -187,7 +195,10 @@ export function CloudProgressBar({
                   index + 1
                 )}
               </span>
-              <span className="text-xs font-bold leading-tight truncate" title={step.label}>
+              <span
+                className="text-xs font-bold leading-tight truncate"
+                title={step.label}
+              >
                 {step.shortLabel}
               </span>
             </li>
@@ -201,7 +212,10 @@ export function CloudProgressBar({
           className="mt-4 rounded-xl border-2 border-[#FF1744] bg-[#FFF1F3] p-3.5 flex items-start justify-between gap-3"
         >
           <div className="flex items-start gap-2.5 min-w-0">
-            <AlertCircle className="w-4 h-4 text-[#FF1744] shrink-0 mt-0.5" strokeWidth={2.5} />
+            <AlertCircle
+              className="w-4 h-4 text-[#FF1744] shrink-0 mt-0.5"
+              strokeWidth={2.5}
+            />
             <p className="text-xs font-bold text-[#991B1B] break-words">
               {progress.errorMessage}
             </p>

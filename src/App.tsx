@@ -1,30 +1,34 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Scissors } from 'lucide-react';
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { StudioConfigBar } from './components/StudioConfigBar';
-import { VideoDropzone } from './components/VideoDropzone';
+import { VideoSourceCard } from './components/VideoSourceCard';
+import { CharacterCard } from './components/CharacterCard';
 import { ExplainerControls } from './components/ExplainerControls';
 import { CloudProgressBar } from './components/CloudProgressBar';
 import { VerticalPlayerCard } from './components/VerticalPlayerCard';
 import { MetadataDeck } from './components/MetadataDeck';
 import { RecentRendersView } from './components/RecentRendersView';
 import {
-  clearStudioConfig,
+  clearStudioKeysOnly,
   getMissingConfigFields,
   loadStudioConfig,
   saveStudioConfig,
 } from './lib/env';
-import { probeLocalVideoFile } from './lib/videoProbe';
+import { formatDuration, probeLocalVideoFile } from './lib/videoProbe';
+import { extractVideoUrl } from './lib/urlExtractor';
 import {
   fetchRenderResultManifest,
+  uploadCharacterPortraitToCloudinary,
   uploadRawVideoToCloudinary,
 } from './lib/cloudinary';
 import {
   cancelWorkflowRun,
   dispatchCloudRender,
-  extractJobIdFromRunName,
+  extractRunTagFromRunName,
   fetchRecentWorkflowRuns,
   fetchWorkflowRunJobs,
-  findWorkflowRunByJobId,
+  findWorkflowRunByTag,
   mapGitHubStepsToStudioProgress,
 } from './lib/github';
 import {
@@ -33,40 +37,31 @@ import {
   saveRenderRecord,
 } from './lib/storage';
 import type {
-  CloudEnvConfig,
   LocalClipInfo,
   PipelineProgressState,
+  RenderedClipItem,
   RenderResultManifest,
+  SavedCharacterAsset,
   SavedRenderRecord,
+  StudioConfig,
   StudioControlsState,
 } from './types/studio';
-
-const DEFAULT_CONTROLS: StudioControlsState = {
-  customPrompt: '',
-  voiceGender: 'female',
-  shieldFlags: {
-    crop_watermark: true,
-    micro_zoom: true,
-    color_grade: true,
-    strip_metadata: true,
-  },
-  captionTheme: 'capcut_yellow_white',
-};
 
 const IDLE_PROGRESS: PipelineProgressState = {
   status: 'idle',
   activeStep: null,
   completedSteps: [],
   percent: 0,
-  statusDetail: 'Drop a source clip and click Render to launch the 7GB GitHub Actions engine.',
-  jobId: null,
+  statusDetail:
+    'Paste any video link or Chinese share-text (or upload a file), then click Generate Production Video.',
+  runTag: null,
   githubRunId: null,
   githubRunUrl: null,
   startedAtMs: null,
   errorMessage: null,
 };
 
-function createJobId(): string {
+function createRunTag(): string {
   const hex = Math.random().toString(16).slice(2, 8);
   return `exp_${Date.now()}_${hex}`;
 }
@@ -89,32 +84,73 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function normalizeManifestClips(
+  manifest: RenderResultManifest | null
+): RenderedClipItem[] {
+  if (!manifest) return [];
+  if (Array.isArray(manifest.clips) && manifest.clips.length > 0) {
+    return manifest.clips;
+  }
+  return [
+    {
+      clip_index: 1,
+      start_sec: 0,
+      end_sec: manifest.duration_sec,
+      reason: 'Short Video Full Cut',
+      video_url: manifest.video_url,
+      video_public_id: manifest.video_public_id,
+      duration_sec: manifest.duration_sec,
+      width: manifest.width,
+      height: manifest.height,
+      file_size_bytes: manifest.file_size_bytes,
+      voice_engine: manifest.voice_engine,
+      character_mode: manifest.character_mode,
+      watermark_boxes_removed: manifest.watermark_boxes_removed,
+      climax_second: manifest.mid_twist_second,
+      youtube_trends_count: manifest.youtube_trends_count,
+      voiceover: manifest.voiceover,
+      title: manifest.title,
+      description: manifest.description,
+      tags: manifest.tags,
+      hashtags: manifest.hashtags,
+      posting_time: manifest.posting_time,
+    },
+  ];
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('studio');
-  const [studioConfig, setStudioConfig] = useState<CloudEnvConfig>(() =>
+  const [studioConfig, setStudioConfig] = useState<StudioConfig>(() =>
     loadStudioConfig()
   );
   const [isConfigExpanded, setIsConfigExpanded] = useState(false);
+
   const [localClip, setLocalClip] = useState<LocalClipInfo | null>(null);
   const [clipError, setClipError] = useState<string | null>(null);
-  const [controls, setControls] = useState<StudioControlsState>(DEFAULT_CONTROLS);
+
+  const [controls, setControls] = useState<StudioControlsState>(() => {
+    const initialConfig = loadStudioConfig();
+    return {
+      sourceType: 'link',
+      videoUrl: '',
+      language: 'en',
+      voiceGender: 'male',
+      customAngle: '',
+      characterEnabled: false,
+      selectedCharacterId: initialConfig.savedCharacters[0]?.id ?? null,
+      outfitPrompt: '',
+    };
+  });
+
+  const [isUploadingPortrait, setIsUploadingPortrait] = useState(false);
+  const [portraitError, setPortraitError] = useState<string | null>(null);
+
   const [progress, setProgress] = useState<PipelineProgressState>(IDLE_PROGRESS);
   const [result, setResult] = useState<RenderResultManifest | null>(null);
+  const [selectedClipIndex, setSelectedClipIndex] = useState(0);
   const [savedRenders, setSavedRenders] = useState<SavedRenderRecord[]>(() =>
     loadSavedRenders()
   );
-
-  const handleSaveConfig = useCallback((next: CloudEnvConfig) => {
-    const saved = saveStudioConfig(next);
-    setStudioConfig(saved);
-    if (getMissingConfigFields(saved).length === 0) {
-      window.setTimeout(() => setIsConfigExpanded(false), 700);
-    }
-  }, []);
-
-  const handleClearConfig = useCallback(() => {
-    setStudioConfig(clearStudioConfig());
-  }, []);
 
   const abortRef = useRef<AbortController | null>(null);
   const activeRunIdRef = useRef<number | null>(null);
@@ -123,6 +159,36 @@ export default function App() {
     return () => {
       abortRef.current?.abort();
     };
+  }, []);
+
+  const renderedClips = useMemo(
+    () => normalizeManifestClips(result),
+    [result]
+  );
+  const activeClip =
+    renderedClips[selectedClipIndex] ?? renderedClips[0] ?? null;
+
+  const handleSaveConfig = useCallback((next: StudioConfig) => {
+    const saved = saveStudioConfig(next);
+    setStudioConfig(saved);
+    if (saved.characterImageUrl) {
+      const matched = saved.savedCharacters.find(
+        (c) => c.url === saved.characterImageUrl
+      );
+      if (matched) {
+        setControls((prev) => ({
+          ...prev,
+          selectedCharacterId: matched.id,
+        }));
+      }
+    }
+    if (getMissingConfigFields(saved, true).length === 0) {
+      window.setTimeout(() => setIsConfigExpanded(false), 700);
+    }
+  }, []);
+
+  const handleClearKeys = useCallback(() => {
+    setStudioConfig((current) => clearStudioKeysOnly(current));
   }, []);
 
   const clearLocalClip = useCallback(() => {
@@ -142,57 +208,173 @@ export default function App() {
         return info;
       });
       setResult(null);
+      setSelectedClipIndex(0);
       setProgress(IDLE_PROGRESS);
     } catch (err) {
       setClipError((err as Error).message);
     }
   }, []);
 
+  const handleUploadPortrait = useCallback(
+    async (file: File) => {
+      setPortraitError(null);
+      if (
+        !studioConfig.cloudinaryCloudName ||
+        !studioConfig.cloudinaryUploadPreset
+      ) {
+        setIsConfigExpanded(true);
+        setPortraitError(
+          'Add your Cloudinary Cloud Name and Unsigned Upload Preset in Studio Config first.'
+        );
+        return;
+      }
+
+      setIsUploadingPortrait(true);
+      try {
+        const res = await uploadCharacterPortraitToCloudinary(file, studioConfig);
+        const cleanName = file.name.replace(/\.[^.]+$/, '').slice(0, 32) || 'Portrait';
+        const newAsset: SavedCharacterAsset = {
+          id: `char_${Date.now()}`,
+          name: cleanName,
+          url: res.secure_url,
+          publicId: res.public_id,
+          uploadedAt: new Date().toISOString(),
+        };
+        const nextConfig = saveStudioConfig({
+          ...studioConfig,
+          characterImageUrl: res.secure_url,
+          savedCharacters: [newAsset, ...studioConfig.savedCharacters].slice(0, 8),
+        });
+        setStudioConfig(nextConfig);
+        setControls((prev) => ({
+          ...prev,
+          characterEnabled: true,
+          selectedCharacterId: newAsset.id,
+        }));
+      } catch (err) {
+        setPortraitError((err as Error).message);
+      } finally {
+        setIsUploadingPortrait(false);
+      }
+    },
+    [studioConfig]
+  );
+
+  const handleSelectCharacter = useCallback(
+    (selectedCharacterId: string) => {
+      setControls((prev) => ({ ...prev, selectedCharacterId }));
+      const chosen = studioConfig.savedCharacters.find(
+        (c) => c.id === selectedCharacterId
+      );
+      if (chosen) {
+        const nextConfig = saveStudioConfig({
+          ...studioConfig,
+          characterImageUrl: chosen.url,
+        });
+        setStudioConfig(nextConfig);
+      }
+    },
+    [studioConfig]
+  );
+
+  const handleDeleteCharacter = useCallback(
+    (id: string) => {
+      const remaining = studioConfig.savedCharacters.filter((c) => c.id !== id);
+      const nextUrl = remaining[0]?.url ?? '';
+      const nextConfig = saveStudioConfig({
+        ...studioConfig,
+        characterImageUrl: nextUrl,
+        savedCharacters: remaining,
+      });
+      setStudioConfig(nextConfig);
+      setControls((prev) => ({
+        ...prev,
+        selectedCharacterId:
+          prev.selectedCharacterId === id
+            ? remaining[0]?.id ?? null
+            : prev.selectedCharacterId,
+      }));
+    },
+    [studioConfig]
+  );
+
   const handleResetWorkspace = useCallback(() => {
     if (progress.status === 'running') return;
     clearLocalClip();
-    setControls(DEFAULT_CONTROLS);
+    setControls((prev) => ({
+      ...prev,
+      videoUrl: '',
+      customAngle: '',
+      outfitPrompt: '',
+    }));
     setProgress(IDLE_PROGRESS);
     setResult(null);
+    setSelectedClipIndex(0);
     setActiveTab('studio');
   }, [clearLocalClip, progress.status]);
 
   const handleCancelRender = useCallback(async () => {
     abortRef.current?.abort();
     const runId = activeRunIdRef.current;
-    const env = studioConfig;
-    if (runId && env.githubToken && env.repoOwner && env.repoName) {
+    if (
+      runId &&
+      studioConfig.githubToken &&
+      studioConfig.repoOwner &&
+      studioConfig.repoName
+    ) {
       try {
-        await cancelWorkflowRun(env, runId);
+        await cancelWorkflowRun(studioConfig, runId);
       } catch {
-        // Ignore cancellation network error after abort
+        // ignore cancel error after abort
       }
     }
     activeRunIdRef.current = null;
     setProgress((prev) => ({
       ...prev,
       status: 'cancelled',
-      statusDetail: 'Cloud render cancelled. Ready for a new clip.',
+      statusDetail: 'Cloud render cancelled. Ready for your next video.',
       errorMessage: null,
     }));
   }, [studioConfig]);
 
-  const handleStartRender = useCallback(async () => {
-    if (!localClip || progress.status === 'running') return;
+  const activeCharacter =
+    studioConfig.savedCharacters.find(
+      (c) => c.id === controls.selectedCharacterId
+    ) ??
+    studioConfig.savedCharacters[0] ??
+    null;
 
-    const env = studioConfig;
-    const missing = getMissingConfigFields(env);
+  const activeCharacterUrl =
+    activeCharacter?.url || studioConfig.characterImageUrl || '';
+
+  const extractedLink = extractVideoUrl(controls.videoUrl);
+
+  const canGenerate =
+    controls.sourceType === 'upload'
+      ? Boolean(localClip)
+      : Boolean(extractedLink);
+
+  const handleStartRender = useCallback(async () => {
+    if (!canGenerate || progress.status === 'running') return;
+
+    const requireUnsignedPreset = controls.sourceType === 'upload';
+    const missing = getMissingConfigFields(studioConfig, requireUnsignedPreset);
     if (missing.length > 0) {
       setIsConfigExpanded(true);
       setProgress({
         ...IDLE_PROGRESS,
         status: 'error',
-        activeStep: 'uploading',
-        statusDetail: 'Configure Studio Keys & Config before dispatching.',
-        errorMessage: `Missing Studio Keys: ${missing.join(
+        activeStep: 'fetching_link',
+        statusDetail: 'Complete Studio Config before starting a cloud render.',
+        errorMessage: `Missing Studio Config fields: ${missing.join(
           ', '
-        )}. Enter them in the "Studio Keys & Config" bar above (saved locally in your browser).`,
+        )}. Enter them in the collapsible Studio Config bar above.`,
       });
+      return;
+    }
+
+    if (controls.characterEnabled && !activeCharacterUrl) {
+      setPortraitError('Upload a character portrait or turn Talking Character OFF.');
       return;
     }
 
@@ -201,17 +383,22 @@ export default function App() {
     abortRef.current = controller;
     activeRunIdRef.current = null;
 
-    const jobId = createJobId();
+    const runTag = createRunTag();
     const startedAtMs = Date.now();
     setResult(null);
+    setSelectedClipIndex(0);
+    setPortraitError(null);
 
     setProgress({
       status: 'running',
-      activeStep: 'uploading',
+      activeStep: 'fetching_link',
       completedSteps: [],
       percent: 4,
-      statusDetail: 'Uploading raw source video to temporary Cloudinary storage...',
-      jobId,
+      statusDetail:
+        controls.sourceType === 'upload'
+          ? 'Uploading raw clip to Cloudinary...'
+          : 'Dispatching pasted video URL to 7GB GitHub Actions runner...',
+      runTag,
       githubRunId: null,
       githubRunUrl: null,
       startedAtMs,
@@ -219,53 +406,59 @@ export default function App() {
     });
 
     try {
-      // Stage 1: Direct browser upload to Cloudinary
-      const uploadRes = await uploadRawVideoToCloudinary(
-        localClip.file,
-        jobId,
-        env,
-        (uploadPct) => {
-          const scaledPct = Math.max(4, Math.min(20, Math.round((uploadPct / 100) * 20)));
-          setProgress((prev) => ({
-            ...prev,
-            percent: scaledPct,
-            statusDetail: `Uploading raw clip to Cloudinary (${uploadPct}%)...`,
-          }));
-        },
-        controller.signal
-      );
+      let videoSourceForWorkflow = extractedLink?.cleanUrl ?? controls.videoUrl.trim();
+      let sourceLabel = videoSourceForWorkflow;
 
-      // Stage 2: Dispatch GitHub Actions workflow_dispatch
+      if (controls.sourceType === 'upload' && localClip) {
+        sourceLabel = localClip.name;
+        const uploadRes = await uploadRawVideoToCloudinary(
+          localClip.file,
+          runTag,
+          studioConfig,
+          (uploadPct) => {
+            const scaled = Math.max(4, Math.min(18, Math.round((uploadPct / 100) * 18)));
+            setProgress((prev) => ({
+              ...prev,
+              percent: scaled,
+              statusDetail: `Uploading raw clip to Cloudinary (${uploadPct}%)...`,
+            }));
+          },
+          controller.signal
+        );
+        videoSourceForWorkflow = uploadRes.secure_url;
+      }
+
       const dispatchedAtMs = Date.now();
       setProgress((prev) => ({
         ...prev,
-        activeStep: 'vision_script',
-        completedSteps: ['uploading'],
-        percent: 22,
-        statusDetail: 'Dispatching 7GB Cloud Render job on GitHub Actions...',
+        percent: Math.max(prev.percent, 18),
+        statusDetail: 'Triggering 7GB GitHub Actions workflow...',
       }));
 
       await dispatchCloudRender(
-        env,
+        studioConfig,
         {
-          jobId,
-          rawVideoUrl: uploadRes.secure_url,
-          rawPublicId: uploadRes.public_id,
-          customPrompt: controls.customPrompt,
+          videoSource: videoSourceForWorkflow,
+          sourceType: controls.sourceType,
+          language: controls.language,
           voiceGender: controls.voiceGender,
-          shieldFlags: controls.shieldFlags,
-          captionTheme: controls.captionTheme,
+          customAngle: controls.customAngle,
+          characterEnabled: controls.characterEnabled,
+          characterUrl: controls.characterEnabled ? activeCharacterUrl : '',
+          outfitPrompt: controls.characterEnabled ? controls.outfitPrompt : '',
+          runTag,
+          sessionCookie: studioConfig.sessionCookie,
         },
         controller.signal
       );
 
-      // Locate the newly dispatched workflow run by jobId
+      // Locate matching workflow run by run_tag
       let matchedRun = null;
-      for (let lookup = 0; lookup < 24; lookup++) {
+      for (let attempt = 0; attempt < 24; attempt++) {
         await sleep(2500, controller.signal);
-        matchedRun = await findWorkflowRunByJobId(
-          env,
-          jobId,
+        matchedRun = await findWorkflowRunByTag(
+          studioConfig,
+          runTag,
           dispatchedAtMs,
           controller.signal
         );
@@ -274,7 +467,7 @@ export default function App() {
 
       if (!matchedRun) {
         throw new Error(
-          'GitHub Actions accepted the dispatch, but the workflow run did not appear within 60 seconds. Check your repository Actions tab.'
+          'Workflow dispatched, but the GitHub Actions run did not appear within 60 seconds. Check your repository Actions tab.'
         );
       }
 
@@ -283,14 +476,13 @@ export default function App() {
         ...prev,
         githubRunId: matchedRun.id,
         githubRunUrl: matchedRun.html_url,
-        statusDetail: '7GB Cloud runner assigned. Waiting for AI Vision & Script stage...',
+        statusDetail: '7GB runner started. Fetching source video...',
       }));
 
-      // Poll live run + job steps every 3 seconds until completion
-      let finishedSuccessfully = false;
-      for (let poll = 0; poll < 240; poll++) {
+      let finishedOk = false;
+      for (let poll = 0; poll < 360; poll++) {
         const { run, jobs } = await fetchWorkflowRunJobs(
-          env,
+          studioConfig,
           matchedRun.id,
           controller.signal
         );
@@ -307,95 +499,109 @@ export default function App() {
 
         if (run.status === 'completed') {
           if (run.conclusion === 'success') {
-            finishedSuccessfully = true;
+            finishedOk = true;
             break;
           }
           throw new Error(
-            `GitHub Actions workflow finished with conclusion "${run.conclusion ?? 'unknown'}". Inspect the GitHub Run logs for details.`
+            `GitHub Actions workflow finished with "${run.conclusion ?? 'failure'}". Open GitHub Run logs to inspect details.`
           );
         }
 
         await sleep(3000, controller.signal);
       }
 
-      if (!finishedSuccessfully) {
-        throw new Error('Cloud render timed out after 12 minutes of polling.');
+      if (!finishedOk) {
+        throw new Error('Cloud render polling timed out after 18 minutes.');
       }
 
-      // Fetch final manifest JSON directly from Cloudinary
       setProgress((prev) => ({
         ...prev,
         activeStep: 'ready',
         completedSteps: [
-          'uploading',
-          'vision_script',
-          'voice_captions',
-          'ffmpeg_render',
+          'fetching_link',
+          'scan_trends',
+          'voice_character',
+          'anti_copyright_render',
         ],
         percent: 98,
-        statusDetail: 'Loading finished 1080×1920 MP4 and US viral metadata...',
+        statusDetail: 'Loading finished 1080×1920 MP4 clip(s) and grounded metadata...',
       }));
 
       const manifest = await fetchRenderResultManifest(
-        env.cloudinaryCloudName,
-        jobId,
+        studioConfig.cloudinaryCloudName,
+        runTag,
         controller.signal
       );
 
+      const clipsCount = manifest.clips?.length ?? 1;
       setResult(manifest);
+      setSelectedClipIndex(0);
       setProgress((prev) => ({
         ...prev,
         status: 'completed',
         activeStep: 'ready',
         completedSteps: [
-          'uploading',
-          'vision_script',
-          'voice_captions',
-          'ffmpeg_render',
+          'fetching_link',
+          'scan_trends',
+          'voice_character',
+          'anti_copyright_render',
           'ready',
         ],
         percent: 100,
         statusDetail:
-          'Finished 1080×1920 MP4 rendered and raw source deleted from Cloudinary.',
+          clipsCount > 1
+            ? `Long video sliced into ${clipsCount} viral 1080×1920 MP4 clips with live YouTube-grounded metadata.`
+            : 'Finished 1080×1920 explainer MP4 and live YouTube-grounded metadata are ready.',
       }));
 
-      const updatedHistory = saveRenderRecord({
+      const updated = saveRenderRecord({
         manifest,
-        sourceFileName: localClip.name,
-        customPrompt: controls.customPrompt,
+        sourceLabel,
+        customAngle: controls.customAngle,
         githubRunUrl: matchedRun.html_url,
       });
-      setSavedRenders(updatedHistory);
+      setSavedRenders(updated);
       activeRunIdRef.current = null;
     } catch (err) {
-      if ((err as Error).name === 'AbortError') {
-        return;
-      }
+      if ((err as Error).name === 'AbortError') return;
       activeRunIdRef.current = null;
       setProgress((prev) => ({
         ...prev,
         status: 'error',
-        statusDetail: 'Cloud render halted due to an error.',
+        statusDetail: 'Cloud render stopped with an error.',
         errorMessage: (err as Error).message || 'Unexpected render failure.',
       }));
     }
-  }, [controls, localClip, progress.status, studioConfig]);
+  }, [
+    activeCharacterUrl,
+    canGenerate,
+    controls,
+    extractedLink,
+    localClip,
+    progress.status,
+    studioConfig,
+  ]);
 
   const handleLoadRecord = useCallback((record: SavedRenderRecord) => {
     setResult(record.manifest);
+    setSelectedClipIndex(0);
+    const clipsCount = record.manifest.clips?.length ?? 1;
     setProgress({
       status: 'completed',
       activeStep: 'ready',
       completedSteps: [
-        'uploading',
-        'vision_script',
-        'voice_captions',
-        'ffmpeg_render',
+        'fetching_link',
+        'scan_trends',
+        'voice_character',
+        'anti_copyright_render',
         'ready',
       ],
       percent: 100,
-      statusDetail: `Loaded completed render (${record.manifest.job_id}).`,
-      jobId: record.manifest.job_id,
+      statusDetail:
+        clipsCount > 1
+          ? `Loaded ${clipsCount}-clip render (${record.manifest.run_tag}).`
+          : `Loaded completed render (${record.manifest.run_tag}).`,
+      runTag: record.manifest.run_tag,
       githubRunId: null,
       githubRunUrl: record.githubRunUrl ?? null,
       startedAtMs: null,
@@ -404,47 +610,46 @@ export default function App() {
     setActiveTab('studio');
   }, []);
 
-  const handleDeleteRecord = useCallback((jobId: string) => {
-    setSavedRenders(deleteRenderRecord(jobId));
+  const handleDeleteRecord = useCallback((runTag: string) => {
+    setSavedRenders(deleteRenderRecord(runTag));
   }, []);
 
   const handleSyncFromGitHub = useCallback(async (): Promise<string> => {
-    const env = studioConfig;
-    const missing = getMissingConfigFields(env);
+    const missing = getMissingConfigFields(studioConfig, false);
     if (missing.length > 0) {
       setIsConfigExpanded(true);
       throw new Error(
-        `Add ${missing.join(', ')} in the "Studio Keys & Config" bar above to sync GitHub Actions runs.`
+        `Add ${missing.join(', ')} in Studio Config above to sync GitHub Actions runs.`
       );
     }
 
-    const runs = await fetchRecentWorkflowRuns(env);
+    const runs = await fetchRecentWorkflowRuns(studioConfig);
     const completedRuns = runs.filter(
       (r) => r.status === 'completed' && r.conclusion === 'success'
     );
 
     let synced = 0;
     let latestList = loadSavedRenders();
-    const existingIds = new Set(latestList.map((r) => r.manifest.job_id));
+    const existingTags = new Set(latestList.map((r) => r.manifest.run_tag));
 
     for (const run of completedRuns) {
-      const jobId = extractJobIdFromRunName(run.name);
-      if (!jobId || existingIds.has(jobId)) continue;
+      const tag = extractRunTagFromRunName(run.name);
+      if (!tag || existingTags.has(tag)) continue;
       try {
         const manifest = await fetchRenderResultManifest(
-          env.cloudinaryCloudName,
-          jobId
+          studioConfig.cloudinaryCloudName,
+          tag
         );
         latestList = saveRenderRecord({
           manifest,
-          sourceFileName: `${jobId}.mp4`,
-          customPrompt: '',
+          sourceLabel: tag,
+          customAngle: '',
           githubRunUrl: run.html_url,
         });
-        existingIds.add(jobId);
+        existingTags.add(tag);
         synced += 1;
       } catch {
-        // Skip runs whose Cloudinary manifest is unavailable or expired
+        // skip runs without manifest
       }
     }
 
@@ -471,31 +676,58 @@ export default function App() {
           isExpanded={isConfigExpanded}
           onToggleExpand={() => setIsConfigExpanded((open) => !open)}
           onSave={handleSaveConfig}
-          onClear={handleClearConfig}
+          onClearKeys={handleClearKeys}
         />
 
         {activeTab === 'studio' ? (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            {/* LEFT COLUMN: Upload & Custom US Explainer Controls */}
+            {/* LEFT COLUMN: Zero-Clutter Essential Controls */}
             <div className="lg:col-span-5 space-y-5">
-              <VideoDropzone
+              <VideoSourceCard
+                sourceType={controls.sourceType}
+                videoUrl={controls.videoUrl}
                 clip={localClip}
                 disabled={progress.status === 'running'}
                 error={clipError}
+                onSourceTypeChange={(sourceType) =>
+                  setControls((prev) => ({ ...prev, sourceType }))
+                }
+                onVideoUrlChange={(videoUrl) =>
+                  setControls((prev) => ({ ...prev, videoUrl }))
+                }
                 onFileSelected={(file) => void handleFileSelected(file)}
                 onClearClip={clearLocalClip}
               />
 
+              <CharacterCard
+                enabled={controls.characterEnabled}
+                savedCharacters={studioConfig.savedCharacters}
+                selectedCharacterId={controls.selectedCharacterId}
+                outfitPrompt={controls.outfitPrompt}
+                disabled={progress.status === 'running'}
+                isUploadingPortrait={isUploadingPortrait}
+                uploadError={portraitError}
+                onToggleEnabled={(characterEnabled) =>
+                  setControls((prev) => ({ ...prev, characterEnabled }))
+                }
+                onSelectCharacter={handleSelectCharacter}
+                onUploadPortrait={(file) => void handleUploadPortrait(file)}
+                onDeleteCharacter={handleDeleteCharacter}
+                onOutfitPromptChange={(outfitPrompt) =>
+                  setControls((prev) => ({ ...prev, outfitPrompt }))
+                }
+              />
+
               <ExplainerControls
                 controls={controls}
-                hasClip={Boolean(localClip)}
+                canGenerate={canGenerate}
                 isRendering={progress.status === 'running'}
                 onChange={setControls}
                 onStartRender={() => void handleStartRender()}
               />
             </div>
 
-            {/* RIGHT COLUMN: Live Stepped Progress, Vertical Player & Viral Metadata Deck */}
+            {/* RIGHT COLUMN: Live 5-Step Progress, Multi-Clip Switcher, 9:16 Player & Copy Output Deck */}
             <div className="lg:col-span-7 space-y-5">
               <CloudProgressBar
                 progress={progress}
@@ -503,12 +735,90 @@ export default function App() {
                 onDismissError={() => setProgress(IDLE_PROGRESS)}
               />
 
+              {renderedClips.length > 1 && (
+                <section
+                  aria-label="Viral Clips Selector"
+                  className="rounded-2xl border-2 border-[#3D5AFE] bg-[#EEF2FF] p-4 space-y-3"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="w-7 h-7 rounded-lg bg-[#3D5AFE] text-white flex items-center justify-center shrink-0">
+                        <Scissors className="w-4 h-4" strokeWidth={2.5} />
+                      </span>
+                      <div>
+                        <h2 className="text-sm font-extrabold text-[#0F172A]">
+                          Top {renderedClips.length} Viral Shorts Extracted
+                        </h2>
+                        <p className="text-xs font-semibold text-[#334155]">
+                          Auto-sliced from{' '}
+                          {formatDuration(result?.source_total_duration ?? 0)} long video — select a clip to preview, download &amp; copy metadata
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div
+                    className={`grid grid-cols-1 gap-2.5 ${
+                      renderedClips.length >= 4
+                        ? 'sm:grid-cols-2 xl:grid-cols-4'
+                        : 'sm:grid-cols-3'
+                    }`}
+                  >
+                    {renderedClips.map((clip, idx) => {
+                      const isActive = idx === selectedClipIndex;
+                      return (
+                        <button
+                          key={clip.clip_index}
+                          type="button"
+                          onClick={() => setSelectedClipIndex(idx)}
+                          className={`rounded-xl border-2 px-3 py-2.5 text-left transition-colors cursor-pointer ${
+                            isActive
+                              ? 'border-[#3D5AFE] bg-[#3D5AFE] text-white'
+                              : 'border-[#CBD5E1] bg-white text-[#0F172A] hover:border-[#3D5AFE]'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-extrabold whitespace-nowrap">
+                              Clip {clip.clip_index}
+                            </span>
+                            <span
+                              className={`font-mono-tabular text-[11px] font-bold ${
+                                isActive ? 'text-white/90' : 'text-[#3D5AFE]'
+                              }`}
+                            >
+                              {formatDuration(clip.start_sec)}–{formatDuration(clip.end_sec)}
+                            </span>
+                          </div>
+                          <p
+                            className={`text-[11px] font-semibold mt-1 truncate ${
+                              isActive ? 'text-white/90' : 'text-[#64748B]'
+                            }`}
+                            title={clip.title || clip.reason}
+                          >
+                            {clip.title || clip.reason}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
               <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
                 <div className="xl:col-span-5">
-                  <VerticalPlayerCard localClip={localClip} result={result} />
+                  <VerticalPlayerCard
+                    localClip={controls.sourceType === 'upload' ? localClip : null}
+                    result={result}
+                    activeClip={activeClip}
+                    totalClips={renderedClips.length}
+                  />
                 </div>
                 <div className="xl:col-span-7">
-                  <MetadataDeck result={result} />
+                  <MetadataDeck
+                    result={result}
+                    activeClip={activeClip}
+                    totalClips={renderedClips.length}
+                  />
                 </div>
               </div>
             </div>
