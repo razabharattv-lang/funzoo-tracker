@@ -1,27 +1,29 @@
-export type StudioMode = 'explainer' | 'documentary';
-
-export type DocumentaryStyle = 'documentary' | 'motion_graphics' | '3d_blender';
-
-export type DocumentaryInputKind = 'topic' | 'script';
-
 export type SourceType = 'upload' | 'link';
 
 export type OutputLanguage = 'en' | 'hi';
 
 export type VoiceGender = 'male' | 'female';
 
+export type AiEnginePreference =
+  | 'auto'
+  | 'gemini-3.8-flash'
+  | 'nvidia/nemotron-3.5-super-vl-120b-a12b'
+  | 'nvidia/nemotron-3.5-lightning-30b-a3b'
+  | 'mistralai/mistral-large-4'
+  | 'nvidia/riva-translate-4b-instruct-v2'
+  | 'nvidia/nemotron-3.5-content-safety';
+
 export type PipelineStepId =
-  | 'step_1_inspect'
-  | 'step_2_clean_visuals'
-  | 'step_3_script_trends'
-  | 'step_4_voice_character'
-  | 'step_5_gpu_mux';
+  | 'step_1_fetch_clip'
+  | 'step_2_clean_grade'
+  | 'step_3_translate_seo'
+  | 'step_4_voiceover'
+  | 'step_5_mux_output';
 
 export type OfflineModelId =
   | 'scene_logo_scanner'
-  | 'whisper_caption_aligner'
-  | 'mediapipe_face_rig'
-  | 'offline_script_generator';
+  | 'caption_timing_aligner'
+  | 'offline_translation_seo';
 
 export interface OfflineModelStatus {
   id: OfflineModelId;
@@ -32,42 +34,12 @@ export interface OfflineModelStatus {
   sizeKB: number;
 }
 
-export interface CacheStorageSummary {
-  cacheApiEntries: number;
-  indexedDbAssets: number;
-  cachedModelIds: OfflineModelId[];
-  totalCachedBytes: number;
-  lastSyncedAt: string;
-}
-
 export interface AlignedWordTiming {
   word: string;
   startSec: number;
   endSec: number;
   confidence: number;
   isEmphasis: boolean;
-}
-
-export interface CharacterFaceLandmarks {
-  cropX: number;
-  cropY: number;
-  cropSize: number;
-  jawRatioY: number;
-  mouthCenterX: number;
-  mouthCenterY: number;
-  eyeLineY: number;
-  detectorEngine: string;
-}
-
-export interface CharacterRigFrameState {
-  mouthOpen: number;
-  jawDrop: number;
-  smileBoost: number;
-  blinkAmount: number;
-  headPitchRad: number;
-  headRollRad: number;
-  headBobPx: number;
-  browRaise: number;
 }
 
 export interface LocalSceneScanResult {
@@ -83,40 +55,13 @@ export interface LocalSceneScanResult {
   hasOutroBumper: boolean;
 }
 
-export interface SavedCharacterAsset {
-  id: string;
-  name: string;
-  url: string;
-  publicId: string;
-  uploadedAt: string;
-}
-
-export interface StudioConfig {
-  geminiApiKey: string;
-  nvidiaApiKey: string;
-  youtubeApiKey: string;
-  cloudinaryCloudName: string;
-  cloudinaryUploadPreset: string;
-  externalGpuEndpoint: string;
-  externalGpuKey: string;
-  characterImageUrl: string;
-  savedCharacters: SavedCharacterAsset[];
-}
-
 export interface StudioControlsState {
-  studioMode: StudioMode;
   sourceType: SourceType;
   videoUrl: string;
-  documentaryStyle: DocumentaryStyle;
-  documentaryInputKind: DocumentaryInputKind;
-  documentaryInput: string;
-  useExternalGpu: boolean;
   language: OutputLanguage;
   voiceGender: VoiceGender;
+  aiEngine: AiEnginePreference;
   customAngle: string;
-  characterEnabled: boolean;
-  selectedCharacterId: string | null;
-  outfitPrompt: string;
 }
 
 export interface SourceMediaItem {
@@ -176,58 +121,6 @@ export interface ViralSegment {
   watermarkZones: WatermarkZone[];
 }
 
-export type MotionShaderPreset =
-  | 'cinema_grid'
-  | 'neon_motion_hud'
-  | 'blender_3d_extrude'
-  | 'orbital_nebula';
-
-export interface DocumentarySceneCard {
-  sceneIndex: number;
-  heading: string;
-  visualPrompt: string;
-  captionCallout: string;
-  shaderPreset: MotionShaderPreset;
-  accentHex: string;
-  targetDurationSec: number;
-  narrationDraft: string;
-  externalVisualDataUrl?: string;
-}
-
-export interface DocumentaryChapter {
-  chapterIndex: number;
-  totalChapters: number;
-  title: string;
-  style: DocumentaryStyle;
-  targetDurationSec: number;
-  climaxSec: number;
-  visualPrompt: string;
-  captionCallout: string;
-  shaderPreset: MotionShaderPreset;
-  accentHex: string;
-  rawNarration: string;
-  beats: ScriptBeat[];
-  searchQueries: string[];
-  externalVisualDataUrl?: string;
-  stampedContactSheetJpeg?: string;
-  stampedTimestampsSec: number[];
-  visualEngineLabel: string;
-}
-
-export interface DocumentaryOutline {
-  id: string;
-  topicOrTitle: string;
-  style: DocumentaryStyle;
-  inputKind: DocumentaryInputKind;
-  chapters: DocumentaryChapter[];
-  totalDurationSec: number;
-  plannerModel: string;
-}
-
-/**
- * Step 1 & Step 2 Output: Locked, trimmed, de-watermarked & cinema-graded visual clip
- * with an exact duration and stamped relative-second contact sheet ready for Step 3 AI inspection.
- */
 export interface PreparedVisualClip {
   clipIndex: number;
   totalClips: number;
@@ -246,25 +139,6 @@ export interface PreparedVisualClip {
   stampedContactSheetJpeg: string;
   stampedTimestampsSec: number[];
   inspectorModel: string;
-}
-
-export interface VisionTimelineBeat {
-  second: number;
-  timestamp: string;
-  action: string;
-}
-
-export interface VisionAnalysisResult {
-  coreTopic: string;
-  climaxSecond: number;
-  timeline: VisionTimelineBeat[];
-  beats: ScriptBeat[];
-  watermarkZones: WatermarkZone[];
-  safeCropInsets: SafeCropInsets;
-  trimRange: TrimRange;
-  searchQueries: string[];
-  viralSegments: ViralSegment[];
-  visionModel: string;
 }
 
 export interface YouTubeTrendVideo {
@@ -295,9 +169,8 @@ export interface RenderedClipOutput {
   startSec: number;
   endSec: number;
   reason: string;
-  studioMode: StudioMode;
-  documentaryStyle?: DocumentaryStyle;
   videoUrl: string;
+  mimeType: string;
   durationSec: number;
   width: number;
   height: number;
@@ -307,10 +180,9 @@ export interface RenderedClipOutput {
   voiceGender: VoiceGender;
   voiceEngine: string;
   renderEngine: string;
-  characterMode: string;
   watermarkBoxesRemoved: number;
   endCardTrimmedSec: number;
-  safeCropApplied?: boolean;
+  safeCropApplied: boolean;
   climaxSecond: number;
   metadata: TrendMetadata;
 }
@@ -332,8 +204,7 @@ export interface SavedRenderRecord {
   completedAt: string;
   sourceLabel: string;
   sourceDurationSec: number;
-  mode: 'short' | 'long' | 'documentary';
-  studioMode: StudioMode;
+  mode: 'short' | 'long';
   customAngle: string;
   clips: RenderedClipOutput[];
 }

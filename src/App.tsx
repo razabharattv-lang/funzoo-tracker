@@ -1,25 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Clapperboard, Layers } from 'lucide-react';
 import { TopBar, type ActiveTab } from './components/TopBar';
-import { StudioConfigBar } from './components/StudioConfigBar';
 import { VideoSourceCard } from './components/VideoSourceCard';
-import { DocumentaryInputCard } from './components/DocumentaryInputCard';
 import { SourcePreviewCard } from './components/SourcePreviewCard';
-import { CharacterCard } from './components/CharacterCard';
 import { ExplainerControls } from './components/ExplainerControls';
 import { CloudProgressBar } from './components/CloudProgressBar';
 import { OutputDeckCard } from './components/OutputDeckCard';
 import { RecentRendersView } from './components/RecentRendersView';
-import {
-  clearStudioKeysOnly,
-  getMissingConfigFields,
-  hasExternalGpuConfigured,
-  loadStudioConfig,
-  saveStudioConfig,
-} from './lib/env';
 import { probeVideoBlobToSource } from './lib/videoProbe';
 import { extractVideoUrl } from './lib/urlExtractor';
-import { uploadCharacterPortraitToCloudinary } from './lib/cloudinary';
 import {
   deleteRenderRecord,
   loadSavedRenders,
@@ -31,1107 +19,401 @@ import {
   inspectAndSliceSegmentsStep1,
 } from './engine/visualClipper';
 import {
-  planDocumentaryOutlineStep1,
-  prepareDocumentaryChapterVisualsStep2,
-} from './engine/documentaryPlanner';
-import {
-  applyFaceLockedOutfitChange,
   fetchLiveYouTubeTrends,
-  inspectLockedVisualClipOneCall,
-  refineBeatSyncedScriptAndMetadata,
-  refineDocumentaryChapterScriptAndMetadata,
+  translateClipAndBuildSeoStep3,
 } from './engine/intelligenceEngine';
-import { requestExternalGpuCharacterFrame } from './engine/modelRouter';
 import { synthesizeCommandingVoiceover } from './engine/audioEngine';
-import {
-  detectDeviceRenderProfile,
-  renderDocumentarySceneMp4Gpu,
-  renderProductionMp4Gpu,
-} from './engine/gpuRenderer';
-import {
-  PRE_EMBEDDED_MODEL_MANIFEST,
-  getStudioCacheSummary,
-} from './engine/cacheManager';
-import { warmPreEmbeddedOfflineModels } from './engine/offlineModels';
+import { renderProductionMp4Gpu } from './engine/gpuRenderer';
+import { warmOfflineEngines } from './engine/offlineModels';
 import type {
-  CacheStorageSummary,
-  DocumentaryOutline,
-  OfflineModelStatus,
   PipelineProgress,
+  PipelineStepId,
   RenderedClipOutput,
-  SavedCharacterAsset,
   SavedRenderRecord,
   SourceMediaItem,
-  StudioConfig,
   StudioControlsState,
-  YouTubeTrendVideo,
+  TrendMetadata,
 } from './types/studio';
 
-const IDLE_PROGRESS: PipelineProgress = {
+const INITIAL_PROGRESS: PipelineProgress = {
   status: 'idle',
   activeStep: null,
   completedSteps: [],
   percent: 0,
-  statusDetail:
-    'Choose Video Explainer or Documentary / 3D Mode, preview your source or chapters, and click Generate Production Video.',
+  statusDetail: 'Paste a video link or upload a local MP4/MOV/WebM file to start.',
   clipProgressLabel: null,
   runTag: null,
   startedAtMs: null,
   errorMessage: null,
 };
 
-function createRunTag(): string {
-  const hex = Math.random().toString(16).slice(2, 8);
-  return `exp_${Date.now()}_${hex}`;
-}
+const INITIAL_CONTROLS: StudioControlsState = {
+  sourceType: 'link',
+  videoUrl: '',
+  language: 'en',
+  voiceGender: 'male',
+  aiEngine: 'auto',
+  customAngle: '',
+};
 
-export default function App() {
+export function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('studio');
-  const [studioConfig, setStudioConfig] = useState<StudioConfig>(() =>
-    loadStudioConfig()
-  );
-  const [isConfigExpanded, setIsConfigExpanded] = useState(
-    () => getMissingConfigFields(loadStudioConfig()).length > 0
-  );
-  const [offlineModels, setOfflineModels] = useState<OfflineModelStatus[]>(
-    () => PRE_EMBEDDED_MODEL_MANIFEST
-  );
-  const [cacheSummary, setCacheSummary] = useState<CacheStorageSummary | null>(
-    null
-  );
-
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      const models = await warmPreEmbeddedOfflineModels();
-      const summary = await getStudioCacheSummary();
-      if (active) {
-        setOfflineModels(models);
-        setCacheSummary(summary);
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  // Compact Card 1 states (Explainer source OR Documentary chapter outline)
+  const [controls, setControls] = useState<StudioControlsState>(INITIAL_CONTROLS);
   const [sourceMedia, setSourceMedia] = useState<SourceMediaItem | null>(null);
-  const [isFetchingLink, setIsFetchingLink] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
+  const [isFetchingLink, setIsFetchingLink] = useState(false);
 
-  const [documentaryOutline, setDocumentaryOutline] =
-    useState<DocumentaryOutline | null>(null);
-  const [isPlanningOutline, setIsPlanningOutline] = useState(false);
-  const [documentaryError, setDocumentaryError] = useState<string | null>(null);
-
-  const [controls, setControls] = useState<StudioControlsState>(() => {
-    const initialConfig = loadStudioConfig();
-    return {
-      studioMode: 'explainer',
-      sourceType: 'link',
-      videoUrl: '',
-      documentaryStyle: 'documentary',
-      documentaryInputKind: 'topic',
-      documentaryInput: '',
-      useExternalGpu: hasExternalGpuConfigured(initialConfig),
-      language: 'en',
-      voiceGender: 'male',
-      customAngle: '',
-      characterEnabled: false,
-      selectedCharacterId: initialConfig.savedCharacters[0]?.id ?? null,
-      outfitPrompt: '',
-    };
-  });
-
-  const [isUploadingPortrait, setIsUploadingPortrait] = useState(false);
-  const [portraitError, setPortraitError] = useState<string | null>(null);
-
-  const [progress, setProgress] = useState<PipelineProgress>(IDLE_PROGRESS);
-
-  // Compact Card 2: Final Production Output Deck state
-  const [outputRunTag, setOutputRunTag] = useState<string | null>(null);
-  const [outputSourceDuration, setOutputSourceDuration] = useState<number>(0);
+  const [progress, setProgress] = useState<PipelineProgress>(INITIAL_PROGRESS);
   const [renderedClips, setRenderedClips] = useState<RenderedClipOutput[]>([]);
-
   const [savedRenders, setSavedRenders] = useState<SavedRenderRecord[]>(() =>
     loadSavedRenders()
   );
 
   const abortRef = useRef<AbortController | null>(null);
-  const activeOutputBlobUrlsRef = useRef<string[]>([]);
-
-  const revokeOutputBlobUrls = useCallback(() => {
-    for (const url of activeOutputBlobUrlsRef.current) {
-      if (url.startsWith('blob:')) URL.revokeObjectURL(url);
-    }
-    activeOutputBlobUrlsRef.current = [];
-  }, []);
-
-  const clearSourceMedia = useCallback(() => {
-    setSourceMedia((prev) => {
-      if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
-      return null;
-    });
-    setSourceError(null);
-  }, []);
-
-  const clearDocumentaryOutline = useCallback(() => {
-    setDocumentaryOutline(null);
-    setDocumentaryError(null);
-  }, []);
+  const sourceUrlRef = useRef<string | null>(null);
+  const renderedUrlsRef = useRef<string[]>([]);
 
   useEffect(() => {
+    warmOfflineEngines();
     return () => {
       abortRef.current?.abort();
-      revokeOutputBlobUrls();
+      if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
+      renderedUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
     };
-  }, [revokeOutputBlobUrls]);
+  }, []);
 
-  const handleSaveConfig = useCallback((next: StudioConfig) => {
-    const saved = saveStudioConfig(next);
-    setStudioConfig(saved);
-    const hasGpu = hasExternalGpuConfigured(saved);
-    setControls((prev) => {
-      const matched = saved.characterImageUrl
-        ? saved.savedCharacters.find((c) => c.url === saved.characterImageUrl)
-        : null;
-      return {
-        ...prev,
-        useExternalGpu: hasGpu ? prev.useExternalGpu : false,
-        selectedCharacterId: matched ? matched.id : prev.selectedCharacterId,
-      };
+  const replaceSourceMedia = useCallback((next: SourceMediaItem | null) => {
+    if (sourceUrlRef.current && sourceUrlRef.current !== next?.objectUrl) {
+      URL.revokeObjectURL(sourceUrlRef.current);
+    }
+    sourceUrlRef.current = next?.objectUrl ?? null;
+    setSourceMedia(next);
+  }, []);
+
+  const replaceRenderedClips = useCallback((next: RenderedClipOutput[]) => {
+    const nextUrls = new Set(next.map((c) => c.videoUrl));
+    renderedUrlsRef.current.forEach((u) => {
+      if (!nextUrls.has(u)) URL.revokeObjectURL(u);
     });
-    if (getMissingConfigFields(saved).length === 0) {
-      window.setTimeout(() => setIsConfigExpanded(false), 600);
-    }
+    renderedUrlsRef.current = next.map((c) => c.videoUrl);
+    setRenderedClips(next);
   }, []);
 
-  const handleClearKeys = useCallback(() => {
-    setStudioConfig((current) => clearStudioKeysOnly(current));
-  }, []);
-
-  const handleFileSelected = useCallback(async (file: File) => {
-    setSourceError(null);
-    try {
-      const probed = await probeVideoBlobToSource({
-        blob: file,
-        sourceType: 'upload',
-        label: file.name,
-        platform: 'Local File',
-      });
-      setSourceMedia((prev) => {
-        if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
-        return probed;
-      });
-      setRenderedClips([]);
-      setOutputRunTag(null);
-      setProgress(IDLE_PROGRESS);
-    } catch (err) {
-      setSourceError((err as Error).message);
-    }
-  }, []);
+  const handleFileSelected = useCallback(
+    async (file: File) => {
+      setSourceError(null);
+      try {
+        const probed = await probeVideoBlobToSource({
+          blob: file,
+          sourceType: 'upload',
+          label: file.name,
+          platform: 'Local Video',
+        });
+        replaceSourceMedia(probed);
+        setProgress({
+          ...INITIAL_PROGRESS,
+          statusDetail: `Loaded "${probed.label}" (${probed.durationSec.toFixed(1)}s, ${probed.width}×${probed.height}). Ready to run all 5 steps.`,
+        });
+      } catch (err) {
+        setSourceError(
+          err instanceof Error
+            ? err.message
+            : 'Could not read video metadata from this file.'
+        );
+      }
+    },
+    [replaceSourceMedia]
+  );
 
   const handleFetchLinkPreview = useCallback(async () => {
-    if (isFetchingLink || progress.status === 'running') return;
     setSourceError(null);
+    const extracted = extractVideoUrl(controls.videoUrl);
+    if (!extracted) {
+      setSourceError('Paste a valid http:// or https:// video link first.');
+      return;
+    }
+
     setIsFetchingLink(true);
     try {
       const resolved = await resolveLinkToSourceMedia({
         rawInput: controls.videoUrl,
-        onStatus: () => {},
+        onStatus: (msg) =>
+          setProgress((prev) => ({
+            ...prev,
+            statusDetail: msg,
+          })),
       });
-      setSourceMedia((prev) => {
-        if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
-        return resolved;
+      replaceSourceMedia(resolved);
+      setProgress({
+        ...INITIAL_PROGRESS,
+        statusDetail: `Source link loaded (${resolved.durationSec.toFixed(1)}s, ${resolved.width}×${resolved.height}). Ready to run all 5 steps.`,
       });
     } catch (err) {
-      setSourceError((err as Error).message);
+      setSourceError(
+        err instanceof Error
+          ? err.message
+          : 'Could not fetch video from this link. Please upload the local video file.'
+      );
     } finally {
       setIsFetchingLink(false);
     }
-  }, [controls.videoUrl, isFetchingLink, progress.status]);
+  }, [controls.videoUrl, replaceSourceMedia]);
 
-  const handlePreviewDocumentaryOutline = useCallback(async () => {
-    if (isPlanningOutline || progress.status === 'running') return;
-    if (controls.documentaryInput.trim().length < 6) return;
-    setDocumentaryError(null);
-    setIsPlanningOutline(true);
-    try {
-      const outline = await planDocumentaryOutlineStep1({
-        rawInput: controls.documentaryInput,
-        inputKind: controls.documentaryInputKind,
-        style: controls.documentaryStyle,
-        language: controls.language,
-        customAngle: controls.customAngle,
-        config: studioConfig,
-      });
-      setDocumentaryOutline(outline);
-    } catch (err) {
-      setDocumentaryError((err as Error).message);
-    } finally {
-      setIsPlanningOutline(false);
-    }
-  }, [
-    controls.customAngle,
-    controls.documentaryInput,
-    controls.documentaryInputKind,
-    controls.documentaryStyle,
-    controls.language,
-    isPlanningOutline,
-    progress.status,
-    studioConfig,
-  ]);
-
-  const handleUploadPortrait = useCallback(
-    async (file: File) => {
-      setPortraitError(null);
-      setIsUploadingPortrait(true);
-      try {
-        const res = await uploadCharacterPortraitToCloudinary(
-          file,
-          studioConfig
-        );
-        const cleanName =
-          file.name.replace(/\.[^.]+$/, '').slice(0, 32) || 'Portrait';
-        const newAsset: SavedCharacterAsset = {
-          id: `char_${Date.now()}`,
-          name: cleanName,
-          url: res.secure_url,
-          publicId: res.public_id,
-          uploadedAt: new Date().toISOString(),
-        };
-        const nextConfig = saveStudioConfig({
-          ...studioConfig,
-          characterImageUrl: res.secure_url,
-          savedCharacters: [newAsset, ...studioConfig.savedCharacters].slice(
-            0,
-            8
-          ),
-        });
-        setStudioConfig(nextConfig);
-        setControls((prev) => ({
-          ...prev,
-          characterEnabled: true,
-          selectedCharacterId: newAsset.id,
-        }));
-      } catch (err) {
-        setPortraitError((err as Error).message);
-      } finally {
-        setIsUploadingPortrait(false);
-      }
-    },
-    [studioConfig]
-  );
-
-  const handleSelectCharacter = useCallback(
-    (selectedCharacterId: string) => {
-      setControls((prev) => ({ ...prev, selectedCharacterId }));
-      const chosen = studioConfig.savedCharacters.find(
-        (c) => c.id === selectedCharacterId
-      );
-      if (chosen) {
-        setStudioConfig(
-          saveStudioConfig({
-            ...studioConfig,
-            characterImageUrl: chosen.url,
-          })
-        );
-      }
-    },
-    [studioConfig]
-  );
-
-  const handleDeleteCharacter = useCallback(
-    (id: string) => {
-      const remaining = studioConfig.savedCharacters.filter((c) => c.id !== id);
-      const nextUrl = remaining[0]?.url ?? '';
-      setStudioConfig(
-        saveStudioConfig({
-          ...studioConfig,
-          characterImageUrl: nextUrl,
-          savedCharacters: remaining,
-        })
-      );
-      setControls((prev) => ({
-        ...prev,
-        selectedCharacterId:
-          prev.selectedCharacterId === id
-            ? remaining[0]?.id ?? null
-            : prev.selectedCharacterId,
-      }));
-    },
-    [studioConfig]
-  );
+  const handleClearSource = useCallback(() => {
+    replaceSourceMedia(null);
+    setSourceError(null);
+  }, [replaceSourceMedia]);
 
   const handleResetWorkspace = useCallback(() => {
     if (progress.status === 'running') return;
-    clearSourceMedia();
-    clearDocumentaryOutline();
-    revokeOutputBlobUrls();
-    setControls((prev) => ({
-      ...prev,
-      videoUrl: '',
-      documentaryInput: '',
-      customAngle: '',
-      outfitPrompt: '',
-    }));
-    setProgress(IDLE_PROGRESS);
-    setRenderedClips([]);
-    setOutputRunTag(null);
-    setOutputSourceDuration(0);
+    replaceSourceMedia(null);
+    replaceRenderedClips([]);
+    setControls(INITIAL_CONTROLS);
+    setSourceError(null);
+    setProgress(INITIAL_PROGRESS);
     setActiveTab('studio');
-  }, [
-    clearDocumentaryOutline,
-    clearSourceMedia,
-    progress.status,
-    revokeOutputBlobUrls,
-  ]);
+  }, [progress.status, replaceRenderedClips, replaceSourceMedia]);
 
-  const handleCancelRender = useCallback(() => {
+  const handleCancelPipeline = useCallback(() => {
     abortRef.current?.abort();
     setProgress((prev) => ({
       ...prev,
       status: 'cancelled',
-      clipProgressLabel: null,
-      statusDetail: 'GPU render cancelled. Ready for your next project.',
-      errorMessage: null,
+      statusDetail: 'Pipeline stopped by user.',
     }));
   }, []);
 
-  const activeCharacter =
-    studioConfig.savedCharacters.find(
-      (c) => c.id === controls.selectedCharacterId
-    ) ??
-    studioConfig.savedCharacters[0] ??
-    null;
-
-  const activeCharacterUrl =
-    activeCharacter?.url || studioConfig.characterImageUrl || '';
-
-  const extractedLink = extractVideoUrl(controls.videoUrl);
-  const externalGpuAvailable = hasExternalGpuConfigured(studioConfig);
-
-  const canGenerate =
-    controls.studioMode === 'documentary'
-      ? controls.documentaryInput.trim().length >= 6
-      : controls.sourceType === 'upload'
-      ? Boolean(sourceMedia && sourceMedia.sourceType === 'upload')
-      : Boolean(extractedLink);
-
-  const resolveCharacterPortraitOnce = useCallback(
-    async (signal: AbortSignal): Promise<string> => {
-      let url = activeCharacterUrl;
-      if (!controls.characterEnabled || !url) return '';
-
-      if (controls.outfitPrompt.trim()) {
-        url = await applyFaceLockedOutfitChange({
-          portraitUrl: url,
-          outfitPrompt: controls.outfitPrompt,
-          signal,
-        });
-      }
-
-      if (controls.useExternalGpu && externalGpuAvailable) {
-        const extChar = await requestExternalGpuCharacterFrame({
-          config: studioConfig,
-          useExternalGpu: true,
-          portraitUrl: url,
-          signal,
-        });
-        if (extChar?.enhancedPortraitUrl) {
-          url = extChar.enhancedPortraitUrl;
-        }
-      }
-      return url;
-    },
-    [
-      activeCharacterUrl,
-      controls.characterEnabled,
-      controls.outfitPrompt,
-      controls.useExternalGpu,
-      externalGpuAvailable,
-      studioConfig,
-    ]
-  );
-
-  const handleStartRender = useCallback(async () => {
-    if (!canGenerate || progress.status === 'running') return;
-
-    const missing = getMissingConfigFields(studioConfig);
-    if (missing.length > 0) {
-      setIsConfigExpanded(true);
-      setProgress({
-        ...IDLE_PROGRESS,
-        status: 'error',
-        activeStep: 'step_1_inspect',
-        statusDetail:
-          'Add required integration keys in Studio Engine & Integrations above.',
-        errorMessage: `Missing required config: ${missing.join(
-          ', '
-        )}. Enter your key in the Studio Engine & Integrations bar above.`,
-      });
-      return;
-    }
-
-    if (controls.characterEnabled && !activeCharacterUrl) {
-      setPortraitError(
-        'Upload a character portrait or turn Talking Character OFF.'
-      );
-      return;
-    }
-
+  const handleGenerate = useCallback(async () => {
+    setSourceError(null);
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
     const { signal } = controller;
 
-    revokeOutputBlobUrls();
-    const runTag = createRunTag();
-    const startedAtMs = Date.now();
-    setOutputRunTag(runTag);
-    setRenderedClips([]);
-    setPortraitError(null);
-    setSourceError(null);
-    setDocumentaryError(null);
-
-    const newOutputBlobUrls: string[] = [];
-
-    try {
-      // ================================================================
-      // MODE B: SCRIPT-TO-DOCUMENTARY / MOTION GRAPHICS / 3D-BLENDER
-      // ================================================================
-      if (controls.studioMode === 'documentary') {
-        setProgress({
-          status: 'running',
-          activeStep: 'step_1_inspect',
-          completedSteps: [],
-          percent: 6,
-          statusDetail:
-            'Step 1: Architecting chapter outline (Nemotron Ultra 550B / Step 5 / Kimi K3.1 / Gemini 3.8)...',
-          clipProgressLabel: null,
-          runTag,
-          startedAtMs,
-          errorMessage: null,
-        });
-
-        const outline =
-          documentaryOutline &&
-          documentaryOutline.style === controls.documentaryStyle &&
-          documentaryOutline.inputKind === controls.documentaryInputKind
-            ? documentaryOutline
-            : await planDocumentaryOutlineStep1({
-                rawInput: controls.documentaryInput,
-                inputKind: controls.documentaryInputKind,
-                style: controls.documentaryStyle,
-                language: controls.language,
-                customAngle: controls.customAngle,
-                config: studioConfig,
-                signal,
-              });
-
-        setDocumentaryOutline(outline);
-        setOutputSourceDuration(outline.totalDurationSec);
-
-        const effectivePortraitUrl = await resolveCharacterPortraitOnce(signal);
-        const totalChapters = outline.chapters.length;
-        const finishedOutputs: RenderedClipOutput[] = [];
-        const trendsCache = new Map<string, YouTubeTrendVideo[]>();
-        const profile = detectDeviceRenderProfile();
-
-        for (let i = 0; i < totalChapters; i++) {
-          if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-          const rawChapter = outline.chapters[i];
-          const chLabel = `Chapter ${i + 1}/${totalChapters}`;
-          const chPrefix = `${chLabel}: `;
-          const basePct = 15 + Math.round((i / totalChapters) * 82);
-          const spanPct = Math.round(82 / totalChapters);
-
-          // STEP 2: Visual Scene & Stamped Contact Sheet
-          setProgress((prev) => ({
-            ...prev,
-            activeStep: 'step_2_clean_visuals',
-            completedSteps: ['step_1_inspect'],
-            clipProgressLabel: chLabel,
-            percent: basePct,
-            statusDetail: `${chPrefix}Step 2: Preparing ${
-              controls.useExternalGpu && externalGpuAvailable
-                ? 'External GPU FLUX / TRELLIS visuals'
-                : 'Browser WebGL2 3D/Motion shader scene'
-            }...`,
-          }));
-
-          const preparedChapter = await prepareDocumentaryChapterVisualsStep2({
-            chapter: rawChapter,
-            config: studioConfig,
-            useExternalGpu: controls.useExternalGpu,
-            targetWidth: profile.width,
-            targetHeight: profile.height,
-            signal,
-          });
-
-          // STEP 3: Script & Live US YouTube Trends
-          setProgress((prev) => ({
-            ...prev,
-            activeStep: 'step_3_script_trends',
-            completedSteps: ['step_1_inspect', 'step_2_clean_visuals'],
-            percent: basePct + Math.round(spanPct * 0.18),
-            statusDetail: `${chPrefix}Step 3: Refining beat-synced script & US YouTube Trends (Mistral 4 / GLM-5 / Riva / Gemini)...`,
-          }));
-
-          const trendKey = preparedChapter.searchQueries
-            .map((q) => q.trim().toLowerCase())
-            .sort()
-            .join('|');
-          let trends = trendsCache.get(trendKey);
-          if (!trends) {
-            trends = await fetchLiveYouTubeTrends(
-              preparedChapter.searchQueries,
-              studioConfig.youtubeApiKey,
-              signal
-            );
-            trendsCache.set(trendKey, trends);
-          }
-
-          const metadata = await refineDocumentaryChapterScriptAndMetadata({
-            chapter: preparedChapter,
-            seriesTitle: outline.topicOrTitle,
-            trends,
-            language: controls.language,
-            customAngle: controls.customAngle,
-            config: studioConfig,
-            signal,
-          });
-
-          // STEP 4: Commanding Voice & Talking Character
-          setProgress((prev) => ({
-            ...prev,
-            activeStep: 'step_4_voice_character',
-            completedSteps: [
-              'step_1_inspect',
-              'step_2_clean_visuals',
-              'step_3_script_trends',
-            ],
-            percent: basePct + Math.round(spanPct * 0.38),
-            statusDetail: `${chPrefix}Step 4: Synthesizing commanding narration & OfflineAudioContext broadcast DSP...`,
-          }));
-
-          const audio = await synthesizeCommandingVoiceover({
-            scriptText: metadata.voiceover,
-            beats: metadata.beats,
-            language: controls.language,
-            voiceGender: controls.voiceGender,
-            config: studioConfig,
-            useExternalGpu: controls.useExternalGpu,
-            lockedVisualDurationSec: preparedChapter.targetDurationSec,
-            onStatus: (msg) => {
-              setProgress((prev) => ({
-                ...prev,
-                activeStep: 'step_4_voice_character',
-                statusDetail: `${chPrefix}${msg}`,
-              }));
-            },
-            signal,
-          });
-
-          const alignedMetadata = {
-            ...metadata,
-            beats:
-              audio.alignedBeats.length > 0
-                ? audio.alignedBeats
-                : metadata.beats,
-            wordTimings: audio.wordTimings,
-          };
-
-          // STEP 5: Hardware WebGL2 / WebCodecs Scene Mux
-          const gpuStartPct = basePct + Math.round(spanPct * 0.54);
-          const gpuSpanPct = Math.max(10, Math.round(spanPct * 0.44));
-
-          setProgress((prev) => ({
-            ...prev,
-            activeStep: 'step_5_gpu_mux',
-            completedSteps: [
-              'step_1_inspect',
-              'step_2_clean_visuals',
-              'step_3_script_trends',
-              'step_4_voice_character',
-            ],
-            percent: gpuStartPct,
-            statusDetail: `${chPrefix}Step 5: Muxing ${preparedChapter.targetDurationSec.toFixed(
-              1
-            )}s 9:16 H.264 MP4 on GPU...`,
-          }));
-
-          const rendered = await renderDocumentarySceneMp4Gpu({
-            chapter: preparedChapter,
-            audio,
-            scriptText: alignedMetadata.voiceover,
-            beats: alignedMetadata.beats,
-            language: controls.language,
-            characterEnabled: controls.characterEnabled,
-            characterPortraitUrl: controls.characterEnabled
-              ? effectivePortraitUrl
-              : '',
-            onStatus: (msg) => {
-              setProgress((prev) => ({
-                ...prev,
-                activeStep: 'step_5_gpu_mux',
-                statusDetail: `${chPrefix}${msg}`,
-              }));
-            },
-            onProgressPct: (localPct) => {
-              const mapped = Math.min(
-                98,
-                gpuStartPct + Math.round((localPct / 100) * gpuSpanPct)
-              );
-              setProgress((prev) => ({
-                ...prev,
-                percent: Math.max(prev.percent, mapped),
-              }));
-            },
-            signal,
-          });
-
-          newOutputBlobUrls.push(rendered.blobUrl);
-
-          const clipOutput: RenderedClipOutput = {
-            clipIndex: preparedChapter.chapterIndex,
-            totalClips: totalChapters,
-            startSec: 0,
-            endSec: preparedChapter.targetDurationSec,
-            reason: preparedChapter.title,
-            studioMode: 'documentary',
-            documentaryStyle: preparedChapter.style,
-            videoUrl: rendered.blobUrl,
-            durationSec: rendered.durationSec,
-            width: rendered.width,
-            height: rendered.height,
-            fps: rendered.fps,
-            fileSizeBytes: rendered.sizeBytes,
-            language: controls.language,
-            voiceGender: controls.voiceGender,
-            voiceEngine: `${audio.engineLabel} · ${metadata.scriptEngine}`,
-            renderEngine: rendered.renderEngine,
-            characterMode: rendered.characterMode,
-            watermarkBoxesRemoved: 0,
-            endCardTrimmedSec: 0,
-            safeCropApplied: false,
-            climaxSecond: preparedChapter.climaxSec,
-            metadata: alignedMetadata,
-          };
-
-          finishedOutputs.push(clipOutput);
-          setRenderedClips([...finishedOutputs]);
-        }
-
-        activeOutputBlobUrlsRef.current = newOutputBlobUrls;
-        const first = finishedOutputs[0];
-        setProgress((prev) => ({
-          ...prev,
-          status: 'completed',
-          activeStep: 'step_5_gpu_mux',
-          completedSteps: [
-            'step_1_inspect',
-            'step_2_clean_visuals',
-            'step_3_script_trends',
-            'step_4_voice_character',
-            'step_5_gpu_mux',
-          ],
-          clipProgressLabel: null,
-          percent: 100,
-          statusDetail: `Completed ${finishedOutputs.length} documentary chapter${
-            finishedOutputs.length === 1 ? '' : 's'
-          } (${first?.width}×${first?.height} @ ${first?.fps}fps) — ready below.`,
-        }));
-
-        const record: SavedRenderRecord = {
-          runTag,
-          completedAt: new Date().toISOString(),
-          sourceLabel: outline.topicOrTitle,
-          sourceDurationSec: outline.totalDurationSec,
-          mode: 'documentary',
-          studioMode: 'documentary',
-          customAngle: controls.customAngle,
-          clips: finishedOutputs,
-        };
-        setSavedRenders(saveRenderRecord(record));
-        return;
-      }
-
-      // ================================================================
-      // MODE A: VIDEO EXPLAINER & VIRAL CLIPPER
-      // ================================================================
+    const runTag = `studio-${Date.now().toString(36)}`;
+    const completedSteps: PipelineStepId[] = [];
+    const markStep = (
+      activeStep: PipelineStepId,
+      percent: number,
+      statusDetail: string,
+      clipProgressLabel: string | null = null
+    ) => {
       setProgress({
         status: 'running',
-        activeStep: 'step_1_inspect',
-        completedSteps: [],
-        percent: 5,
-        statusDetail:
-          controls.sourceType === 'upload'
-            ? 'Step 1: Inspecting imported local video...'
-            : 'Step 1: Resolving direct no-watermark MP4 stream...',
-        clipProgressLabel: null,
+        activeStep,
+        completedSteps: [...completedSteps],
+        percent,
+        statusDetail,
+        clipProgressLabel,
         runTag,
-        startedAtMs,
+        startedAtMs: Date.now(),
         errorMessage: null,
       });
+    };
+
+    try {
+      // STEP 1: Fetch & Smart Clipping
+      markStep('step_1_fetch_clip', 6, 'Step 1/5: Verifying source video and real duration...');
 
       let activeSource = sourceMedia;
-      const linkMatchesExisting =
-        controls.sourceType === 'link' &&
-        activeSource?.sourceType === 'link' &&
-        extractedLink &&
-        activeSource.label === extractedLink.cleanUrl;
-
-      if (controls.sourceType === 'link' && !linkMatchesExisting) {
-        activeSource = await resolveLinkToSourceMedia({
-          rawInput: controls.videoUrl,
-          onStatus: (msg) => {
-            setProgress((prev) => ({
-              ...prev,
-              activeStep: 'step_1_inspect',
-              percent: Math.min(14, prev.percent + 2),
-              statusDetail: msg,
-            }));
-          },
-          signal,
-        });
-        setSourceMedia((prev) => {
-          if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
-          return activeSource;
-        });
-      }
-
       if (!activeSource) {
-        throw new Error('No source video available to render.');
+        if (controls.sourceType === 'link' && extractVideoUrl(controls.videoUrl)) {
+          activeSource = await resolveLinkToSourceMedia({
+            rawInput: controls.videoUrl,
+            signal,
+            onStatus: (msg) => markStep('step_1_fetch_clip', 10, `Step 1/5: ${msg}`),
+          });
+          replaceSourceMedia(activeSource);
+        } else {
+          throw new Error(
+            'Please paste a valid video link or upload a local MP4/MOV/WebM file first.'
+          );
+        }
       }
 
-      setOutputSourceDuration(activeSource.durationSec);
       if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-
-      setProgress((prev) => ({
-        ...prev,
-        activeStep: 'step_1_inspect',
-        percent: 16,
-        statusDetail:
-          activeSource.mode === 'long'
-            ? 'Step 1: Scanning 18 proportional keyframes (Nemotron VL / Omni / Gemini 3.8) to pinpoint viral segments...'
-            : 'Step 1: Inspecting timeline & trimming creator outro bumper...',
-      }));
 
       const { segments, inspectorModel } = await inspectAndSliceSegmentsStep1({
         source: activeSource,
-        customAngle: controls.customAngle,
-        nvidiaApiKey: studioConfig.nvidiaApiKey,
-        onStatus: (msg) => {
-          setProgress((prev) => ({
-            ...prev,
-            activeStep: 'step_1_inspect',
-            percent: Math.min(22, Math.max(prev.percent, 18)),
-            statusDetail: msg,
-          }));
-        },
-        signal,
+        onProgress: (detail) =>
+          markStep('step_1_fetch_clip', 16, `Step 1/5: ${detail}`),
       });
 
-      // STEP 2: Anti-Copyright Cleanups, Safe Crop, Cinema Grade & Contact Sheet
-      setProgress((prev) => ({
-        ...prev,
-        activeStep: 'step_2_clean_visuals',
-        completedSteps: ['step_1_inspect'],
-        percent: 24,
-        statusDetail:
-          'Step 2: Locking clean visual timelines, delogo masks & cinema color grade...',
-      }));
+      completedSteps.push('step_1_fetch_clip');
+
+      // STEP 2: Visual Clean & Grade
+      markStep(
+        'step_2_clean_grade',
+        24,
+        `Step 2/5: Cleaning, subject-safe framing & grading ${segments.length} clip${segments.length > 1 ? 's' : ''}...`
+      );
 
       const preparedClips = await cleanAndGradeClipsStep2({
         source: activeSource,
         segments,
         inspectorModel,
-        onStatus: (msg) => {
-          setProgress((prev) => ({
-            ...prev,
-            activeStep: 'step_2_clean_visuals',
-            percent: Math.min(34, Math.max(prev.percent, 26)),
-            statusDetail: msg,
-          }));
-        },
-        signal,
+        onProgress: (detail) =>
+          markStep('step_2_clean_grade', 32, `Step 2/5: ${detail}`),
       });
 
-      if (preparedClips.length === 0) {
-        throw new Error('Step 2 could not prepare a locked visual timeline.');
+      if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      completedSteps.push('step_2_clean_grade');
+
+      // STEP 3: Direct Translation & SEO (1-Call Quota Guardrail per Clip)
+      markStep(
+        'step_3_translate_seo',
+        40,
+        'Step 3/5: Fetching live US YouTube trends (regionCode=US)...'
+      );
+
+      const trendQuery =
+        controls.customAngle.trim() ||
+        activeSource.label.replace(/\.(mp4|mov|webm|mkv)$/i, '');
+      const trends = await fetchLiveYouTubeTrends(trendQuery, signal);
+
+      const clipMetadataList: TrendMetadata[] = [];
+      for (let i = 0; i < preparedClips.length; i++) {
+        if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+        const clip = preparedClips[i];
+        const stepPct = 44 + Math.round(((i + 0.5) / preparedClips.length) * 14);
+        const clipLabel = `Clip ${clip.clipIndex}/${clip.totalClips}`;
+
+        const meta = await translateClipAndBuildSeoStep3({
+          clip,
+          sourceLabel: activeSource.label,
+          language: controls.language,
+          aiEngine: controls.aiEngine,
+          customAngle: controls.customAngle,
+          trends,
+          signal,
+          onStatus: (detail) =>
+            markStep('step_3_translate_seo', stepPct, `Step 3/5: ${detail}`, clipLabel),
+        });
+        clipMetadataList.push(meta);
       }
 
-      const effectivePortraitUrl = await resolveCharacterPortraitOnce(signal);
-      const totalClips = preparedClips.length;
-      const finishedOutputs: RenderedClipOutput[] = [];
-      const trendsCache = new Map<string, YouTubeTrendVideo[]>();
+      completedSteps.push('step_3_translate_seo');
 
-      for (let i = 0; i < totalClips; i++) {
+      // STEP 4: Commanding Voiceover (Gemini 3.8 Flash TTS + Broadcast EQ + Duration Fit)
+      const voiceResults = [];
+      for (let i = 0; i < preparedClips.length; i++) {
         if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-        const preparedClip = preparedClips[i];
-        const clipLabel =
-          totalClips > 1 ? `Clip ${i + 1}/${totalClips}` : 'Single Short';
-        const clipPrefix = totalClips > 1 ? `Clip ${i + 1}/${totalClips}: ` : '';
+        const clip = preparedClips[i];
+        const meta = clipMetadataList[i];
+        const clipLabel = `Clip ${clip.clipIndex}/${clip.totalClips}`;
+        const stepPct = 60 + Math.round(((i + 0.5) / preparedClips.length) * 14);
 
-        const clipBasePct = 36 + Math.round((i / totalClips) * 60);
-        const clipSpanPct = Math.round(60 / totalClips);
-
-        // STEP 3: Inspect stamped frames + US YouTube trends + beat-synced script
-        setProgress((prev) => ({
-          ...prev,
-          activeStep: 'step_3_script_trends',
-          completedSteps: ['step_1_inspect', 'step_2_clean_visuals'],
-          clipProgressLabel: clipLabel,
-          percent: clipBasePct,
-          statusDetail: `${clipPrefix}Step 3: Syncing stamped ${preparedClip.lockedVisualDurationSec.toFixed(
-            1
-          )}s frames with beat-synced script & US trends...`,
-        }));
-
-        const inspection = await inspectLockedVisualClipOneCall({
-          source: activeSource,
-          preparedClip,
-          language: controls.language,
-          customAngle: controls.customAngle,
-          nvidiaApiKey: studioConfig.nvidiaApiKey,
-          signal,
-        });
-
-        const lockedClip = inspection.updatedClip;
-        const trendCacheKey = inspection.searchQueries
-          .map((q) => q.trim().toLowerCase())
-          .sort()
-          .join('|');
-        let trends = trendsCache.get(trendCacheKey);
-        if (!trends) {
-          trends = await fetchLiveYouTubeTrends(
-            inspection.searchQueries,
-            studioConfig.youtubeApiKey,
-            signal
-          );
-          trendsCache.set(trendCacheKey, trends);
-        }
-
-        const metadata = await refineBeatSyncedScriptAndMetadata({
-          inspection,
-          trends,
-          language: controls.language,
-          customAngle: controls.customAngle,
-          config: studioConfig,
-          signal,
-        });
-
-        // STEP 4: Punchy Voice & Character
-        setProgress((prev) => ({
-          ...prev,
-          activeStep: 'step_4_voice_character',
-          completedSteps: [
-            'step_1_inspect',
-            'step_2_clean_visuals',
-            'step_3_script_trends',
-          ],
-          clipProgressLabel: clipLabel,
-          percent: clipBasePct + Math.round(clipSpanPct * 0.36),
-          statusDetail: `${clipPrefix}Step 4: Synthesizing commanding voiceover & broadcast vocal DSP...`,
-        }));
-
-        const audio = await synthesizeCommandingVoiceover({
-          scriptText: metadata.voiceover,
-          beats: metadata.beats,
+        const voice = await synthesizeCommandingVoiceover({
+          scriptText: meta.voiceover,
+          beats: meta.beats,
           language: controls.language,
           voiceGender: controls.voiceGender,
-          config: studioConfig,
-          useExternalGpu: controls.useExternalGpu,
-          lockedVisualDurationSec: lockedClip.lockedVisualDurationSec,
-          onStatus: (msg) => {
-            setProgress((prev) => ({
-              ...prev,
-              activeStep: 'step_4_voice_character',
-              statusDetail: `${clipPrefix}${msg}`,
-            }));
-          },
+          targetDurationSec: clip.lockedVisualDurationSec,
           signal,
+          onStatus: (detail) =>
+            markStep('step_4_voiceover', stepPct, `Step 4/5: ${detail}`, clipLabel),
         });
 
-        const alignedMetadata = {
-          ...metadata,
-          beats:
-            audio.alignedBeats.length > 0 ? audio.alignedBeats : metadata.beats,
-          wordTimings: audio.wordTimings,
-        };
+        meta.wordTimings = voice.wordTimings;
+        voiceResults.push(voice);
+      }
 
-        // STEP 5: Single-Pass GPU Mux & Output Deck
-        const gpuStartPct = clipBasePct + Math.round(clipSpanPct * 0.5);
-        const gpuSpanPct = Math.max(10, Math.round(clipSpanPct * 0.48));
+      completedSteps.push('step_4_voiceover');
 
-        setProgress((prev) => ({
-          ...prev,
-          activeStep: 'step_5_gpu_mux',
-          completedSteps: [
-            'step_1_inspect',
-            'step_2_clean_visuals',
-            'step_3_script_trends',
-            'step_4_voice_character',
-          ],
-          clipProgressLabel: clipLabel,
-          percent: gpuStartPct,
-          statusDetail: `${clipPrefix}Step 5: Running single-pass WebGL2 + WebCodecs GPU mux (${lockedClip.lockedVisualDurationSec.toFixed(
-            1
-          )}s)...`,
-        }));
+      // STEP 5: Fast, Phone-Safe Mux & Output Deck
+      const outputs: RenderedClipOutput[] = [];
+      for (let i = 0; i < preparedClips.length; i++) {
+        if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+        const clip = preparedClips[i];
+        const meta = clipMetadataList[i];
+        const voice = voiceResults[i];
+        const clipLabel = `Clip ${clip.clipIndex}/${clip.totalClips}`;
 
         const rendered = await renderProductionMp4Gpu({
           source: activeSource,
-          clip: lockedClip,
-          audio,
-          scriptText: alignedMetadata.voiceover,
-          beats: alignedMetadata.beats,
+          clip,
+          metadata: meta,
+          voice,
           language: controls.language,
-          characterEnabled: controls.characterEnabled,
-          characterPortraitUrl: controls.characterEnabled
-            ? effectivePortraitUrl
-            : '',
-          onStatus: (msg) => {
-            setProgress((prev) => ({
-              ...prev,
-              activeStep: 'step_5_gpu_mux',
-              statusDetail: `${clipPrefix}${msg}`,
-            }));
-          },
-          onProgressPct: (localPct) => {
-            const mapped = Math.min(
-              98,
-              gpuStartPct + Math.round((localPct / 100) * gpuSpanPct)
-            );
-            setProgress((prev) => ({
-              ...prev,
-              percent: Math.max(prev.percent, mapped),
-            }));
-          },
           signal,
+          onProgress: (localPct, detail) => {
+            const overallPct =
+              75 +
+              Math.round(
+                ((i + localPct / 100) / Math.max(1, preparedClips.length)) * 24
+              );
+            markStep('step_5_mux_output', overallPct, `Step 5/5: ${detail}`, clipLabel);
+          },
         });
 
-        newOutputBlobUrls.push(rendered.blobUrl);
-
-        const clipOutput: RenderedClipOutput = {
-          clipIndex: lockedClip.clipIndex,
-          totalClips,
-          startSec: lockedClip.trimRange.startSec,
-          endSec: lockedClip.trimRange.endSec,
-          reason: lockedClip.reason,
-          studioMode: 'explainer',
-          videoUrl: rendered.blobUrl,
+        const videoUrl = URL.createObjectURL(rendered.blob);
+        outputs.push({
+          clipIndex: clip.clipIndex,
+          totalClips: clip.totalClips,
+          startSec: clip.trimRange.startSec,
+          endSec: clip.trimRange.endSec,
+          reason: clip.reason,
+          videoUrl,
+          mimeType: rendered.mimeType,
           durationSec: rendered.durationSec,
           width: rendered.width,
           height: rendered.height,
           fps: rendered.fps,
-          fileSizeBytes: rendered.sizeBytes,
+          fileSizeBytes: rendered.blob.size,
           language: controls.language,
           voiceGender: controls.voiceGender,
-          voiceEngine: `${audio.engineLabel} · ${metadata.scriptEngine}`,
+          voiceEngine: voice.voiceEngine,
           renderEngine: rendered.renderEngine,
-          characterMode: rendered.characterMode,
-          watermarkBoxesRemoved: rendered.delogoCount,
-          endCardTrimmedSec: rendered.bumperTrimmedSec,
-          safeCropApplied: rendered.safeCropApplied,
-          climaxSecond: lockedClip.climaxSec,
-          metadata: alignedMetadata,
-        };
-
-        finishedOutputs.push(clipOutput);
-        setRenderedClips([...finishedOutputs]);
+          watermarkBoxesRemoved: clip.delogoZoneCount,
+          endCardTrimmedSec: clip.bumperTrimmedSec,
+          safeCropApplied: clip.safeCropApplied,
+          climaxSecond: clip.climaxSec,
+          metadata: meta,
+        });
       }
 
-      activeOutputBlobUrlsRef.current = newOutputBlobUrls;
-      const first = finishedOutputs[0];
-      setProgress((prev) => ({
-        ...prev,
-        status: 'completed',
-        activeStep: 'step_5_gpu_mux',
-        completedSteps: [
-          'step_1_inspect',
-          'step_2_clean_visuals',
-          'step_3_script_trends',
-          'step_4_voice_character',
-          'step_5_gpu_mux',
-        ],
-        clipProgressLabel: null,
-        percent: 100,
-        statusDetail:
-          finishedOutputs.length > 1
-            ? `Completed all ${finishedOutputs.length} beat-synced 9:16 MP4 clips (${first?.width}×${first?.height} @ ${first?.fps}fps) — ready below.`
-            : `Finished ${first?.width}×${first?.height} MP4 (${first?.renderEngine}) — ready for instant download below.`,
-      }));
+      completedSteps.push('step_5_mux_output');
+      replaceRenderedClips(outputs);
 
-      const record: SavedRenderRecord = {
+      const saved = saveRenderRecord({
         runTag,
         completedAt: new Date().toISOString(),
         sourceLabel: activeSource.label,
         sourceDurationSec: activeSource.durationSec,
         mode: activeSource.mode,
-        studioMode: 'explainer',
         customAngle: controls.customAngle,
-        clips: finishedOutputs,
-      };
-      setSavedRenders(saveRenderRecord(record));
+        clips: outputs,
+      });
+      setSavedRenders(saved);
+
+      setProgress({
+        status: 'completed',
+        activeStep: null,
+        completedSteps: [...completedSteps],
+        percent: 100,
+        statusDetail: `Completed ${outputs.length} production clip${outputs.length > 1 ? 's' : ''} + 5 one-click SEO copy cards.`,
+        clipProgressLabel: `${outputs.length}/${outputs.length} Done`,
+        runTag,
+        startedAtMs: null,
+        errorMessage: null,
+      });
     } catch (err) {
-      for (const u of newOutputBlobUrls) URL.revokeObjectURL(u);
       if ((err as Error).name === 'AbortError') return;
+      const msg =
+        err instanceof Error ? err.message : 'Unexpected pipeline error occurred.';
       setProgress((prev) => ({
         ...prev,
         status: 'error',
-        clipProgressLabel: null,
-        statusDetail: 'In-browser render stopped with an error.',
-        errorMessage: (err as Error).message || 'Unexpected render failure.',
+        statusDetail: 'Pipeline stopped — see details below.',
+        errorMessage: msg,
       }));
     }
-  }, [
-    activeCharacterUrl,
-    canGenerate,
-    controls,
-    documentaryOutline,
-    externalGpuAvailable,
-    extractedLink,
-    progress.status,
-    resolveCharacterPortraitOnce,
-    revokeOutputBlobUrls,
-    sourceMedia,
-    studioConfig,
-  ]);
+  }, [controls, replaceRenderedClips, replaceSourceMedia, sourceMedia]);
 
-  const handleLoadRecord = useCallback((record: SavedRenderRecord) => {
-    setOutputRunTag(record.runTag);
-    setOutputSourceDuration(record.sourceDurationSec);
-    setRenderedClips(record.clips);
-    setProgress({
-      status: 'completed',
-      activeStep: 'step_5_gpu_mux',
-      completedSteps: [
-        'step_1_inspect',
-        'step_2_clean_visuals',
-        'step_3_script_trends',
-        'step_4_voice_character',
-        'step_5_gpu_mux',
-      ],
-      percent: 100,
-      clipProgressLabel: null,
-      statusDetail: `Loaded ${record.clips.length} saved item${
-        record.clips.length === 1 ? '' : 's'
-      } (${record.runTag}).`,
-      runTag: record.runTag,
-      startedAtMs: null,
-      errorMessage: null,
-    });
-    setActiveTab('studio');
-  }, []);
-
-  const handleDeleteRecord = useCallback((runTag: string) => {
-    setSavedRenders(deleteRenderRecord(runTag));
-  }, []);
-
-  const isRunning = progress.status === 'running';
+  const isRendering = progress.status === 'running';
+  const canRun =
+    Boolean(sourceMedia) ||
+    (controls.sourceType === 'link' && Boolean(extractVideoUrl(controls.videoUrl)));
 
   return (
     <div className="min-h-screen bg-[#F4F6F9] text-[#0F172A] flex flex-col">
@@ -1139,189 +421,80 @@ export default function App() {
         activeTab={activeTab}
         onTabChange={setActiveTab}
         onResetWorkspace={handleResetWorkspace}
-        isRendering={isRunning}
+        isRendering={isRendering}
         savedCount={savedRenders.length}
       />
 
-      <main className="flex-1 w-full max-w-[1440px] mx-auto px-4 sm:px-6 py-5 space-y-5">
-        <StudioConfigBar
-          config={studioConfig}
-          isExpanded={isConfigExpanded}
-          offlineModels={offlineModels}
-          cacheSummary={cacheSummary}
-          onToggleExpand={() => setIsConfigExpanded((open) => !open)}
-          onSave={handleSaveConfig}
-          onClearKeys={handleClearKeys}
-        />
-
-        {activeTab === 'studio' ? (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            {/* LEFT COLUMN: Mode Switcher -> Input Card -> Compact Card 1 (Preview) -> Character -> Controls */}
+      <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6">
+        {activeTab === 'history' ? (
+          <RecentRendersView
+            records={savedRenders}
+            onDelete={(tag) => setSavedRenders(deleteRenderRecord(tag))}
+            onBackToStudio={() => setActiveTab('studio')}
+          />
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+            {/* Left Column: Link/Upload Input -> Card 1 Source Preview -> Translation & Voice Controls */}
             <div className="lg:col-span-5 space-y-5">
-              {/* Studio Mode Switcher */}
-              <div
-                role="tablist"
-                aria-label="Production Studio Mode"
-                className="rounded-2xl border-2 border-[#E2E8F0] bg-white p-1.5 grid grid-cols-2 gap-1.5"
-              >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={controls.studioMode === 'explainer'}
-                  disabled={isRunning}
-                  onClick={() =>
-                    setControls((prev) => ({ ...prev, studioMode: 'explainer' }))
-                  }
-                  className={`flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl text-xs font-extrabold transition-colors cursor-pointer disabled:opacity-55 whitespace-nowrap ${
-                    controls.studioMode === 'explainer'
-                      ? 'bg-[#3D5AFE] text-white'
-                      : 'bg-white text-[#475569] hover:bg-[#F4F6F9] hover:text-[#0F172A]'
-                  }`}
-                >
-                  <Clapperboard className="w-4 h-4 shrink-0" strokeWidth={2.5} />
-                  <span>Video Explainer &amp; Clipper</span>
-                </button>
-
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={controls.studioMode === 'documentary'}
-                  disabled={isRunning}
-                  onClick={() =>
-                    setControls((prev) => ({
-                      ...prev,
-                      studioMode: 'documentary',
-                    }))
-                  }
-                  className={`flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl text-xs font-extrabold transition-colors cursor-pointer disabled:opacity-55 whitespace-nowrap ${
-                    controls.studioMode === 'documentary'
-                      ? 'bg-[#3D5AFE] text-white'
-                      : 'bg-white text-[#475569] hover:bg-[#F4F6F9] hover:text-[#0F172A]'
-                  }`}
-                >
-                  <Layers className="w-4 h-4 shrink-0" strokeWidth={2.5} />
-                  <span>Documentary / Motion / 3D</span>
-                </button>
-              </div>
-
-              {controls.studioMode === 'explainer' ? (
-                <VideoSourceCard
-                  sourceType={controls.sourceType}
-                  videoUrl={controls.videoUrl}
-                  sourceMedia={sourceMedia}
-                  disabled={isRunning}
-                  isFetchingLink={isFetchingLink}
-                  error={sourceError}
-                  onSourceTypeChange={(sourceType) =>
-                    setControls((prev) => ({ ...prev, sourceType }))
-                  }
-                  onVideoUrlChange={(videoUrl) => {
-                    setSourceError(null);
-                    setControls((prev) => ({ ...prev, videoUrl }));
-                  }}
-                  onFetchLinkPreview={() => void handleFetchLinkPreview()}
-                  onFileSelected={(file) => void handleFileSelected(file)}
-                  onClearSource={clearSourceMedia}
-                />
-              ) : (
-                <DocumentaryInputCard
-                  style={controls.documentaryStyle}
-                  inputKind={controls.documentaryInputKind}
-                  inputText={controls.documentaryInput}
-                  useExternalGpu={controls.useExternalGpu}
-                  externalGpuAvailable={externalGpuAvailable}
-                  disabled={isRunning}
-                  isPlanningOutline={isPlanningOutline}
-                  error={documentaryError}
-                  onStyleChange={(documentaryStyle) => {
-                    setDocumentaryOutline(null);
-                    setControls((prev) => ({ ...prev, documentaryStyle }));
-                  }}
-                  onInputKindChange={(documentaryInputKind) => {
-                    setDocumentaryOutline(null);
-                    setControls((prev) => ({ ...prev, documentaryInputKind }));
-                  }}
-                  onInputTextChange={(documentaryInput) => {
-                    setDocumentaryError(null);
-                    setDocumentaryOutline(null);
-                    setControls((prev) => ({ ...prev, documentaryInput }));
-                  }}
-                  onToggleExternalGpu={(useExternalGpu) =>
-                    setControls((prev) => ({ ...prev, useExternalGpu }))
-                  }
-                  onPreviewOutline={() =>
-                    void handlePreviewDocumentaryOutline()
-                  }
-                />
-              )}
-
-              {/* COMPACT CARD 1: Source Video Preview OR Documentary Chapter Outline */}
-              <SourcePreviewCard
-                studioMode={controls.studioMode}
-                source={sourceMedia}
-                documentaryOutline={documentaryOutline}
-                disabled={isRunning}
-                onClear={
-                  controls.studioMode === 'documentary'
-                    ? clearDocumentaryOutline
-                    : clearSourceMedia
+              <VideoSourceCard
+                sourceType={controls.sourceType}
+                videoUrl={controls.videoUrl}
+                sourceMedia={sourceMedia}
+                disabled={isRendering}
+                isFetchingLink={isFetchingLink}
+                error={sourceError}
+                onSourceTypeChange={(sourceType) =>
+                  setControls((prev) => ({ ...prev, sourceType }))
                 }
+                onVideoUrlChange={(videoUrl) => {
+                  setSourceError(null);
+                  setControls((prev) => ({ ...prev, videoUrl }));
+                }}
+                onFetchLinkPreview={handleFetchLinkPreview}
+                onFileSelected={handleFileSelected}
+                onClearSource={handleClearSource}
               />
 
-              <CharacterCard
-                enabled={controls.characterEnabled}
-                savedCharacters={studioConfig.savedCharacters}
-                selectedCharacterId={controls.selectedCharacterId}
-                outfitPrompt={controls.outfitPrompt}
-                disabled={isRunning}
-                isUploadingPortrait={isUploadingPortrait}
-                uploadError={portraitError}
-                onToggleEnabled={(characterEnabled) =>
-                  setControls((prev) => ({ ...prev, characterEnabled }))
-                }
-                onSelectCharacter={handleSelectCharacter}
-                onUploadPortrait={(file) => void handleUploadPortrait(file)}
-                onDeleteCharacter={handleDeleteCharacter}
-                onOutfitPromptChange={(outfitPrompt) =>
-                  setControls((prev) => ({ ...prev, outfitPrompt }))
-                }
+              <SourcePreviewCard
+                sourceMedia={sourceMedia}
+                isFetchingLink={isFetchingLink}
               />
 
               <ExplainerControls
-                controls={controls}
-                canGenerate={canGenerate}
-                isRendering={isRunning}
-                onChange={setControls}
-                onStartRender={() => void handleStartRender()}
+                language={controls.language}
+                voiceGender={controls.voiceGender}
+                aiEngine={controls.aiEngine}
+                customAngle={controls.customAngle}
+                canRun={canRun}
+                isRendering={isRendering}
+                onLanguageChange={(language) =>
+                  setControls((prev) => ({ ...prev, language }))
+                }
+                onVoiceGenderChange={(voiceGender) =>
+                  setControls((prev) => ({ ...prev, voiceGender }))
+                }
+                onAiEngineChange={(aiEngine) =>
+                  setControls((prev) => ({ ...prev, aiEngine }))
+                }
+                onCustomAngleChange={(customAngle) =>
+                  setControls((prev) => ({ ...prev, customAngle }))
+                }
+                onGenerate={handleGenerate}
+                onCancel={handleCancelPipeline}
               />
             </div>
 
-            {/* RIGHT COLUMN: Live 5-Step Progress -> Compact Card 2 (Final Production Output Deck) */}
+            {/* Right Column: 5-Step Pipeline Progress -> Card 2 Final Production Output Deck */}
             <div className="lg:col-span-7 space-y-5">
-              <CloudProgressBar
-                progress={progress}
-                onCancelRender={handleCancelRender}
-                onDismissError={() => setProgress(IDLE_PROGRESS)}
-              />
+              <CloudProgressBar progress={progress} />
 
-              {/* COMPACT CARD 2: Final Production Output Deck */}
-              <OutputDeckCard
-                runTag={outputRunTag}
-                clips={renderedClips}
-                isRendering={isRunning}
-                sourceDurationSec={outputSourceDuration}
-              />
+              <OutputDeckCard clips={renderedClips} runTag={progress.runTag} />
             </div>
           </div>
-        ) : (
-          <RecentRendersView
-            records={savedRenders}
-            onLoadRecord={handleLoadRecord}
-            onDeleteRecord={handleDeleteRecord}
-            onGoToStudio={() => setActiveTab('studio')}
-          />
         )}
       </main>
     </div>
   );
 }
+
+export default App;

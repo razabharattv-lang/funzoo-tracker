@@ -1,10 +1,6 @@
 import type { SavedRenderRecord } from '../types/studio';
-import {
-  deleteRenderRecordFromIndexedDb,
-  saveRenderRecordToIndexedDb,
-} from '../engine/cacheManager';
 
-const STORAGE_KEY = 'explainer_studio_renders_v3';
+const STORAGE_KEY = 'explainer_studio_renders_v4';
 
 export function loadSavedRenders(): SavedRenderRecord[] {
   try {
@@ -30,13 +26,12 @@ export function saveRenderRecord(
   const existing = loadSavedRenders().filter(
     (item) => item.runTag !== record.runTag
   );
-  const next = [record, ...existing].slice(0, 25);
+  const next = [record, ...existing].slice(0, 20);
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch {
     // ignore storage quota errors
   }
-  void saveRenderRecordToIndexedDb(record);
   return next;
 }
 
@@ -47,6 +42,5 @@ export function deleteRenderRecord(runTag: string): SavedRenderRecord[] {
   } catch {
     // ignore storage quota errors
   }
-  void deleteRenderRecordFromIndexedDb(runTag);
   return next;
 }

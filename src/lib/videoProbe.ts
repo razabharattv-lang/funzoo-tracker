@@ -13,6 +13,10 @@ export function shouldTrimSocialEndCard(platformOrLabel: string): boolean {
   );
 }
 
+/**
+ * Probes an actual video Blob via HTMLVideoElement metadata, reading true duration,
+ * videoWidth, and videoHeight with zero hardcoded duration caps.
+ */
 export function probeVideoBlobToSource(params: {
   blob: Blob;
   sourceType: 'upload' | 'link';
@@ -27,31 +31,49 @@ export function probeVideoBlobToSource(params: {
     video.muted = true;
     video.playsInline = true;
 
+    let settled = false;
+
     const cleanup = () => {
       window.clearTimeout(timer);
+      video.onloadedmetadata = null;
+      video.ondurationchange = null;
+      video.onseeked = null;
+      video.onerror = null;
       video.removeAttribute('src');
       video.load();
     };
 
-    const timer = window.setTimeout(() => {
+    const fail = (message: string) => {
+      if (settled) return;
+      settled = true;
       URL.revokeObjectURL(objectUrl);
       cleanup();
-      reject(new Error('Timed out reading video metadata.'));
-    }, 15_000);
+      reject(new Error(message));
+    };
 
-    video.onloadedmetadata = () => {
-      const durationSec =
-        Number.isFinite(video.duration) && video.duration > 0
-          ? Number(video.duration.toFixed(2))
-          : 15;
+    const finalize = () => {
+      if (settled) return;
+      const rawDur = video.duration;
+      const rawW = video.videoWidth;
+      const rawH = video.videoHeight;
+
+      if (!Number.isFinite(rawDur) || rawDur <= 0 || rawW <= 0 || rawH <= 0) {
+        fail(
+          'Could not read playable video dimensions or duration. Please upload a valid MP4, MOV, or WebM file.'
+        );
+        return;
+      }
+
+      settled = true;
+      const durationSec = Number(rawDur.toFixed(2));
       const item: SourceMediaItem = {
         sourceType,
         blob,
         objectUrl,
         label,
         platform,
-        width: video.videoWidth || 1080,
-        height: video.videoHeight || 1920,
+        width: rawW,
+        height: rawH,
         durationSec,
         sizeBytes: blob.size,
         mode: durationSec > 65 ? 'long' : 'short',
@@ -62,13 +84,29 @@ export function probeVideoBlobToSource(params: {
       resolve(item);
     };
 
+    const timer = window.setTimeout(() => {
+      fail('Timed out reading video metadata. Please try uploading the local video file directly.');
+    }, 15_000);
+
+    video.onloadedmetadata = () => {
+      // Handle WebM recordings that report Infinity until seeked
+      if (video.duration === Infinity) {
+        video.onseeked = () => {
+          finalize();
+        };
+        try {
+          video.currentTime = 1e7;
+        } catch {
+          finalize();
+        }
+        return;
+      }
+      finalize();
+    };
+
     video.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      cleanup();
-      reject(
-        new Error(
-          'Could not read video metadata. Please choose a valid MP4, MOV, or WebM clip.'
-        )
+      fail(
+        'This video format could not be decoded in the browser. Please choose a standard MP4, MOV, or WebM clip.'
       );
     };
 

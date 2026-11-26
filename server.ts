@@ -11,32 +11,30 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-const JSON_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'gemini-4-hydrogen',
-  'gemini-3.1-flash-lite',
-] as const;
-const TTS_MODELS = [
-  'gemini-3.8-flash-tts',
-  'gemini-3.8-flash-lite-tts',
-  'gemini-2.5-flash-preview-tts',
-] as const;
-const IMAGE_EDIT_MODEL = 'gemini-3.1-flash-lite-image';
+const GEMINI_PRIMARY_JSON_MODEL = 'gemini-3.8-flash';
+const GEMINI_FALLBACK_JSON_MODEL = 'gemini-4-hydrogen';
+
+const GEMINI_PRIMARY_TTS_MODEL = 'gemini-3.8-flash-tts';
+const GEMINI_FALLBACK_TTS_MODEL = 'gemini-3.8-flash-lite-tts';
+
+const ALLOWED_NVIDIA_MODELS = new Set([
+  'nvidia/nemotron-3.5-super-vl-120b-a12b',
+  'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'mistralai/mistral-large-4',
+  'nvidia/riva-translate-4b-instruct-v2',
+  'nvidia/nemotron-3.5-content-safety',
+]);
+
+const NVIDIA_NIM_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
 let cachedKey = '';
 let cachedClient: GoogleGenAI | null = null;
 
-function getGeminiClient(overrideKey?: string): GoogleGenAI {
-  const apiKey = (
-    overrideKey ||
-    process.env.GEMINI_API_KEY ||
-    process.env.VITE_GEMINI_API_KEY ||
-    ''
-  ).trim();
+function getGeminiClient(): GoogleGenAI {
+  const apiKey = (process.env.GEMINI_API_KEY ?? '').trim();
   if (!apiKey) {
     const err = new Error(
-      'GEMINI_API_KEY is not configured. Enter your Gemini API Key in Engine & Keys at the top, or set GEMINI_API_KEY in Settings > Secrets.'
+      'GEMINI_API_KEY is not configured on the server.'
     ) as Error & { statusCode?: number };
     err.statusCode = 503;
     throw err;
@@ -55,6 +53,22 @@ function getGeminiClient(overrideKey?: string): GoogleGenAI {
   return cachedClient;
 }
 
+function getNvidiaApiKey(): string {
+  return (
+    process.env.NVIDIA_API_KEY ||
+    process.env.VITE_NVIDIA_API_KEY ||
+    ''
+  ).trim();
+}
+
+function getYoutubeApiKey(): string {
+  return (
+    process.env.YOUTUBE_API_KEY ||
+    process.env.VITE_YOUTUBE_API_KEY ||
+    ''
+  ).trim();
+}
+
 function extractErrorInfo(err: unknown): { status: number; message: string } {
   if (err && typeof err === 'object') {
     const rec = err as Record<string, unknown>;
@@ -66,10 +80,10 @@ function extractErrorInfo(err: unknown): { status: number; message: string } {
     const message =
       typeof rec.message === 'string' && rec.message.trim()
         ? rec.message.trim()
-        : 'Gemini API request failed.';
+        : 'Upstream AI API request failed.';
     return { status, message };
   }
-  return { status: 502, message: 'Unexpected server Gemini API error.' };
+  return { status: 502, message: 'Unexpected server API error.' };
 }
 
 function stripJsonFences(raw: string): string {
@@ -93,15 +107,16 @@ async function startServer(): Promise<void> {
   app.disable('x-powered-by');
   app.use(express.json({ limit: '16mb' }));
 
-  // Non-sensitive health endpoint
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({
       ok: true,
       geminiConfigured: Boolean((process.env.GEMINI_API_KEY ?? '').trim()),
+      nvidiaConfigured: Boolean(getNvidiaApiKey()),
+      youtubeConfigured: Boolean(getYoutubeApiKey()),
     });
   });
 
-  // Server-side Gemini structured JSON generation (text or JPEG contact sheet + text)
+  // Server-side Gemini structured JSON generation (strict 1-call quota guardrail, zero 429 retries)
   app.post('/api/gemini/json', async (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
@@ -124,9 +139,7 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      const apiKey =
-        typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
-      const ai = getGeminiClient(apiKey);
+      const ai = getGeminiClient();
       const contents = imageBase64Jpeg
         ? {
             parts: [
@@ -141,46 +154,53 @@ async function startServer(): Promise<void> {
           }
         : prompt;
 
-      let lastErr: unknown = null;
-      for (const model of JSON_MODELS) {
-        try {
-          const response = await ai.models.generateContent({
-            model,
-            contents,
-            config: {
-              responseMimeType: 'application/json',
-              ...(systemInstruction ? { systemInstruction } : {}),
-            },
-          });
+      const callModel = async (model: string) => {
+        const response = await ai.models.generateContent({
+          model,
+          contents,
+          config: {
+            responseMimeType: 'application/json',
+            ...(systemInstruction ? { systemInstruction } : {}),
+          },
+        });
+        const rawText = (response.text ?? '').trim();
+        if (!rawText) {
+          throw new Error(`Empty JSON response from ${model}.`);
+        }
+        const parsed = JSON.parse(stripJsonFences(rawText)) as Record<
+          string,
+          unknown
+        >;
+        return { parsed, modelUsed: model };
+      };
 
-          const rawText = (response.text ?? '').trim();
-          if (!rawText) {
-            throw new Error(`Empty JSON response from ${model}.`);
-          }
-          const parsed = JSON.parse(stripJsonFences(rawText)) as Record<
-            string,
-            unknown
-          >;
-          res.json({ parsed, modelUsed: model });
-          return;
-        } catch (err) {
-          lastErr = err;
-          const info = extractErrorInfo(err);
-          if (info.status === 400 || info.status === 401 || info.status === 403) {
-            break;
+      try {
+        const out = await callModel(GEMINI_PRIMARY_JSON_MODEL);
+        res.json(out);
+        return;
+      } catch (err) {
+        const info = extractErrorInfo(err);
+        // Never retry 429 quota or auth errors; only resolve 404 model alias once
+        if (info.status === 404) {
+          try {
+            const fallbackOut = await callModel(GEMINI_FALLBACK_JSON_MODEL);
+            res.json(fallbackOut);
+            return;
+          } catch (fbErr) {
+            const fbInfo = extractErrorInfo(fbErr);
+            res.status(fbInfo.status).json({ error: fbInfo.message });
+            return;
           }
         }
+        res.status(info.status).json({ error: info.message });
       }
-
-      const finalErr = extractErrorInfo(lastErr);
-      res.status(finalErr.status).json({ error: finalErr.message });
     } catch (err) {
       const info = extractErrorInfo(err);
       res.status(info.status).json({ error: info.message });
     }
   });
 
-  // Server-side Gemini TTS (gemini-3.8-flash-tts / gemini-3.8-flash-lite-tts)
+  // Server-side Gemini TTS (gemini-3.8-flash-tts, Fenrir/Kore, zero 429 retries)
   app.post('/api/gemini/tts', async (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
@@ -188,8 +208,8 @@ async function startServer(): Promise<void> {
         typeof body.scriptText === 'string' ? body.scriptText.trim() : '';
       const styleDesc =
         typeof body.styleDesc === 'string' && body.styleDesc.trim()
-          ? body.styleDesc.trim()
-          : 'Commanding, punchy viral storyteller narration';
+          ? body.styleDesc.trim().slice(0, 400)
+          : 'Commanding, punchy, high-authority broadcast narration';
       const voiceName = body.voiceName === 'Kore' ? 'Kore' : 'Fenrir';
 
       if (!scriptText || scriptText.length > 8_000) {
@@ -197,130 +217,287 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      const apiKey =
-        typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
-      const ai = getGeminiClient(apiKey);
-      let lastErr: unknown = null;
+      const ai = getGeminiClient();
 
-      for (const model of TTS_MODELS) {
-        try {
-          const response = await ai.models.generateContent({
-            model,
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: scriptText,
-                    speechMetadata: { style: styleDesc },
-                  },
-                ],
-              },
-            ],
-            config: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName },
+      const callTts = async (model: string) => {
+        const response = await ai.models.generateContent({
+          model,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: scriptText,
+                  speechMetadata: { style: styleDesc },
                 },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName },
               },
             },
-          });
+          },
+        });
 
-          const parts = response.candidates?.[0]?.content?.parts ?? [];
-          for (const part of parts) {
-            if (part.inlineData?.data) {
-              res.json({
-                audioBase64: part.inlineData.data,
-                mimeType: part.inlineData.mimeType ?? 'audio/wav',
-                modelUsed: model,
-              });
-              return;
-            }
-          }
-          lastErr = new Error(`No audio returned by ${model}.`);
-        } catch (err) {
-          lastErr = err;
-          const info = extractErrorInfo(err);
-          if (info.status === 400 || info.status === 401 || info.status === 403) {
-            break;
+        const parts = response.candidates?.[0]?.content?.parts ?? [];
+        for (const part of parts) {
+          if (part.inlineData?.data) {
+            return {
+              audioBase64: part.inlineData.data,
+              mimeType: part.inlineData.mimeType ?? 'audio/wav',
+              modelUsed: model,
+            };
           }
         }
-      }
+        throw new Error(`No audio returned by ${model}.`);
+      };
 
-      const finalErr = extractErrorInfo(lastErr);
-      res.status(finalErr.status).json({ error: finalErr.message });
+      try {
+        const out = await callTts(GEMINI_PRIMARY_TTS_MODEL);
+        res.json(out);
+        return;
+      } catch (err) {
+        const info = extractErrorInfo(err);
+        if (info.status === 404) {
+          try {
+            const fallbackOut = await callTts(GEMINI_FALLBACK_TTS_MODEL);
+            res.json(fallbackOut);
+            return;
+          } catch (fbErr) {
+            const fbInfo = extractErrorInfo(fbErr);
+            res.status(fbInfo.status).json({ error: fbInfo.message });
+            return;
+          }
+        }
+        res.status(info.status).json({ error: info.message });
+      }
     } catch (err) {
       const info = extractErrorInfo(err);
       res.status(info.status).json({ error: info.message });
     }
   });
 
-  // Server-side Face-Locked Portrait Outfit Editing
-  app.post('/api/gemini/edit-portrait', async (req: Request, res: Response) => {
+  // Server-side NVIDIA NIM proxy (strict model allowlist, 1 call, zero 429 retries)
+  app.post('/api/nvidia/chat', async (req: Request, res: Response) => {
     try {
+      const nvidiaKey = getNvidiaApiKey();
+      if (!nvidiaKey) {
+        res
+          .status(503)
+          .json({ error: 'NVIDIA_API_KEY is not configured on the server.' });
+        return;
+      }
+
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const imageBase64 =
-        typeof body.imageBase64 === 'string' ? body.imageBase64.trim() : '';
-      const rawMime =
-        typeof body.mimeType === 'string' ? body.mimeType.trim() : 'image/jpeg';
-      const mimeType =
-        rawMime === 'image/png' ||
-        rawMime === 'image/webp' ||
-        rawMime === 'image/jpeg'
-          ? rawMime
-          : 'image/jpeg';
-      const outfitPrompt =
-        typeof body.outfitPrompt === 'string' ? body.outfitPrompt.trim() : '';
+      const model = typeof body.model === 'string' ? body.model.trim() : '';
+      const systemPrompt =
+        typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
+      const userPrompt =
+        typeof body.userPrompt === 'string' ? body.userPrompt.trim() : '';
+      const imageBase64Jpeg =
+        typeof body.imageBase64Jpeg === 'string'
+          ? body.imageBase64Jpeg.trim()
+          : '';
 
-      if (!imageBase64 || imageBase64.length > 10_000_000) {
-        res.status(400).json({ error: 'Valid portrait image is required.' });
+      if (!ALLOWED_NVIDIA_MODELS.has(model)) {
+        res.status(400).json({ error: 'Requested NVIDIA model is not allowed.' });
         return;
       }
-      if (!outfitPrompt || outfitPrompt.length > 300) {
-        res.status(400).json({ error: 'Valid outfit prompt is required.' });
+      if (!userPrompt || userPrompt.length > 50_000) {
+        res.status(400).json({ error: 'Valid userPrompt is required.' });
+        return;
+      }
+      if (imageBase64Jpeg && imageBase64Jpeg.length > 12_000_000) {
+        res.status(413).json({ error: 'Image payload too large.' });
         return;
       }
 
-      const apiKey =
-        typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
-      const ai = getGeminiClient(apiKey);
-      const editPrompt =
-        `Keep the person's exact face, facial structure, eyes, nose, mouth, skin tone, hair, and identity 100% locked and identical to the reference photo. ` +
-        `Change ONLY their outfit/clothing to: ${outfitPrompt}. ` +
-        `Clean studio portrait lighting, crisp edges, front-facing head-and-shoulders framing.`;
+      const supportsVision = model === 'nvidia/nemotron-3.5-super-vl-120b-a12b';
+      const userContent =
+        supportsVision && imageBase64Jpeg
+          ? [
+              { type: 'text', text: userPrompt },
+              {
+                type: 'image_url',
+                image_url: { url: `data:image/jpeg;base64,${imageBase64Jpeg}` },
+              },
+            ]
+          : userPrompt;
 
-      const response = await ai.models.generateContent({
-        model: IMAGE_EDIT_MODEL,
-        contents: {
-          parts: [
-            { inlineData: { mimeType, data: imageBase64 } },
-            { text: editPrompt },
-          ],
-        },
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 14_000);
 
-      for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-        if (part.inlineData?.data) {
-          const outMime = part.inlineData.mimeType ?? 'image/png';
-          res.json({
-            imageDataUrl: `data:${outMime};base64,${part.inlineData.data}`,
-            modelUsed: IMAGE_EDIT_MODEL,
+      try {
+        const resp = await fetch(NVIDIA_NIM_URL, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${nvidiaKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              ...(systemPrompt
+                ? [{ role: 'system', content: systemPrompt }]
+                : []),
+              { role: 'user', content: userContent },
+            ],
+            temperature: 0.35,
+            top_p: 0.9,
+            max_tokens: 1400,
+            response_format: { type: 'json_object' },
+          }),
+          signal: controller.signal,
+        });
+
+        if (!resp.ok) {
+          res.status(resp.status).json({
+            error: `NVIDIA NIM returned HTTP ${resp.status}.`,
           });
           return;
         }
-      }
 
-      res
-        .status(502)
-        .json({ error: 'Portrait outfit edit returned no image output.' });
+        const data = (await resp.json()) as {
+          choices?: { message?: { content?: string } }[];
+        };
+        const rawContent = data.choices?.[0]?.message?.content?.trim() ?? '';
+        if (!rawContent) {
+          res.status(502).json({ error: 'NVIDIA NIM returned empty content.' });
+          return;
+        }
+
+        const parsed = JSON.parse(stripJsonFences(rawContent)) as Record<
+          string,
+          unknown
+        >;
+        res.json({ parsed, modelUsed: model });
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (err) {
       const info = extractErrorInfo(err);
       res.status(info.status).json({ error: info.message });
     }
   });
 
-  // Ensure API errors always return JSON rather than HTML fallback
+  // Server-side YouTube Data API v3 proxy (regionCode=US)
+  app.post('/api/youtube/trends', async (req: Request, res: Response) => {
+    try {
+      const ytKey = getYoutubeApiKey();
+      if (!ytKey) {
+        res.json({ trends: [], configured: false });
+        return;
+      }
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const rawQueries = Array.isArray(body.queries) ? body.queries : [];
+      const queries = rawQueries
+        .filter((q): q is string => typeof q === 'string')
+        .map((q) => q.trim().slice(0, 120))
+        .filter(Boolean)
+        .slice(0, 2);
+
+      if (queries.length === 0) {
+        res.json({ trends: [], configured: true });
+        return;
+      }
+
+      const publishedAfter = new Date(
+        Date.now() - 30 * 24 * 60 * 60 * 1000
+      ).toISOString();
+
+      const videoIds: string[] = [];
+      const seen = new Set<string>();
+
+      await Promise.all(
+        queries.map(async (q) => {
+          const searchUrl = new URL(
+            'https://www.googleapis.com/youtube/v3/search'
+          );
+          searchUrl.searchParams.set('part', 'snippet');
+          searchUrl.searchParams.set('q', q);
+          searchUrl.searchParams.set('regionCode', 'US');
+          searchUrl.searchParams.set('type', 'video');
+          searchUrl.searchParams.set('videoDuration', 'short');
+          searchUrl.searchParams.set('order', 'viewCount');
+          searchUrl.searchParams.set('publishedAfter', publishedAfter);
+          searchUrl.searchParams.set('maxResults', '6');
+          searchUrl.searchParams.set('key', ytKey);
+
+          try {
+            const resp = await fetch(searchUrl.toString());
+            if (!resp.ok) return;
+            const data = (await resp.json()) as {
+              items?: { id?: { videoId?: string } }[];
+            };
+            for (const item of data.items ?? []) {
+              const vid = item.id?.videoId;
+              if (vid && !seen.has(vid)) {
+                seen.add(vid);
+                videoIds.push(vid);
+              }
+            }
+          } catch {
+            // Skip failed search query without retrying
+          }
+        })
+      );
+
+      if (videoIds.length === 0) {
+        res.json({ trends: [], configured: true });
+        return;
+      }
+
+      const detailsUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
+      detailsUrl.searchParams.set('part', 'snippet,statistics');
+      detailsUrl.searchParams.set('id', videoIds.slice(0, 12).join(','));
+      detailsUrl.searchParams.set('key', ytKey);
+
+      const detailsResp = await fetch(detailsUrl.toString());
+      if (!detailsResp.ok) {
+        res.json({ trends: [], configured: true });
+        return;
+      }
+
+      const detailsData = (await detailsResp.json()) as {
+        items?: {
+          snippet?: {
+            title?: string;
+            channelTitle?: string;
+            publishedAt?: string;
+            tags?: string[];
+          };
+          statistics?: {
+            viewCount?: string;
+            likeCount?: string;
+          };
+        }[];
+      };
+
+      const trends = (detailsData.items ?? [])
+        .map((item) => ({
+          title: item.snippet?.title ?? '',
+          channel: item.snippet?.channelTitle ?? '',
+          publishedAt: item.snippet?.publishedAt ?? '',
+          viewCount: parseInt(item.statistics?.viewCount ?? '0', 10) || 0,
+          likeCount: parseInt(item.statistics?.likeCount ?? '0', 10) || 0,
+          tags: (item.snippet?.tags ?? []).slice(0, 15),
+        }))
+        .sort((a, b) => b.viewCount - a.viewCount)
+        .slice(0, 10);
+
+      res.json({ trends, configured: true });
+    } catch (err) {
+      const info = extractErrorInfo(err);
+      res.status(info.status).json({ error: info.message, trends: [] });
+    }
+  });
+
   app.use('/api', (_req: Request, res: Response) => {
     res.status(404).json({ error: 'API route not found.' });
   });

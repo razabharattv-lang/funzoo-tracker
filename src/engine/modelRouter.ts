@@ -1,745 +1,414 @@
-import type {
-  DocumentaryStyle,
-  OutputLanguage,
-  StudioConfig,
-  VoiceGender,
-} from '../types/studio';
+import { getBuildRuntimeEnv } from '../lib/env';
+import type { AiEnginePreference, YouTubeTrendVideo } from '../types/studio';
 
-/**
- * Multi-Model Studio Router:
- * - Server-side Gemini endpoints (`/api/gemini/*`) execute all Gemini Vision, JSON planning,
- *   TTS voiceover, and face-locked outfit editing safely on the backend server.
- * - Optional NVIDIA NIM endpoints and optional External GPU endpoints run when configured.
- */
-export const MODEL_ROSTER = {
-  step1Planning: [
-    { id: 'nvidia/nemotron-3-ultra-550b-a55b', label: 'Nemotron 3 Ultra 550B' },
-    { id: 'stepfun-ai/step-5-preview', label: 'Step 5 Preview' },
-    { id: 'moonshotai/kimi-k3.1-pro', label: 'Kimi K3.1 Pro' },
-    { id: 'nvidia/nemotron-3.5-parse', label: 'Nemotron 3.5 Parse' },
-  ],
-  step1Vision: [
-    { id: 'nvidia/nemotron-3.5-super-vl-120b-a12b', label: 'Nemotron 3.5 VL 120B' },
-    { id: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', label: 'Nemotron Nano Omni 30B' },
-    { id: 'nvidia/cosmos3-nano-reasoner', label: 'Cosmos 3 Nano Reasoner' },
-    { id: 'nvidia/nemotron-ocr-v1', label: 'Nemotron OCR v1' },
-  ],
-  step2ExternalVisuals: [
-    'flux-3-image-klein',
-    'FLUX.1-schnell',
-    'TRELLIS',
-    'Relighting',
-  ],
-  step3Script: [
-    { id: 'mistralai/mistral-large-4', label: 'Mistral Large 4' },
-    { id: 'z-ai/glm-5-3-flash', label: 'GLM-5 3 Flash' },
-    { id: 'nvidia/nemotron-3.5-lightning-30b-a3b', label: 'Nemotron 3.5 Lightning 30B' },
-  ],
-  step3Translate: {
-    id: 'nvidia/riva-translate-4b-instruct-v2',
-    label: 'Riva Translate 4B v2',
-  },
-  step3Safety: {
-    id: 'nvidia/nemotron-3.5-content-safety',
-    label: 'Nemotron 3.5 Content Safety',
-  },
-  step4ExternalAudio: [
-    'magpie-tts-zeroshot',
-    'Studio Voice',
-    'Background Noise Removal',
-  ],
-  step4ExternalCharacter: [
-    'LipSync',
-    'wan2.2-animate-2-14b',
-    '3D Body Pose',
-    'eyecontact',
-  ],
-} as const;
-
-const NVIDIA_NIM_ENDPOINT =
-  'https://integrate.api.nvidia.com/v1/chat/completions';
-const NIM_TIMEOUT_MS = 9_500;
-const SERVER_GEMINI_TIMEOUT_MS = 35_000;
-const EXTERNAL_GPU_TIMEOUT_MS = 18_000;
-
-export async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  parentSignal?: AbortSignal,
-  timeoutMs = SERVER_GEMINI_TIMEOUT_MS
-): Promise<Response> {
-  const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
-  const onParentAbort = () => ctrl.abort();
-  if (parentSignal?.aborted) {
-    window.clearTimeout(timer);
-    throw new DOMException('Cancelled', 'AbortError');
-  }
-  parentSignal?.addEventListener('abort', onParentAbort, { once: true });
-
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } catch (err) {
-    if (parentSignal?.aborted) {
-      throw new DOMException('Cancelled', 'AbortError');
-    }
-    throw err;
-  } finally {
-    window.clearTimeout(timer);
-    parentSignal?.removeEventListener('abort', onParentAbort);
-  }
+export interface AiEngineOption {
+  id: AiEnginePreference;
+  label: string;
+  provider: 'auto' | 'gemini' | 'nvidia';
+  supportsVision: boolean;
+  badge: string;
 }
 
-export function stripJsonFences(raw: string): string {
-  let cleaned = raw.trim();
-  if (cleaned.startsWith('```')) {
-    const lines = cleaned.split('\n');
-    if (lines[0]?.startsWith('```')) lines.shift();
-    if (lines[lines.length - 1]?.trim() === '```') lines.pop();
-    cleaned = lines.join('\n').trim();
-  }
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    cleaned = cleaned.slice(start, end + 1);
-  }
-  return cleaned;
-}
-
-const DIRECT_GEMINI_JSON_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
+export const NVIDIA_MODEL_ROSTER = [
+  'nvidia/nemotron-3.5-super-vl-120b-a12b',
+  'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'mistralai/mistral-large-4',
+  'nvidia/riva-translate-4b-instruct-v2',
+  'nvidia/nemotron-3.5-content-safety',
 ] as const;
 
-async function callDirectGeminiJsonFallback(params: {
-  apiKey: string;
-  prompt: string;
-  systemInstruction?: string;
-  imageBase64Jpeg?: string;
-  signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
-  const { apiKey, prompt, systemInstruction, imageBase64Jpeg, signal } = params;
-  const trimmedKey = apiKey.trim();
-  if (!trimmedKey) {
-    throw new Error(
-      'Gemini API Key is missing. Open "Engine & Keys" at the top and paste your Gemini API Key (or configure VITE_GEMINI_API_KEY in GitHub Secrets).'
-    );
-  }
+export type NvidiaModelId = (typeof NVIDIA_MODEL_ROSTER)[number];
 
-  let lastErrorMsg = '';
-  for (const model of DIRECT_GEMINI_JSON_MODELS) {
-    if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-    try {
-      const parts: Record<string, unknown>[] = [{ text: prompt }];
-      if (imageBase64Jpeg) {
-        parts.push({
-          inline_data: {
-            mime_type: 'image/jpeg',
-            data: imageBase64Jpeg,
-          },
-        });
-      }
+export const AI_ENGINE_OPTIONS: AiEngineOption[] = [
+  {
+    id: 'auto',
+    label: 'Auto (Best Configured — 1 Call/Clip)',
+    provider: 'auto',
+    supportsVision: true,
+    badge: 'AUTO',
+  },
+  {
+    id: 'gemini-3.8-flash',
+    label: 'Gemini 3.8 Flash (Vision + Direct Translation)',
+    provider: 'gemini',
+    supportsVision: true,
+    badge: 'GEMINI',
+  },
+  {
+    id: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
+    label: 'NVIDIA Nemotron 3.5 Super VL 120B (Vision)',
+    provider: 'nvidia',
+    supportsVision: true,
+    badge: 'NIM VL',
+  },
+  {
+    id: 'nvidia/riva-translate-4b-instruct-v2',
+    label: 'NVIDIA Riva Translate 4B v2 (Direct Translate)',
+    provider: 'nvidia',
+    supportsVision: false,
+    badge: 'RIVA',
+  },
+  {
+    id: 'nvidia/nemotron-3.5-lightning-30b-a3b',
+    label: 'NVIDIA Nemotron 3.5 Lightning 30B (Fast SEO)',
+    provider: 'nvidia',
+    supportsVision: false,
+    badge: 'NIM FAST',
+  },
+  {
+    id: 'mistralai/mistral-large-4',
+    label: 'Mistral Large 4 via NVIDIA NIM (Deep Script)',
+    provider: 'nvidia',
+    supportsVision: false,
+    badge: 'MISTRAL',
+  },
+  {
+    id: 'nvidia/nemotron-3.5-content-safety',
+    label: 'NVIDIA Nemotron 3.5 Content Safety (Brand-Safe)',
+    provider: 'nvidia',
+    supportsVision: false,
+    badge: 'SAFETY',
+  },
+];
 
-      const resp = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-          trimmedKey
-        )}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ...(systemInstruction
-              ? {
-                  system_instruction: {
-                    parts: [{ text: systemInstruction }],
-                  },
-                }
-              : {}),
-            contents: [{ role: 'user', parts }],
-            generationConfig: {
-              responseMimeType: 'application/json',
-              temperature: 0.45,
-            },
-          }),
-        },
-        signal,
-        SERVER_GEMINI_TIMEOUT_MS
-      );
+export interface ServerHealthSnapshot {
+  backendAvailable: boolean;
+  geminiConfigured: boolean;
+  nvidiaConfigured: boolean;
+  youtubeConfigured: boolean;
+}
 
-      const data = (await resp.json().catch(() => ({}))) as {
-        candidates?: {
-          content?: { parts?: { text?: string }[] };
-        }[];
-        error?: { message?: string; status?: string };
+let cachedHealth: ServerHealthSnapshot | null = null;
+
+export async function probeStudioApiHealth(): Promise<ServerHealthSnapshot> {
+  if (cachedHealth) return cachedHealth;
+  const staticEnv = getBuildRuntimeEnv();
+
+  try {
+    const resp = await fetch('/api/health', { method: 'GET' });
+    const contentType = resp.headers.get('content-type') ?? '';
+    if (resp.ok && contentType.includes('application/json')) {
+      const data = (await resp.json()) as {
+        geminiConfigured?: boolean;
+        nvidiaConfigured?: boolean;
+        youtubeConfigured?: boolean;
       };
-
-      if (!resp.ok) {
-        lastErrorMsg =
-          data.error?.message || `Gemini API ${model} returned HTTP ${resp.status}.`;
-        if (resp.status === 400 || resp.status === 401 || resp.status === 403) {
-          if (model === DIRECT_GEMINI_JSON_MODELS[DIRECT_GEMINI_JSON_MODELS.length - 1]) {
-            throw new Error(`Gemini API error: ${lastErrorMsg}`);
-          }
-        }
-        continue;
-      }
-
-      const rawText =
-        data.candidates?.[0]?.content?.parts
-          ?.map((p) => p.text || '')
-          .join('\n')
-          .trim() ?? '';
-
-      if (!rawText) {
-        lastErrorMsg = `Gemini ${model} returned an empty response.`;
-        continue;
-      }
-
-      const parsed = JSON.parse(stripJsonFences(rawText)) as Record<
-        string,
-        unknown
-      >;
-      return { parsed, modelUsed: model };
-    } catch (err) {
-      if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-      lastErrorMsg = err instanceof Error ? err.message : String(err);
+      cachedHealth = {
+        backendAvailable: true,
+        geminiConfigured: Boolean(data.geminiConfigured),
+        nvidiaConfigured:
+          Boolean(data.nvidiaConfigured) || Boolean(staticEnv.nvidiaApiKey),
+        youtubeConfigured:
+          Boolean(data.youtubeConfigured) || Boolean(staticEnv.youtubeApiKey),
+      };
+      return cachedHealth;
     }
+  } catch {
+    // Static GitHub Pages deployment (no Express backend)
   }
 
-  throw new Error(
-    lastErrorMsg ||
-      'Gemini video analysis failed. Please verify your Gemini API Key in Engine & Keys.'
+  cachedHealth = {
+    backendAvailable: false,
+    geminiConfigured: false,
+    nvidiaConfigured: Boolean(staticEnv.nvidiaApiKey),
+    youtubeConfigured: Boolean(staticEnv.youtubeApiKey),
+  };
+  return cachedHealth;
+}
+
+export function isQuotaOrRateLimitStatus(status: number, message: string): boolean {
+  if (status === 429) return true;
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('429') ||
+    lower.includes('quota') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('rate limit') ||
+    lower.includes('too many requests')
   );
 }
 
-export async function callServerGeminiJson(params: {
-  prompt: string;
-  systemInstruction?: string;
-  imageBase64Jpeg?: string;
-  geminiApiKey?: string;
-  signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
-  const {
-    prompt,
-    systemInstruction,
-    imageBase64Jpeg,
-    geminiApiKey = '',
-    signal,
-  } = params;
-
-  const effectiveKey = (
-    geminiApiKey ||
-    (import.meta.env.VITE_GEMINI_API_KEY ?? '')
-  ).trim();
+export function extractJsonObject<T>(rawText: string): T | null {
+  const cleaned = rawText
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
+    .trim();
 
   try {
-    const resp = await fetchWithTimeout(
-      '/api/gemini/json',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          ...(systemInstruction ? { systemInstruction } : {}),
-          ...(imageBase64Jpeg ? { imageBase64Jpeg } : {}),
-          ...(effectiveKey ? { apiKey: effectiveKey } : {}),
-        }),
-      },
-      signal,
-      SERVER_GEMINI_TIMEOUT_MS
-    );
-
-    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
-    const isJson = contentType.includes('application/json');
-    const payload = isJson
-      ? ((await resp.json().catch(() => ({}))) as {
-          parsed?: Record<string, unknown>;
-          modelUsed?: string;
-          error?: string;
-        })
-      : {};
-
-    if (resp.ok && payload.parsed) {
-      return {
-        parsed: payload.parsed,
-        modelUsed: payload.modelUsed || 'gemini-2.5-flash',
-      };
+    return JSON.parse(cleaned) as T;
+  } catch {
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(cleaned.slice(start, end + 1)) as T;
+      } catch {
+        return null;
+      }
     }
-
-    // If hosted on static GitHub Pages (404/405/HTML response) or server lacks env key, try direct Gemini key if available
-    if (effectiveKey) {
-      return await callDirectGeminiJsonFallback({
-        apiKey: effectiveKey,
-        prompt,
-        systemInstruction,
-        imageBase64Jpeg,
-        signal,
-      });
-    }
-
-    throw new Error(
-      payload.error ||
-        `Gemini API Key is not configured (HTTP ${resp.status}). Open "Engine & Keys" at the top and paste your Gemini API Key.`
-    );
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    if (effectiveKey) {
-      return await callDirectGeminiJsonFallback({
-        apiKey: effectiveKey,
-        prompt,
-        systemInstruction,
-        imageBase64Jpeg,
-        signal,
-      });
-    }
-    throw err instanceof Error
-      ? err
-      : new Error(
-          'Gemini API request failed. Open "Engine & Keys" and enter a valid Gemini API Key.'
-        );
+    return null;
   }
 }
 
-export async function callNvidiaNimJson(params: {
-  nvidiaApiKey: string;
+export interface SingleClipAiResult {
+  rawText: string;
+  modelUsed: string;
+  quotaExhausted?: boolean;
+  errorReason?: string;
+}
+
+/**
+ * STRICT 1-CALL QUOTA GUARDRAIL:
+ * Makes at most ONE primary AI request per clip.
+ * Never loops across multiple models and never auto-retries HTTP 429 errors.
+ */
+export async function runSingleClipAiRequest(params: {
+  preference: AiEnginePreference;
   systemPrompt: string;
   userPrompt: string;
   imageBase64Jpeg?: string;
-  candidates: readonly { id: string; label: string }[];
-  maxAttempts?: number;
   signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string } | null> {
-  const {
-    nvidiaApiKey,
-    systemPrompt,
-    userPrompt,
-    imageBase64Jpeg,
-    candidates,
-    maxAttempts = 2,
-    signal,
-  } = params;
-  if (!nvidiaApiKey || candidates.length === 0) return null;
+}): Promise<SingleClipAiResult | null> {
+  const { preference, systemPrompt, userPrompt, imageBase64Jpeg, signal } = params;
+  const health = await probeStudioApiHealth();
+  const staticEnv = getBuildRuntimeEnv();
 
-  const limit = Math.min(maxAttempts, candidates.length);
-  for (let i = 0; i < limit; i++) {
-    const model = candidates[i];
-    if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+  // Resolve the single target model to call (1 call max, no waterfall loop)
+  let targetModel: AiEnginePreference = preference;
+  if (targetModel === 'auto') {
+    if (health.backendAvailable && health.geminiConfigured) {
+      targetModel = 'gemini-3.8-flash';
+    } else if (health.nvidiaConfigured) {
+      targetModel = imageBase64Jpeg
+        ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
+        : 'nvidia/nemotron-3.5-lightning-30b-a3b';
+    } else {
+      return null;
+    }
+  }
+
+  // PATH A: Gemini 3.8 Flash via server-side `/api/gemini/json` (single call, zero 429 retries)
+  if (targetModel === 'gemini-3.8-flash') {
+    if (!health.backendAvailable || !health.geminiConfigured) {
+      return {
+        rawText: '',
+        modelUsed: 'gemini-3.8-flash',
+        errorReason: 'Gemini backend unavailable',
+      };
+    }
+
     try {
-      const userContent = imageBase64Jpeg
-        ? [
-            { type: 'text', text: userPrompt },
-            {
-              type: 'image_url',
-              image_url: { url: `data:image/jpeg;base64,${imageBase64Jpeg}` },
-            },
-          ]
-        : userPrompt;
-
-      const resp = await fetchWithTimeout(
-        NVIDIA_NIM_ENDPOINT,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${nvidiaApiKey}`,
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({
-            model: model.id,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userContent },
-            ],
-            temperature: 0.55,
-            top_p: 0.9,
-            max_tokens: 1400,
-            response_format: { type: 'json_object' },
-          }),
-        },
+      const resp = await fetch('/api/gemini/json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         signal,
-        NIM_TIMEOUT_MS
-      );
-      if (!resp.ok) continue;
+        body: JSON.stringify({
+          prompt: `${systemPrompt}\n\n${userPrompt}`,
+          imageBase64Jpeg,
+          maxOutputTokens: 1600,
+          temperature: 0.4,
+        }),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        const quota = isQuotaOrRateLimitStatus(resp.status, errText);
+        return {
+          rawText: '',
+          modelUsed: 'gemini-3.8-flash',
+          quotaExhausted: quota,
+          errorReason: quota ? 'Gemini 429 quota limit' : `Gemini HTTP ${resp.status}`,
+        };
+      }
+
+      const payload = (await resp.json()) as { text?: string; model?: string };
+      return {
+        rawText: payload.text ?? '',
+        modelUsed: payload.model ?? 'gemini-3.8-flash',
+      };
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') throw err;
+      return {
+        rawText: '',
+        modelUsed: 'gemini-3.8-flash',
+        errorReason: 'Gemini network unreachable',
+      };
+    }
+  }
+
+  // PATH B: Configured NVIDIA NIM model (single call, zero 429 retries)
+  const isVisionModel = targetModel === 'nvidia/nemotron-3.5-super-vl-120b-a12b';
+  const userContent: unknown =
+    isVisionModel && imageBase64Jpeg
+      ? [
+          { type: 'text', text: userPrompt },
+          {
+            type: 'image_url',
+            image_url: { url: `data:image/jpeg;base64,${imageBase64Jpeg}` },
+          },
+        ]
+      : userPrompt;
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: userContent },
+  ];
+
+  // Prefer server proxy `/api/nvidia/chat` when Express backend is running
+  if (health.backendAvailable) {
+    try {
+      const resp = await fetch('/api/nvidia/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal,
+        body: JSON.stringify({
+          model: targetModel,
+          messages,
+          temperature: 0.35,
+          max_tokens: 1500,
+        }),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        const quota = isQuotaOrRateLimitStatus(resp.status, errText);
+        return {
+          rawText: '',
+          modelUsed: targetModel,
+          quotaExhausted: quota,
+          errorReason: quota ? 'NVIDIA NIM 429 quota limit' : `NVIDIA NIM HTTP ${resp.status}`,
+        };
+      }
 
       const data = (await resp.json()) as {
         choices?: { message?: { content?: string } }[];
       };
-      const rawContent = data.choices?.[0]?.message?.content ?? '';
-      if (!rawContent) continue;
-
-      const parsed = JSON.parse(stripJsonFences(rawContent)) as Record<
-        string,
-        unknown
-      >;
-      return { parsed, modelUsed: model.label };
+      return {
+        rawText: data.choices?.[0]?.message?.content ?? '',
+        modelUsed: targetModel,
+      };
     } catch (err) {
-      if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+      if ((err as Error).name === 'AbortError') throw err;
+      return {
+        rawText: '',
+        modelUsed: targetModel,
+        errorReason: 'NVIDIA NIM proxy unreachable',
+      };
     }
   }
-  return null;
+
+  // Static GitHub Pages fallback when `VITE_NVIDIA_API_KEY` was injected at build time
+  if (!staticEnv.nvidiaApiKey) {
+    return {
+      rawText: '',
+      modelUsed: targetModel,
+      errorReason: 'NVIDIA API key not configured',
+    };
+  }
+
+  try {
+    const resp = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${staticEnv.nvidiaApiKey}`,
+      },
+      signal,
+      body: JSON.stringify({
+        model: targetModel,
+        messages,
+        temperature: 0.35,
+        max_tokens: 1500,
+      }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      const quota = isQuotaOrRateLimitStatus(resp.status, errText);
+      return {
+        rawText: '',
+        modelUsed: targetModel,
+        quotaExhausted: quota,
+        errorReason: quota ? 'NVIDIA NIM 429 quota limit' : `NVIDIA NIM HTTP ${resp.status}`,
+      };
+    }
+
+    const data = (await resp.json()) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    return {
+      rawText: data.choices?.[0]?.message?.content ?? '',
+      modelUsed: targetModel,
+    };
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') throw err;
+    return {
+      rawText: '',
+      modelUsed: targetModel,
+      errorReason: 'NVIDIA NIM network/CORS blocked',
+    };
+  }
 }
 
 /**
- * Step 1 Vision Router: tries Gemini (gemini-2.5-flash -> gemini-2.0-flash) first for fast 6-frame contact sheet inspection,
- * with fallback to NVIDIA NIM Vision if configured.
+ * Queries live US YouTube Data API v3 (`regionCode=US`) via server `/api/youtube/trends`
+ * (or build-time `VITE_YOUTUBE_API_KEY` on static GitHub Pages). Single call, zero retries.
  */
-export async function runStep1VisionJson(params: {
-  geminiApiKey?: string;
-  nvidiaApiKey: string;
-  systemPrompt: string;
-  userPrompt: string;
-  imageBase64Jpeg: string;
-  signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
-  const {
-    geminiApiKey = '',
-    nvidiaApiKey,
-    systemPrompt,
-    userPrompt,
-    imageBase64Jpeg,
-    signal,
-  } = params;
+export async function fetchYouTubeTrendsFromApi(
+  topicQuery: string,
+  signal?: AbortSignal
+): Promise<YouTubeTrendVideo[]> {
+  const cleanQ = topicQuery.trim().slice(0, 70) || 'explained viral shorts';
+  const health = await probeStudioApiHealth();
+  const staticEnv = getBuildRuntimeEnv();
 
-  let geminiError: unknown = null;
-  try {
-    return await callServerGeminiJson({
-      prompt: userPrompt,
-      systemInstruction: systemPrompt,
-      imageBase64Jpeg,
-      geminiApiKey,
-      signal,
-    });
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    geminiError = err;
-  }
-
-  if (nvidiaApiKey) {
-    const nimRes = await callNvidiaNimJson({
-      nvidiaApiKey,
-      systemPrompt,
-      userPrompt,
-      imageBase64Jpeg,
-      candidates: MODEL_ROSTER.step1Vision,
-      maxAttempts: 2,
-      signal,
-    });
-    if (nimRes) return nimRes;
-  }
-
-  throw geminiError instanceof Error
-    ? geminiError
-    : new Error(
-        'Vision analysis failed: Please enter a valid Gemini API Key or NVIDIA NIM Key in "Engine & Keys".'
-      );
-}
-
-/**
- * Step 1 Chapter/Scene Planner Router:
- * Routes through Gemini (`gemini-2.5-flash` -> `gemini-2.0-flash`) or NVIDIA NIM planning models.
- */
-export async function runStep1PlannerJson(params: {
-  geminiApiKey?: string;
-  nvidiaApiKey: string;
-  systemPrompt: string;
-  userPrompt: string;
-  signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
-  const {
-    geminiApiKey = '',
-    nvidiaApiKey,
-    systemPrompt,
-    userPrompt,
-    signal,
-  } = params;
-
-  let geminiError: unknown = null;
-  try {
-    return await callServerGeminiJson({
-      prompt: userPrompt,
-      systemInstruction: systemPrompt,
-      geminiApiKey,
-      signal,
-    });
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    geminiError = err;
-  }
-
-  if (nvidiaApiKey) {
-    const nimRes = await callNvidiaNimJson({
-      nvidiaApiKey,
-      systemPrompt,
-      userPrompt,
-      candidates: MODEL_ROSTER.step1Planning,
-      maxAttempts: 2,
-      signal,
-    });
-    if (nimRes) return nimRes;
-  }
-
-  throw geminiError instanceof Error
-    ? geminiError
-    : new Error(
-        'Planner failed: Please enter a valid Gemini API Key or NVIDIA NIM Key in "Engine & Keys".'
-      );
-}
-
-/**
- * Step 3 Script & Translation Router:
- * Routes script generation through Gemini (`gemini-2.5-flash` -> `gemini-2.0-flash`) with fallback to NVIDIA NIM.
- */
-export async function runStep3ScriptJson(params: {
-  config: StudioConfig;
-  language: OutputLanguage;
-  systemPrompt: string;
-  userPrompt: string;
-  signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
-  const { config, language, systemPrompt, userPrompt, signal } = params;
-
-  let result: { parsed: Record<string, unknown>; modelUsed: string } | null = null;
-  let geminiError: unknown = null;
-
-  try {
-    result = await callServerGeminiJson({
-      prompt: userPrompt,
-      systemInstruction: systemPrompt,
-      geminiApiKey: config.geminiApiKey,
-      signal,
-    });
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    geminiError = err;
-  }
-
-  if (!result && config.nvidiaApiKey) {
-    result = await callNvidiaNimJson({
-      nvidiaApiKey: config.nvidiaApiKey,
-      systemPrompt,
-      userPrompt,
-      candidates: MODEL_ROSTER.step3Script,
-      maxAttempts: 2,
-      signal,
-    });
-  }
-
-  if (!result) {
-    throw geminiError instanceof Error
-      ? geminiError
-      : new Error(
-          'Script generation failed: Please configure your Gemini API Key in "Engine & Keys".'
-        );
-  }
-
-  if (
-    language === 'hi' &&
-    config.nvidiaApiKey &&
-    Array.isArray(result.parsed.beats) &&
-    result.parsed.beats.length > 0 &&
-    !result.modelUsed.includes('Riva')
-  ) {
-    const beatsJson = JSON.stringify(result.parsed.beats);
-    const hasLatinOnly =
-      !/[\u0900-\u097F]/.test(beatsJson) && /[a-zA-Z]{4,}/.test(beatsJson);
-    if (hasLatinOnly) {
-      const rivaRes = await callNvidiaNimJson({
-        nvidiaApiKey: config.nvidiaApiKey,
-        systemPrompt:
-          'Translate spoken beats accurately into punchy conversational Hindi (Devanagari script) keeping identical beat count and word budget. Output JSON {"beats": [...]}.',
-        userPrompt: beatsJson,
-        candidates: [MODEL_ROSTER.step3Translate],
-        maxAttempts: 1,
+  if (health.backendAvailable) {
+    try {
+      const resp = await fetch(`/api/youtube/trends?q=${encodeURIComponent(cleanQ)}`, {
         signal,
       });
-      if (rivaRes && Array.isArray(rivaRes.parsed.beats)) {
-        result = {
-          parsed: { ...result.parsed, beats: rivaRes.parsed.beats },
-          modelUsed: `${result.modelUsed} + ${MODEL_ROSTER.step3Translate.label}`,
-        };
-      }
+      if (!resp.ok) return [];
+      const data = (await resp.json()) as { items?: YouTubeTrendVideo[] };
+      return Array.isArray(data.items) ? data.items : [];
+    } catch {
+      return [];
     }
   }
 
-  return result;
-}
-
-export async function requestExternalGpuVisual(params: {
-  config: StudioConfig;
-  useExternalGpu: boolean;
-  style: DocumentaryStyle;
-  visualPrompt: string;
-  width: number;
-  height: number;
-  signal?: AbortSignal;
-}): Promise<{ dataUrl: string; engineLabel: string } | null> {
-  const { config, useExternalGpu, style, visualPrompt, width, height, signal } =
-    params;
-  if (!useExternalGpu || !config.externalGpuEndpoint) return null;
-
-  const modelChain =
-    style === '3d_blender'
-      ? ['TRELLIS', 'Relighting', 'FLUX.1-schnell']
-      : ['flux-3-image-klein', 'FLUX.1-schnell', 'Relighting'];
+  if (!staticEnv.youtubeApiKey) return [];
 
   try {
-    const resp = await fetchWithTimeout(
-      `${config.externalGpuEndpoint}/api/visuals`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(config.externalGpuKey
-            ? { Authorization: `Bearer ${config.externalGpuKey}` }
-            : {}),
-        },
-        body: JSON.stringify({
-          prompt: visualPrompt,
-          style,
-          models: modelChain,
-          width,
-          height,
-        }),
-      },
-      signal,
-      EXTERNAL_GPU_TIMEOUT_MS
-    );
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as {
-      imageDataUrl?: string;
-      imageBase64?: string;
-      mimeType?: string;
-      modelUsed?: string;
-    };
-    const dataUrl =
-      data.imageDataUrl ||
-      (data.imageBase64
-        ? `data:${data.mimeType || 'image/jpeg'};base64,${data.imageBase64}`
-        : '');
-    if (!dataUrl.startsWith('data:image/') && !dataUrl.startsWith('http')) {
-      return null;
-    }
-    return {
-      dataUrl,
-      engineLabel: `External GPU (${data.modelUsed || modelChain[0]})`,
-    };
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    return null;
-  }
-}
+    const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
+    searchUrl.searchParams.set('part', 'snippet');
+    searchUrl.searchParams.set('type', 'video');
+    searchUrl.searchParams.set('videoDuration', 'short');
+    searchUrl.searchParams.set('regionCode', 'US');
+    searchUrl.searchParams.set('relevanceLanguage', 'en');
+    searchUrl.searchParams.set('order', 'viewCount');
+    searchUrl.searchParams.set('maxResults', '6');
+    searchUrl.searchParams.set('q', cleanQ);
+    searchUrl.searchParams.set('key', staticEnv.youtubeApiKey);
 
-export async function requestExternalGpuVoice(params: {
-  config: StudioConfig;
-  useExternalGpu: boolean;
-  scriptText: string;
-  language: OutputLanguage;
-  voiceGender: VoiceGender;
-  signal?: AbortSignal;
-}): Promise<{ wavBytes: Uint8Array; engineLabel: string } | null> {
-  const {
-    config,
-    useExternalGpu,
-    scriptText,
-    language,
-    voiceGender,
-    signal,
-  } = params;
-  if (!useExternalGpu || !config.externalGpuEndpoint) return null;
+    const sResp = await fetch(searchUrl.toString(), { signal });
+    if (!sResp.ok) return [];
+    const sJson = (await sResp.json()) as {
+      items?: {
+        id?: { videoId?: string };
+        snippet?: { title?: string; channelTitle?: string; publishedAt?: string };
+      }[];
+    };
+    const items = sJson.items ?? [];
+    if (items.length === 0) return [];
 
-  try {
-    const resp = await fetchWithTimeout(
-      `${config.externalGpuEndpoint}/api/tts`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(config.externalGpuKey
-            ? { Authorization: `Bearer ${config.externalGpuKey}` }
-            : {}),
-        },
-        body: JSON.stringify({
-          text: scriptText,
-          language,
-          voiceGender,
-          models: MODEL_ROSTER.step4ExternalAudio,
-        }),
-      },
-      signal,
-      EXTERNAL_GPU_TIMEOUT_MS
-    );
-    if (!resp.ok) return null;
-    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
-    if (contentType.includes('audio/')) {
-      const buf = await resp.arrayBuffer();
-      if (buf.byteLength > 1000) {
-        return {
-          wavBytes: new Uint8Array(buf),
-          engineLabel: 'External GPU (Magpie + Studio Voice)',
-        };
-      }
-      return null;
-    }
-    const json = (await resp.json()) as {
-      audioBase64?: string;
-      modelUsed?: string;
-    };
-    if (!json.audioBase64) return null;
-    const binary = window.atob(json.audioBase64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return {
-      wavBytes: bytes,
-      engineLabel: `External GPU (${json.modelUsed || 'magpie-tts-zeroshot'})`,
-    };
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    return null;
-  }
-}
-
-export async function requestExternalGpuCharacterFrame(params: {
-  config: StudioConfig;
-  useExternalGpu: boolean;
-  portraitUrl: string;
-  signal?: AbortSignal;
-}): Promise<{ enhancedPortraitUrl: string; engineLabel: string } | null> {
-  const { config, useExternalGpu, portraitUrl, signal } = params;
-  if (!useExternalGpu || !config.externalGpuEndpoint || !portraitUrl) {
-    return null;
-  }
-
-  try {
-    const resp = await fetchWithTimeout(
-      `${config.externalGpuEndpoint}/api/character`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(config.externalGpuKey
-            ? { Authorization: `Bearer ${config.externalGpuKey}` }
-            : {}),
-        },
-        body: JSON.stringify({
-          portraitUrl,
-          models: MODEL_ROSTER.step4ExternalCharacter,
-        }),
-      },
-      signal,
-      EXTERNAL_GPU_TIMEOUT_MS
-    );
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as {
-      portraitDataUrl?: string;
-      modelUsed?: string;
-    };
-    if (!data.portraitDataUrl) return null;
-    return {
-      enhancedPortraitUrl: data.portraitDataUrl,
-      engineLabel: `External GPU (${data.modelUsed || 'LipSync + wan2.2'})`,
-    };
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    return null;
+    return items.map((item) => ({
+      title: item.snippet?.title ?? '',
+      channel: item.snippet?.channelTitle ?? '',
+      publishedAt: item.snippet?.publishedAt ?? '',
+      viewCount: 0,
+      likeCount: 0,
+      tags: [],
+    }));
+  } catch {
+    return [];
   }
 }

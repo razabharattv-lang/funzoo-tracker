@@ -1,6 +1,6 @@
 {
   "name": "US Explainer Video Studio",
-  "description": "Flat Material React + Vite Video-First AI Production Studio running on Express + Browser GPU with 18-keyframe long-video clipping, adaptive subject-safe cropping & GPU delogo, beat-synced server-side Gemini AI + US YouTube trends + NVIDIA NIM scripts, time-fitted broadcast voiceover, and fast single-pass WebGL2/WebCodecs MP4 rendering.",
+  "description": "Focused Video Clipping, Direct Translation & Commanding Voiceover Studio with smart timeline clipping, subject-safe visual clean & cinema grade, NVIDIA NIM + Gemini 3.8 Flash + US YouTube Data API v3 SEO, broadcast voiceover DSP, and fast phone-safe WebCodecs/Canvas export.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

@@ -1,880 +1,581 @@
+import { buildCaptionChunks, drawCapCutPopCaption } from './captionPainter';
 import type {
-  CharacterFaceLandmarks,
-  DocumentaryChapter,
   OutputLanguage,
   PreparedVisualClip,
-  ScriptBeat,
   SourceMediaItem,
+  TrendMetadata,
 } from '../types/studio';
-import type { ProcessedStudioAudio } from './audioEngine';
-import { loadPortraitBitmapWithOfflineRig } from './characterAnimator';
-import { cachedFetchResponse } from './cacheManager';
-
-export interface GpuRenderOptions {
-  source: SourceMediaItem;
-  clip: PreparedVisualClip;
-  audio: ProcessedStudioAudio;
-  scriptText: string;
-  beats: ScriptBeat[];
-  language: OutputLanguage;
-  characterEnabled: boolean;
-  characterPortraitUrl: string;
-  onStatus: (msg: string) => void;
-  onProgressPct: (pct: number) => void;
-  signal?: AbortSignal;
-}
-
-export interface DocumentarySceneRenderOptions {
-  chapter: DocumentaryChapter;
-  audio: ProcessedStudioAudio;
-  scriptText: string;
-  beats: ScriptBeat[];
-  language: OutputLanguage;
-  characterEnabled: boolean;
-  characterPortraitUrl: string;
-  onStatus: (msg: string) => void;
-  onProgressPct: (pct: number) => void;
-  signal?: AbortSignal;
-}
-
-export interface RenderedHardwareMp4 {
-  blob: Blob;
-  blobUrl: string;
-  sizeBytes: number;
-  durationSec: number;
-  width: number;
-  height: number;
-  fps: number;
-  delogoCount: number;
-  bumperTrimmedSec: number;
-  safeCropApplied: boolean;
-  characterMode: string;
-  renderEngine: string;
-}
+import type { SynthesizedVoiceResult } from './audioEngine';
 
 export interface DeviceRenderProfile {
   isMobile: boolean;
+  fps: number;
+  bitrate: number;
+  supportsWebCodecs: boolean;
+}
+
+export interface RenderedVideoBlobResult {
+  blob: Blob;
+  mimeType: string;
+  width: number;
+  height: number;
+  fps: number;
+  durationSec: number;
+  renderEngine: string;
+}
+
+export function detectDeviceRenderProfile(): DeviceRenderProfile {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+  const supportsWebCodecs =
+    typeof VideoEncoder !== 'undefined' &&
+    typeof VideoFrame !== 'undefined' &&
+    typeof OffscreenCanvas !== 'undefined' &&
+    typeof Worker !== 'undefined';
+
+  return {
+    isMobile,
+    fps: isMobile ? 24 : 30,
+    bitrate: isMobile ? 2_600_000 : 4_200_000,
+    supportsWebCodecs,
+  };
+}
+
+function computeTargetDimensions(
+  source: SourceMediaItem,
+  isMobile: boolean
+): { width: number; height: number } {
+  const srcW = Math.max(160, source.width || 1080);
+  const srcH = Math.max(160, source.height || 1920);
+  const isLandscape = srcW > srcH * 1.05;
+  const isSquare = Math.abs(srcW - srcH) / Math.max(srcW, srcH) <= 0.12;
+
+  if (isSquare) {
+    return isMobile ? { width: 720, height: 720 } : { width: 1080, height: 1080 };
+  }
+  if (isLandscape) {
+    return isMobile ? { width: 960, height: 540 } : { width: 1280, height: 720 };
+  }
+  return isMobile ? { width: 720, height: 1280 } : { width: 1080, height: 1920 };
+}
+
+async function seekVideoPrecise(
+  video: HTMLVideoElement,
+  targetSec: number
+): Promise<void> {
+  const clamped = Math.max(
+    0,
+    Math.min(targetSec, Math.max(0, (video.duration || targetSec + 0.1) - 0.04))
+  );
+  if (Math.abs(video.currentTime - clamped) < 0.008 && video.readyState >= 2) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      video.onseeked = null;
+      resolve();
+    };
+    const timer = window.setTimeout(done, 1000);
+    video.onseeked = () => {
+      window.clearTimeout(timer);
+      done();
+    };
+    try {
+      video.currentTime = clamped;
+    } catch {
+      window.clearTimeout(timer);
+      done();
+    }
+  });
+}
+
+async function renderSinglePassWebCodecsWorker(params: {
+  source: SourceMediaItem;
+  clip: PreparedVisualClip;
+  metadata: TrendMetadata;
+  voice: SynthesizedVoiceResult;
+  language: OutputLanguage;
   width: number;
   height: number;
   fps: number;
   bitrate: number;
-  playbackRate: number;
-  label: string;
-}
-
-interface VideoFrameCallbackMetadata {
-  mediaTime: number;
-}
-
-type VideoWithRVFC = HTMLVideoElement & {
-  requestVideoFrameCallback?: (
-    cb: (now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata) => void
-  ) => number;
-  cancelVideoFrameCallback?: (handle: number) => void;
-};
-
-/**
- * Mobile Resource Guardrail:
- * - Mobile / <= 4GB RAM: 720x1280 @ 24fps (~3.8 Mbps)
- * - Desktop: 1080x1920 @ 30fps (~6.0 Mbps)
- */
-export function detectDeviceRenderProfile(): DeviceRenderProfile {
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  const deviceMemory =
-    typeof navigator !== 'undefined'
-      ? (navigator as Navigator & { deviceMemory?: number }).deviceMemory
-      : undefined;
-  const isMobileUa =
-    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(
-      ua
-    );
-  const isLowRam = typeof deviceMemory === 'number' && deviceMemory <= 4;
-
-  if (isMobileUa || isLowRam) {
-    return {
-      isMobile: true,
-      width: 720,
-      height: 1280,
-      fps: 24,
-      bitrate: 3_800_000,
-      playbackRate: 1.25,
-      label: '720p 24fps Mobile GPU',
-    };
-  }
-
-  return {
-    isMobile: false,
-    width: 1080,
-    height: 1920,
-    fps: 30,
-    bitrate: 6_000_000,
-    playbackRate: 1.5,
-    label: '1080p 30fps Desktop GPU',
-  };
-}
-
-function supportsWebCodecsWorkerPipeline(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof Worker !== 'undefined' &&
-    typeof OffscreenCanvas !== 'undefined' &&
-    typeof VideoEncoder !== 'undefined' &&
-    typeof AudioEncoder !== 'undefined' &&
-    typeof VideoFrame !== 'undefined' &&
-    typeof AudioData !== 'undefined' &&
-    typeof createImageBitmap === 'function'
-  );
-}
-
-function describeSurgicalAction(clip: PreparedVisualClip): string {
-  if (clip.delogoZoneCount > 0 && clip.safeCropApplied) {
-    return 'Removing Inner Logo + Safe Edge Crop & Fast GPU Mux';
-  }
-  if (clip.delogoZoneCount > 0) {
-    return 'Removing Inner Logo & Fast GPU Mux';
-  }
-  if (clip.safeCropApplied) {
-    return 'Applying Subject-Safe Crop & Fast GPU Mux';
-  }
-  if (clip.bumperTrimmedSec > 0) {
-    return 'Skipping Creator Bumper & Fast GPU Mux';
-  }
-  return 'Fast Single-Pass GPU Mux';
-}
-
-async function seekOnceForIntervalStart(
-  video: HTMLVideoElement,
-  targetSec: number,
-  signal?: AbortSignal
-): Promise<void> {
-  if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-  const clamped = Math.max(
-    0.01,
-    Math.min(targetSec, Math.max(0.05, (video.duration || targetSec + 1) - 0.05))
-  );
-  if (Math.abs(video.currentTime - clamped) < 0.04 && video.readyState >= 2) {
-    return;
-  }
-  await new Promise<void>((resolve, reject) => {
-    const onAbort = () => {
-      cleanup();
-      reject(new DOMException('Cancelled', 'AbortError'));
-    };
-    const cleanup = () => {
-      window.clearTimeout(timer);
-      video.onseeked = null;
-      signal?.removeEventListener('abort', onAbort);
-    };
-    const timer = window.setTimeout(() => {
-      cleanup();
-      resolve();
-    }, 1500);
-    video.onseeked = () => {
-      cleanup();
-      resolve();
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      video.currentTime = clamped;
-    } catch {
-      cleanup();
-      resolve();
-    }
-  });
-}
-
-function waitNextDecodedVideoFrame(
-  video: VideoWithRVFC,
-  signal?: AbortSignal
-): Promise<number> {
-  return new Promise<number>((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DOMException('Cancelled', 'AbortError'));
-      return;
-    }
-
-    let settled = false;
-    let rvfcId: number | null = null;
-    let rafId: number | null = null;
-
-    const cleanup = () => {
-      window.clearTimeout(watchdog);
-      signal?.removeEventListener('abort', onAbort);
-      if (rvfcId !== null && video.cancelVideoFrameCallback) {
-        try {
-          video.cancelVideoFrameCallback(rvfcId);
-        } catch {
-          // ignore
-        }
-      }
-      if (rafId !== null) {
-        window.cancelAnimationFrame(rafId);
-      }
-    };
-
-    const finish = (mediaTime: number) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(mediaTime);
-    };
-
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new DOMException('Cancelled', 'AbortError'));
-    };
-
-    signal?.addEventListener('abort', onAbort, { once: true });
-
-    const watchdog = window.setTimeout(() => {
-      finish(video.currentTime);
-    }, 120);
-
-    if (typeof video.requestVideoFrameCallback === 'function') {
-      rvfcId = video.requestVideoFrameCallback((_now, meta) => {
-        finish(Number.isFinite(meta?.mediaTime) ? meta.mediaTime : video.currentTime);
-      });
-    } else {
-      rafId = window.requestAnimationFrame(() => {
-        finish(video.currentTime);
-      });
-    }
-  });
-}
-
-function createWorkerRpc(
-  worker: Worker,
-  signal?: AbortSignal
-): (expectedType: string) => Promise<Record<string, unknown>> {
-  let pendingResolve: ((data: Record<string, unknown>) => void) | null = null;
-  let pendingReject: ((err: Error) => void) | null = null;
-
-  worker.onmessage = (ev: MessageEvent<Record<string, unknown>>) => {
-    const data = ev.data;
-    if (data.type === 'error') {
-      const err = new Error(String(data.message || 'renderWorker error'));
-      pendingReject?.(err);
-      pendingResolve = null;
-      pendingReject = null;
-      return;
-    }
-    pendingResolve?.(data);
-    pendingResolve = null;
-    pendingReject = null;
-  };
-
-  worker.onerror = (ev) => {
-    const err = new Error(ev.message || 'renderWorker crashed');
-    pendingReject?.(err);
-    pendingResolve = null;
-    pendingReject = null;
-  };
-
-  return (expectedType: string) =>
-    new Promise<Record<string, unknown>>((resolve, reject) => {
-      if (signal?.aborted) {
-        reject(new DOMException('Cancelled', 'AbortError'));
-        return;
-      }
-      pendingResolve = (data) => {
-        if (data.type === expectedType) {
-          resolve(data);
-        } else {
-          reject(
-            new Error(
-              `Unexpected worker reply "${String(
-                data.type
-              )}" (expected "${expectedType}")`
-            )
-          );
-        }
-      };
-      pendingReject = reject;
-    });
-}
-
-async function renderSinglePassWebCodecsWorker(
-  opts: GpuRenderOptions,
-  profile: DeviceRenderProfile
-): Promise<RenderedHardwareMp4> {
+  signal?: AbortSignal;
+  onProgress?: (pct: number, detail: string) => void;
+}): Promise<RenderedVideoBlobResult> {
   const {
     source,
     clip,
-    audio,
-    scriptText,
-    beats,
+    metadata,
+    voice,
     language,
-    characterEnabled,
-    characterPortraitUrl,
-    onStatus,
-    onProgressPct,
+    width,
+    height,
+    fps,
+    bitrate,
     signal,
-  } = opts;
+    onProgress,
+  } = params;
 
-  if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-
-  const lockedDurationSec = clip.lockedVisualDurationSec;
-  const totalFrames = Math.max(
-    profile.fps * 3,
-    Math.round(lockedDurationSec * profile.fps)
+  const durationSec = Math.max(
+    1.5,
+    Math.min(clip.lockedVisualDurationSec, voice.durationSec)
   );
-  const intervals =
-    clip.usableIntervals.length > 0
-      ? clip.usableIntervals
-      : [{ startSec: clip.trimRange.startSec, endSec: clip.trimRange.endSec }];
+  const totalFrames = Math.max(1, Math.round(durationSec * fps));
 
-  let portraitBitmap: ImageBitmap | null = null;
-  let portraitLandmarks: CharacterFaceLandmarks | null = null;
-  let characterMode = 'disabled';
-  if (characterEnabled && characterPortraitUrl) {
-    try {
-      const loaded = await loadPortraitBitmapWithOfflineRig(
-        characterPortraitUrl
-      );
-      portraitBitmap = loaded.bitmap;
-      portraitLandmarks = loaded.landmarks;
-      characterMode = `offline-phoneme-rig (${loaded.landmarks.detectorEngine})`;
-    } catch {
-      portraitBitmap = null;
-      portraitLandmarks = null;
-      characterMode = 'disabled';
-    }
-  }
-
-  const videoUrl = URL.createObjectURL(source.blob);
-  const video = document.createElement('video') as VideoWithRVFC;
+  const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
   video.preload = 'auto';
-  video.src = videoUrl;
+  video.crossOrigin = 'anonymous';
+  video.src = source.objectUrl;
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(
+      () => reject(new Error('Timed out loading source video for GPU render.')),
+      15000
+    );
+    video.onloadeddata = () => {
+      window.clearTimeout(timer);
+      resolve();
+    };
+    video.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error('Failed to decode source video for GPU render.'));
+    };
+    video.load();
+  });
 
   const worker = new Worker(new URL('./renderWorker.ts', import.meta.url), {
     type: 'module',
   });
 
-  let delogoCount = 0;
-  let activeCodecLabel = profile.label;
-
-  const onAbort = () => {
+  const cleanup = () => {
     try {
-      worker.postMessage({ type: 'abort' });
+      worker.terminate();
     } catch {
       // ignore
     }
-    worker.terminate();
-  };
-  signal?.addEventListener('abort', onAbort, { once: true });
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(
-        () => reject(new Error('Source video load timed out.')),
-        15_000
-      );
-      video.onloadeddata = () => {
-        window.clearTimeout(timer);
-        resolve();
-      };
-      video.onerror = () => {
-        window.clearTimeout(timer);
-        reject(new Error('Could not decode source video for GPU pipeline.'));
-      };
-    });
-
-    const srcW = video.videoWidth || source.width || 1080;
-    const srcH = video.videoHeight || source.height || 1920;
-    const awaitWorkerReply = createWorkerRpc(worker, signal);
-
-    const actionSummary = describeSurgicalAction(clip);
-    onStatus(
-      `${actionSummary} (${profile.width}×${profile.height} @ ${profile.fps}fps · locked ${lockedDurationSec.toFixed(
-        1
-      )}s)...`
-    );
-
-    const pcmCopy = new Float32Array(audio.pcmMono);
-    const ampCopy = new Float32Array(audio.amplitudeEnvelope);
-    const mouthCopy = new Float32Array(audio.mouthOpenEnvelope);
-    const initTransfer: Transferable[] = [
-      pcmCopy.buffer,
-      ampCopy.buffer,
-      mouthCopy.buffer,
-    ];
-    if (portraitBitmap) initTransfer.push(portraitBitmap);
-
-    const readyPromise = awaitWorkerReply('ready');
-    worker.postMessage(
-      {
-        type: 'init',
-        renderMode: 'video',
-        width: profile.width,
-        height: profile.height,
-        fps: profile.fps,
-        bitrate: profile.bitrate,
-        durationSec: lockedDurationSec,
-        scriptText,
-        beats: audio.alignedBeats.length > 0 ? audio.alignedBeats : beats,
-        wordTimings: audio.wordTimings,
-        language,
-        safeCropInsets: clip.safeCropInsets,
-        watermarkZones: clip.watermarkZones,
-        climaxSecond: clip.climaxSec,
-        portraitBitmap,
-        portraitLandmarks,
-        pcmMono: pcmCopy,
-        sampleRate: audio.sampleRate,
-        amplitudeEnvelope: ampCopy,
-        mouthOpenEnvelope: mouthCopy,
-        envelopeFps: audio.envelopeFps,
-      },
-      initTransfer
-    );
-    portraitBitmap = null;
-
-    const readyData = await readyPromise;
-    delogoCount = Number(readyData.delogoCount ?? 0);
-    const hwAccel = String(readyData.hardwareAcceleration ?? 'prefer-hardware');
-    activeCodecLabel =
-      hwAccel === 'prefer-hardware'
-        ? `Single-Pass Hardware GPU (${profile.width}×${profile.height} @ ${profile.fps}fps)`
-        : `Single-Pass WebGL2 (${profile.width}×${profile.height} @ ${profile.fps}fps)`;
-    onProgressPct(12);
-
-    let intervalIdx = 0;
-    let priorDurationSec = 0;
-    let currentInterval = intervals[0];
-    await seekOnceForIntervalStart(video, currentInterval.startSec, signal);
-    video.playbackRate = profile.playbackRate;
-
-    let continuousPlayActive = true;
-    try {
-      await video.play();
-    } catch {
-      continuousPlayActive = false;
-    }
-
-    let frameIndex = 0;
-    const frameStepSec = 1 / profile.fps;
-    let lastMediaTime = currentInterval.startSec;
-    let stallTicks = 0;
-
-    while (frameIndex < totalFrames) {
-      if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-
-      const targetClipTimeSec = frameIndex * frameStepSec;
-      let mediaTime = video.currentTime;
-
-      if (continuousPlayActive) {
-        mediaTime = await waitNextDecodedVideoFrame(video, signal);
-
-        if (mediaTime >= currentInterval.endSec - 0.03 || video.ended) {
-          const hasNextInterval = intervalIdx + 1 < intervals.length;
-          const remainingFrames = totalFrames - frameIndex;
-          if (hasNextInterval || remainingFrames > Math.ceil(profile.fps * 0.5)) {
-            priorDurationSec += Math.max(
-              0.2,
-              currentInterval.endSec - currentInterval.startSec
-            );
-            intervalIdx = (intervalIdx + 1) % intervals.length;
-            currentInterval = intervals[intervalIdx];
-            video.pause();
-            await seekOnceForIntervalStart(video, currentInterval.startSec, signal);
-            video.playbackRate = profile.playbackRate;
-            await video.play().catch(() => {
-              continuousPlayActive = false;
-            });
-            mediaTime = currentInterval.startSec;
-            lastMediaTime = mediaTime;
-            stallTicks = 0;
-          } else {
-            video.pause();
-            mediaTime = Math.min(mediaTime, currentInterval.endSec - 0.02);
-            priorDurationSec = Math.max(priorDurationSec, targetClipTimeSec);
-          }
-        }
-
-        if (Math.abs(mediaTime - lastMediaTime) < 0.002) {
-          stallTicks++;
-          if (stallTicks > 8) {
-            const nextSec = Math.min(
-              currentInterval.endSec - 0.04,
-              mediaTime + frameStepSec
-            );
-            await seekOnceForIntervalStart(video, nextSec, signal);
-            mediaTime = nextSec;
-            stallTicks = 0;
-          }
-        } else {
-          stallTicks = 0;
-        }
-        lastMediaTime = mediaTime;
-      } else {
-        const relInClip = targetClipTimeSec;
-        let rem = relInClip;
-        let chosen = intervals[0];
-        for (const iv of intervals) {
-          const len = Math.max(0.2, iv.endSec - iv.startSec);
-          if (rem <= len) {
-            chosen = iv;
-            break;
-          }
-          rem -= len;
-        }
-        const seekSec = Math.min(chosen.endSec - 0.04, chosen.startSec + rem);
-        await seekOnceForIntervalStart(video, seekSec, signal);
-        mediaTime = seekSec;
-      }
-
-      const elapsedInClipSec =
-        priorDurationSec + Math.max(0, mediaTime - currentInterval.startSec);
-
-      if (continuousPlayActive && elapsedInClipSec + 0.004 < targetClipTimeSec) {
-        continue;
-      }
-
-      const framesToEmit = continuousPlayActive
-        ? Math.max(
-            1,
-            Math.min(
-              2,
-              Math.floor((elapsedInClipSec - targetClipTimeSec) / frameStepSec) + 1
-            )
-          )
-        : 1;
-
-      if (continuousPlayActive && framesToEmit > 1) {
-        video.pause();
-      }
-
-      for (let k = 0; k < framesToEmit && frameIndex < totalFrames; k++) {
-        const emitTimeSec = frameIndex * frameStepSec;
-        const frameBitmap = await createImageBitmap(video);
-        const frameAck = awaitWorkerReply('frame_done');
-        worker.postMessage(
-          {
-            type: 'frame',
-            frameIndex,
-            timeSec: emitTimeSec,
-            sourceTimeSec: mediaTime,
-            bitmap: frameBitmap,
-            sourceWidth: srcW,
-            sourceHeight: srcH,
-          },
-          [frameBitmap]
-        );
-        await frameAck;
-        frameIndex++;
-
-        if (frameIndex % 12 === 0 || frameIndex === totalFrames) {
-          onProgressPct(12 + Math.round((frameIndex / totalFrames) * 82));
-          if (frameIndex % 36 === 0) {
-            onStatus(
-              `${actionSummary} (${Math.round(
-                (frameIndex / totalFrames) * 100
-              )}% · ${frameIndex}/${totalFrames} frames)...`
-            );
-          }
-        }
-      }
-
-      if (continuousPlayActive && video.paused && frameIndex < totalFrames) {
-        video.playbackRate = profile.playbackRate;
-        await video.play().catch(() => {
-          continuousPlayActive = false;
-        });
-      }
-    }
-
-    video.pause();
-    onStatus('Finalizing H.264 + AAC MP4 container...');
-    const finishPromise = awaitWorkerReply('complete');
-    worker.postMessage({ type: 'finish' });
-    const completeData = await finishPromise;
-
-    const mp4Buffer = completeData.buffer as ArrayBuffer;
-    const finalBlob = new Blob([mp4Buffer], { type: 'video/mp4' });
-    const blobUrl = URL.createObjectURL(finalBlob);
-    onProgressPct(100);
-
-    return {
-      blob: finalBlob,
-      blobUrl,
-      sizeBytes: finalBlob.size,
-      durationSec: Number(lockedDurationSec.toFixed(2)),
-      width: profile.width,
-      height: profile.height,
-      fps: profile.fps,
-      delogoCount,
-      bumperTrimmedSec: clip.bumperTrimmedSec,
-      safeCropApplied: clip.safeCropApplied,
-      characterMode,
-      renderEngine: activeCodecLabel,
-    };
-  } finally {
-    signal?.removeEventListener('abort', onAbort);
-    portraitBitmap?.close();
-    worker.terminate();
     video.pause();
     video.removeAttribute('src');
     video.load();
-    URL.revokeObjectURL(videoUrl);
-  }
-}
-
-async function renderSceneWebCodecsWorker(
-  opts: DocumentarySceneRenderOptions,
-  profile: DeviceRenderProfile
-): Promise<RenderedHardwareMp4> {
-  const {
-    chapter,
-    audio,
-    scriptText,
-    beats,
-    language,
-    characterEnabled,
-    characterPortraitUrl,
-    onStatus,
-    onProgressPct,
-    signal,
-  } = opts;
-
-  if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-
-  const lockedDurationSec = chapter.targetDurationSec;
-  const totalFrames = Math.max(
-    profile.fps * 3,
-    Math.round(lockedDurationSec * profile.fps)
-  );
-
-  let portraitBitmap: ImageBitmap | null = null;
-  let portraitLandmarks: CharacterFaceLandmarks | null = null;
-  let characterMode = 'disabled';
-  if (characterEnabled && characterPortraitUrl) {
-    try {
-      const loaded = await loadPortraitBitmapWithOfflineRig(
-        characterPortraitUrl
-      );
-      portraitBitmap = loaded.bitmap;
-      portraitLandmarks = loaded.landmarks;
-      characterMode = `offline-phoneme-rig (${loaded.landmarks.detectorEngine})`;
-    } catch {
-      portraitBitmap = null;
-      portraitLandmarks = null;
-      characterMode = 'disabled';
-    }
-  }
-
-  let sceneBgBitmap: ImageBitmap | null = null;
-  if (chapter.externalVisualDataUrl) {
-    try {
-      const resp = await cachedFetchResponse(chapter.externalVisualDataUrl, {
-        signal,
-      });
-      if (resp.ok) {
-        sceneBgBitmap = await createImageBitmap(await resp.blob());
-      }
-    } catch {
-      sceneBgBitmap = null;
-    }
-  }
-
-  const worker = new Worker(new URL('./renderWorker.ts', import.meta.url), {
-    type: 'module',
-  });
-
-  const onAbort = () => {
-    try {
-      worker.postMessage({ type: 'abort' });
-    } catch {
-      // ignore
-    }
-    worker.terminate();
   };
-  signal?.addEventListener('abort', onAbort, { once: true });
 
   try {
-    const awaitWorkerReply = createWorkerRpc(worker, signal);
-    onStatus(
-      `Step 5: Rendering ${chapter.visualEngineLabel} (${profile.width}×${profile.height} @ ${profile.fps}fps)...`
-    );
+    let waitResolver: ((msg: Record<string, unknown>) => void) | null = null;
+    let waitRejecter: ((err: Error) => void) | null = null;
 
-    const pcmCopy = new Float32Array(audio.pcmMono);
-    const ampCopy = new Float32Array(audio.amplitudeEnvelope);
-    const mouthCopy = new Float32Array(audio.mouthOpenEnvelope);
-    const initTransfer: Transferable[] = [
-      pcmCopy.buffer,
-      ampCopy.buffer,
-      mouthCopy.buffer,
-    ];
-    if (portraitBitmap) initTransfer.push(portraitBitmap);
-    if (sceneBgBitmap) initTransfer.push(sceneBgBitmap);
+    worker.onmessage = (event: MessageEvent<Record<string, unknown>>) => {
+      const data = event.data;
+      if (data.type === 'error') {
+        const err = new Error(String(data.message || 'Render worker error'));
+        if (waitRejecter) {
+          const rej = waitRejecter;
+          waitResolver = null;
+          waitRejecter = null;
+          rej(err);
+        }
+        return;
+      }
+      if (waitResolver) {
+        const res = waitResolver;
+        waitResolver = null;
+        waitRejecter = null;
+        res(data);
+      }
+    };
 
-    const readyPromise = awaitWorkerReply('ready');
+    worker.onerror = (event) => {
+      const err = new Error(event.message || 'Render worker crashed.');
+      if (waitRejecter) {
+        const rej = waitRejecter;
+        waitResolver = null;
+        waitRejecter = null;
+        rej(err);
+      }
+    };
+
+    const nextWorkerReply = (): Promise<Record<string, unknown>> =>
+      new Promise((resolve, reject) => {
+        waitResolver = resolve;
+        waitRejecter = reject;
+      });
+
+    // Copy PCM buffer for zero-copy transfer into worker
+    const pcmCopy = new Float32Array(voice.pcmSamples);
+    const readyPromise = nextWorkerReply();
     worker.postMessage(
       {
         type: 'init',
-        renderMode: 'scene',
-        width: profile.width,
-        height: profile.height,
-        fps: profile.fps,
-        bitrate: profile.bitrate,
-        durationSec: lockedDurationSec,
-        scriptText,
-        beats: audio.alignedBeats.length > 0 ? audio.alignedBeats : beats,
-        wordTimings: audio.wordTimings,
+        width,
+        height,
+        fps,
+        durationSec,
+        bitrate,
         language,
-        safeCropInsets: { top: 0, bottom: 0, left: 0, right: 0 },
-        watermarkZones: [],
-        climaxSecond: chapter.climaxSec,
-        portraitBitmap,
-        portraitLandmarks,
-        pcmMono: pcmCopy,
-        sampleRate: audio.sampleRate,
-        amplitudeEnvelope: ampCopy,
-        mouthOpenEnvelope: mouthCopy,
-        envelopeFps: audio.envelopeFps,
-        sceneStyle: chapter.style,
-        shaderPreset: chapter.shaderPreset,
-        accentHex: chapter.accentHex,
-        chapterTitle: chapter.title,
-        captionCallout: chapter.captionCallout,
-        sceneBgBitmap,
+        scriptText: metadata.voiceover,
+        beats: metadata.beats,
+        wordTimings: voice.wordTimings,
+        safeCropInsets: clip.safeCropInsets,
+        watermarkZones: clip.watermarkZones,
+        sampleRate: voice.sampleRate,
+        pcmSamples: pcmCopy.buffer,
       },
-      initTransfer
+      [pcmCopy.buffer]
     );
-    portraitBitmap = null;
-    sceneBgBitmap = null;
+    await readyPromise;
 
-    const readyData = await readyPromise;
-    const hwAccel = String(readyData.hardwareAcceleration ?? 'prefer-hardware');
-    const engineName = `${chapter.visualEngineLabel} · ${
-      hwAccel === 'prefer-hardware' ? 'WebCodecs H.264 GPU' : 'WebGL2 H.264'
-    }`;
-    onProgressPct(10);
+    for (let i = 0; i < totalFrames; i++) {
+      if (signal?.aborted) {
+        throw new DOMException('Render cancelled', 'AbortError');
+      }
 
-    const frameStepSec = 1 / profile.fps;
-    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
-      if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-      const timeSec = frameIndex * frameStepSec;
-      const frameAck = awaitWorkerReply('frame_done');
-      worker.postMessage({
-        type: 'render_scene_frame',
-        frameIndex,
-        timeSec,
-      });
-      await frameAck;
+      const timeSec = i / fps;
+      const sourceTimeSec = clip.trimRange.startSec + timeSec;
+      await seekVideoPrecise(video, sourceTimeSec);
 
-      if (frameIndex % 15 === 0 || frameIndex === totalFrames - 1) {
-        onProgressPct(10 + Math.round(((frameIndex + 1) / totalFrames) * 84));
+      const bitmap = await createImageBitmap(video);
+      const ackPromise = nextWorkerReply();
+      worker.postMessage(
+        {
+          type: 'frame',
+          frameIndex: i,
+          timestampUs: Math.round(timeSec * 1_000_000),
+          timeSec,
+          bitmap,
+        },
+        [bitmap]
+      );
+      await ackPromise;
+
+      if (onProgress && (i % Math.max(1, Math.floor(fps / 2)) === 0 || i === totalFrames - 1)) {
+        const pct = Math.min(96, Math.round(((i + 1) / totalFrames) * 95));
+        onProgress(
+          pct,
+          `Encoding Clip ${clip.clipIndex}/${clip.totalClips} (${i + 1}/${totalFrames} frames · WebGL2/WebCodecs)...`
+        );
       }
     }
 
-    onStatus('Finalizing H.264 + AAC Documentary MP4...');
-    const finishPromise = awaitWorkerReply('complete');
+    onProgress?.(98, `Finalizing MP4 container for Clip ${clip.clipIndex}/${clip.totalClips}...`);
+    const donePromise = nextWorkerReply();
     worker.postMessage({ type: 'finish' });
-    const completeData = await finishPromise;
+    const doneMsg = await donePromise;
+    const mp4Buffer = doneMsg.mp4Buffer as ArrayBuffer;
 
-    const mp4Buffer = completeData.buffer as ArrayBuffer;
-    const finalBlob = new Blob([mp4Buffer], { type: 'video/mp4' });
-    const blobUrl = URL.createObjectURL(finalBlob);
-    onProgressPct(100);
+    if (!mp4Buffer || mp4Buffer.byteLength < 1024) {
+      throw new Error('WebCodecs worker produced an empty MP4 buffer.');
+    }
 
+    const blob = new Blob([mp4Buffer], { type: 'video/mp4' });
     return {
-      blob: finalBlob,
-      blobUrl,
-      sizeBytes: finalBlob.size,
-      durationSec: Number(lockedDurationSec.toFixed(2)),
-      width: profile.width,
-      height: profile.height,
-      fps: profile.fps,
-      delogoCount: 0,
-      bumperTrimmedSec: 0,
-      safeCropApplied: false,
-      characterMode,
-      renderEngine: engineName,
+      blob,
+      mimeType: 'video/mp4',
+      width,
+      height,
+      fps,
+      durationSec: Number(durationSec.toFixed(2)),
+      renderEngine: 'WebGL2 + WebCodecs H.264/AAC MP4',
     };
   } finally {
-    signal?.removeEventListener('abort', onAbort);
-    portraitBitmap?.close();
-    sceneBgBitmap?.close();
-    worker.terminate();
+    cleanup();
   }
 }
 
-export async function renderProductionMp4Gpu(
-  opts: GpuRenderOptions
-): Promise<RenderedHardwareMp4> {
-  const profile = detectDeviceRenderProfile();
+/**
+ * Fast, phone-safe fallback when WebCodecs H.264 is unavailable on a browser.
+ * Uses real-time Canvas 2D + WebAudio MediaStreamAudioDestinationNode + MediaRecorder
+ * (zero 5-minute mobile FFmpeg.wasm stalls).
+ */
+async function renderCanvasMediaRecorderFallback(params: {
+  source: SourceMediaItem;
+  clip: PreparedVisualClip;
+  metadata: TrendMetadata;
+  voice: SynthesizedVoiceResult;
+  language: OutputLanguage;
+  width: number;
+  height: number;
+  fps: number;
+  bitrate: number;
+  signal?: AbortSignal;
+  onProgress?: (pct: number, detail: string) => void;
+}): Promise<RenderedVideoBlobResult> {
+  const {
+    source,
+    clip,
+    metadata,
+    voice,
+    language,
+    width,
+    height,
+    fps,
+    bitrate,
+    signal,
+    onProgress,
+  } = params;
 
-  if (supportsWebCodecsWorkerPipeline()) {
-    try {
-      return await renderSinglePassWebCodecsWorker(opts, profile);
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') throw err;
-      opts.onStatus(
-        'WebCodecs hardware pass unavailable — lazy-loading FFmpeg.wasm fallback...'
-      );
-    }
+  if (typeof MediaRecorder === 'undefined') {
+    throw new Error('This browser supports neither WebCodecs nor MediaRecorder video export.');
   }
 
-  const { renderWithLazyFFmpegFallback } = await import('./ffmpegFallback');
-  return renderWithLazyFFmpegFallback({
-    sourceVideoBlob: opts.source.blob,
-    sourceWidth: opts.source.width,
-    sourceHeight: opts.source.height,
-    targetWidth: profile.width,
-    targetHeight: profile.height,
-    targetFps: profile.fps,
-    trimRange: opts.clip.trimRange,
-    safeCropInsets: opts.clip.safeCropInsets,
-    watermarkZones: opts.clip.watermarkZones,
-    bumperTrimmedSec: opts.clip.bumperTrimmedSec,
-    lockedDurationSec: opts.clip.lockedVisualDurationSec,
-    audio: opts.audio,
-    scriptText: opts.scriptText,
-    beats: opts.beats,
-    language: opts.language,
-    climaxSecond: opts.clip.climaxSec,
-    characterEnabled: opts.characterEnabled,
-    characterPortraitUrl: opts.characterPortraitUrl,
-    onStatus: opts.onStatus,
-    onProgressPct: opts.onProgressPct,
-    signal: opts.signal,
+  const durationSec = Math.max(
+    1.5,
+    Math.min(clip.lockedVisualDurationSec, voice.durationSec)
+  );
+
+  const mimeCandidates = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  const chosenMime =
+    mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.src = source.objectUrl;
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(
+      () => reject(new Error('Timed out loading video for Canvas MediaRecorder export.')),
+      15000
+    );
+    video.onloadeddata = () => {
+      window.clearTimeout(timer);
+      resolve();
+    };
+    video.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error('Unable to decode video for Canvas MediaRecorder export.'));
+    };
+    video.load();
   });
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D context unavailable.');
+
+  const captionChunks = buildCaptionChunks(
+    metadata.voiceover,
+    durationSec,
+    language,
+    metadata.beats,
+    voice.wordTimings
+  );
+
+  // Build real-time audio stream from mastered AudioBuffer
+  const audioCtx = new AudioContext({ sampleRate: voice.sampleRate });
+  const audioDest = audioCtx.createMediaStreamDestination();
+  const audioSource = audioCtx.createBufferSource();
+  const playBuf = audioCtx.createBuffer(
+    1,
+    voice.pcmSamples.length,
+    voice.sampleRate
+  );
+  playBuf.copyToChannel(new Float32Array(voice.pcmSamples), 0);
+  audioSource.buffer = playBuf;
+  audioSource.connect(audioDest);
+
+  const canvasStream = canvas.captureStream(fps);
+  const combinedStream = new MediaStream([
+    ...canvasStream.getVideoTracks(),
+    ...audioDest.stream.getAudioTracks(),
+  ]);
+
+  const chunks: BlobPart[] = [];
+  const recorder = new MediaRecorder(combinedStream, {
+    mimeType: chosenMime,
+    videoBitsPerSecond: bitrate,
+    audioBitsPerSecond: 128_000,
+  });
+  recorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+  };
+
+  const crop = clip.safeCropInsets;
+  const vw = video.videoWidth || source.width || width;
+  const vh = video.videoHeight || source.height || height;
+  const sx = Math.round(vw * crop.left);
+  const sy = Math.round(vh * crop.top);
+  const sw = Math.max(16, Math.round(vw * (1 - crop.left - crop.right)));
+  const sh = Math.max(16, Math.round(vh * (1 - crop.top - crop.bottom)));
+
+  // Cover-fit rectangle calculation
+  const srcAspect = sw / Math.max(1, sh);
+  const dstAspect = width / Math.max(1, height);
+  let drawSx = sx;
+  let drawSy = sy;
+  let drawSw = sw;
+  let drawSh = sh;
+  if (srcAspect > dstAspect) {
+    drawSw = Math.round(sh * dstAspect);
+    drawSx = sx + Math.round((sw - drawSw) / 2);
+  } else {
+    drawSh = Math.round(sw / dstAspect);
+    drawSy = sy + Math.round((sh - drawSh) / 2);
+  }
+
+  let rafId = 0;
+
+  try {
+    await seekVideoPrecise(video, clip.trimRange.startSec);
+    if (audioCtx.state === 'suspended') {
+      await audioCtx.resume();
+    }
+
+    const stoppedPromise = new Promise<void>((resolve) => {
+      recorder.onstop = () => resolve();
+    });
+
+    recorder.start(250);
+    audioSource.start();
+    await video.play();
+
+    const startWallMs = performance.now();
+
+    await new Promise<void>((resolve, reject) => {
+      const tick = () => {
+        if (signal?.aborted) {
+          reject(new DOMException('Render cancelled', 'AbortError'));
+          return;
+        }
+        const elapsedSec = (performance.now() - startWallMs) / 1000;
+        if (elapsedSec >= durationSec) {
+          resolve();
+          return;
+        }
+
+        ctx.save();
+        ctx.filter = 'contrast(1.07) saturate(1.12)';
+        ctx.drawImage(video, drawSx, drawSy, drawSw, drawSh, 0, 0, width, height);
+        ctx.restore();
+
+        // Time-windowed corner delogo patch
+        for (const z of clip.watermarkZones) {
+          if (elapsedSec >= z.startSec && elapsedSec <= z.endSec) {
+            const zx = Math.round(z.box[0] * width);
+            const zy = Math.round(z.box[1] * height);
+            const zw = Math.max(8, Math.round((z.box[2] - z.box[0]) * width));
+            const zh = Math.max(8, Math.round((z.box[3] - z.box[1]) * height));
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(zx, zy, zw, zh);
+            ctx.clip();
+            ctx.filter = 'blur(12px)';
+            ctx.drawImage(video, drawSx, drawSy, drawSw, drawSh, 0, 0, width, height);
+            ctx.restore();
+          }
+        }
+
+        drawCapCutPopCaption({
+          ctx,
+          chunks: captionChunks,
+          timeSec: elapsedSec,
+          language,
+          canvasWidth: width,
+          canvasHeight: height,
+        });
+
+        const pct = Math.min(96, Math.round((elapsedSec / durationSec) * 96));
+        onProgress?.(
+          pct,
+          `Recording Clip ${clip.clipIndex}/${clip.totalClips} (${elapsedSec.toFixed(1)}s/${durationSec.toFixed(1)}s · Canvas MediaRecorder)...`
+        );
+
+        rafId = requestAnimationFrame(tick);
+      };
+      rafId = requestAnimationFrame(tick);
+    });
+
+    if (recorder.state !== 'inactive') {
+      recorder.stop();
+    }
+    await stoppedPromise;
+
+    const cleanMime = chosenMime.startsWith('video/mp4') ? 'video/mp4' : 'video/webm';
+    const blob = new Blob(chunks, { type: cleanMime });
+    if (blob.size < 1024) {
+      throw new Error('MediaRecorder produced an empty video file.');
+    }
+
+    return {
+      blob,
+      mimeType: cleanMime,
+      width,
+      height,
+      fps,
+      durationSec: Number(durationSec.toFixed(2)),
+      renderEngine:
+        cleanMime === 'video/mp4'
+          ? 'Canvas + MediaRecorder MP4'
+          : 'Canvas + MediaRecorder WebM',
+    };
+  } finally {
+    if (rafId) cancelAnimationFrame(rafId);
+    try {
+      audioSource.stop();
+    } catch {
+      // ignore
+    }
+    combinedStream.getTracks().forEach((t) => t.stop());
+    try {
+      await audioCtx.close();
+    } catch {
+      // ignore
+    }
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  }
 }
 
-export async function renderDocumentarySceneMp4Gpu(
-  opts: DocumentarySceneRenderOptions
-): Promise<RenderedHardwareMp4> {
+/**
+ * STEP 5 (Fast, Phone-Safe Mux & Output):
+ * Uses WebGL2 + WebCodecs H.264/AAC MP4 worker as primary path, falling back instantly
+ * to real-time Canvas + MediaRecorder + WebAudio (zero mobile FFmpeg.wasm stalls).
+ */
+export async function renderProductionMp4Gpu(params: {
+  source: SourceMediaItem;
+  clip: PreparedVisualClip;
+  metadata: TrendMetadata;
+  voice: SynthesizedVoiceResult;
+  language: OutputLanguage;
+  signal?: AbortSignal;
+  onProgress?: (pct: number, detail: string) => void;
+}): Promise<RenderedVideoBlobResult> {
   const profile = detectDeviceRenderProfile();
+  const { width, height } = computeTargetDimensions(params.source, profile.isMobile);
 
-  if (supportsWebCodecsWorkerPipeline()) {
+  if (profile.supportsWebCodecs) {
     try {
-      return await renderSceneWebCodecsWorker(opts, profile);
+      return await renderSinglePassWebCodecsWorker({
+        ...params,
+        width,
+        height,
+        fps: profile.fps,
+        bitrate: profile.bitrate,
+      });
     } catch (err) {
       if ((err as Error).name === 'AbortError') throw err;
-      opts.onStatus(
-        'WebCodecs unavailable — lazy-loading FFmpeg.wasm scene fallback...'
+      params.onProgress?.(
+        5,
+        'Switching to fast Canvas MediaRecorder fallback for this device...'
       );
     }
   }
 
-  const { renderDocumentarySceneFallback } = await import('./ffmpegFallback');
-  return renderDocumentarySceneFallback({
-    chapter: opts.chapter,
-    targetWidth: profile.width,
-    targetHeight: profile.height,
-    targetFps: profile.fps,
-    audio: opts.audio,
-    scriptText: opts.scriptText,
-    beats: opts.beats,
-    language: opts.language,
-    characterEnabled: opts.characterEnabled,
-    characterPortraitUrl: opts.characterPortraitUrl,
-    onStatus: opts.onStatus,
-    onProgressPct: opts.onProgressPct,
-    signal: opts.signal,
+  return renderCanvasMediaRecorderFallback({
+    ...params,
+    width,
+    height,
+    fps: profile.fps,
+    bitrate: profile.bitrate,
   });
 }
