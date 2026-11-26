@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import { pickNormalizedEnvKey } from './src/lib/env';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
@@ -11,14 +12,13 @@ export default defineConfig(({ mode }) => {
     viteKey: string,
     rawKey: string,
     allowRawOutsidePages = false
-  ): string => {
-    const fromVite = process.env[viteKey] || env[viteKey] || '';
-    const fromRaw =
-      isGithubPages || allowRawOutsidePages
-        ? process.env[rawKey] || env[rawKey] || ''
-        : '';
-    return (fromVite || fromRaw).trim();
-  };
+  ): string =>
+    pickNormalizedEnvKey(
+      process.env[viteKey],
+      env[viteKey],
+      isGithubPages || allowRawOutsidePages ? process.env[rawKey] : '',
+      isGithubPages || allowRawOutsidePages ? env[rawKey] : ''
+    );
 
   const geminiStaticKey = readSafeKey('VITE_GEMINI_API_KEY', 'GEMINI_API_KEY');
   const youtubeStaticKey = readSafeKey('VITE_YOUTUBE_API_KEY', 'YOUTUBE_API_KEY');

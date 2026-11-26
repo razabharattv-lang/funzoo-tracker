@@ -8,8 +8,11 @@ import { OutputDeckCard } from './components/OutputDeckCard';
 import { RecentRendersView } from './components/RecentRendersView';
 import { probeVideoBlobToSource } from './lib/videoProbe';
 import {
+  buildYouTubeContextNotice,
   extractVideoUrl,
+  fetchYouTubeOEmbedContext,
   YOUTUBE_DIRECT_FETCH_BLOCKED_MSG,
+  type YouTubeOEmbedContext,
 } from './lib/urlExtractor';
 import {
   deleteRenderRecord,
@@ -83,8 +86,12 @@ export function App() {
     loadSavedRenders()
   );
 
+  const youtubeLinkContextRef = useRef<YouTubeOEmbedContext | null>(null);
+  const sourceMediaRef = useRef<SourceMediaItem | null>(null);
+
   const abortRef = useRef<AbortController | null>(null);
   const linkAbortRef = useRef<AbortController | null>(null);
+  const oembedAbortRef = useRef<AbortController | null>(null);
   const sourceLoadSeqRef = useRef(0);
   const pipelineRunSeqRef = useRef(0);
   const sourceUrlRef = useRef<string | null>(null);
@@ -113,6 +120,7 @@ export function App() {
       active = false;
       abortRef.current?.abort();
       linkAbortRef.current?.abort();
+      oembedAbortRef.current?.abort();
       safeRevokeObjectUrl(sourceUrlRef.current);
       renderedUrlsRef.current.forEach((u) => safeRevokeObjectUrl(u));
     };
@@ -131,9 +139,52 @@ export function App() {
         safeRevokeObjectUrl(sourceUrlRef.current);
       }
       sourceUrlRef.current = next?.objectUrl ?? null;
+      sourceMediaRef.current = next;
       setSourceMedia(next);
     },
     [safeRevokeObjectUrl]
+  );
+
+  const updateYoutubeLinkContext = useCallback(
+    (next: YouTubeOEmbedContext | null) => {
+      youtubeLinkContextRef.current = next;
+    },
+    []
+  );
+
+  const fetchYouTubeMetadataInBackground = useCallback(
+    (rawUrl: string) => {
+      oembedAbortRef.current?.abort();
+      const extracted = extractVideoUrl(rawUrl);
+      if (!extracted?.isYouTube || !extracted.youtubeVideoId) {
+        updateYoutubeLinkContext(null);
+        return;
+      }
+
+      const controller = new AbortController();
+      oembedAbortRef.current = controller;
+      updateYoutubeLinkContext(null);
+
+      void fetchYouTubeOEmbedContext(extracted.cleanUrl, controller.signal).then(
+        (ctx) => {
+          if (controller.signal.aborted || !ctx) return;
+          updateYoutubeLinkContext(ctx);
+          if (!sourceMediaRef.current || sourceMediaRef.current.sourceType !== 'upload') {
+            setSourceError(buildYouTubeContextNotice(ctx));
+          } else {
+            setProgress((prev) =>
+              prev.status === 'idle'
+                ? {
+                    ...prev,
+                    statusDetail: `Video ready + YouTube context "${ctx.title}". Click Run Pipeline.`,
+                  }
+                : prev
+            );
+          }
+        }
+      );
+    },
+    [updateYoutubeLinkContext]
   );
 
   const replaceRenderedClips = useCallback(
@@ -166,9 +217,13 @@ export function App() {
         }
         replaceSourceMedia(probed);
         replaceRenderedClips([]);
+        const ytCtx = youtubeLinkContextRef.current;
+        const ytSuffix = ytCtx?.title
+          ? ` · Linked context: "${ytCtx.title}"`
+          : '';
         setProgress({
           ...INITIAL_PROGRESS,
-          statusDetail: `Video ready (${probed.durationSec.toFixed(1)}s · ${probed.width}×${probed.height}). Click Run Pipeline.`,
+          statusDetail: `Video ready (${probed.durationSec.toFixed(1)}s · ${probed.width}×${probed.height}${ytSuffix}). Click Run Pipeline.`,
         });
       } catch (err) {
         if (loadSeq !== sourceLoadSeqRef.current) return;
@@ -191,7 +246,10 @@ export function App() {
     }
     if (extracted.isYouTube) {
       replaceSourceMedia(null);
-      setSourceError(YOUTUBE_DIRECT_FETCH_BLOCKED_MSG);
+      setSourceError(buildYouTubeContextNotice(youtubeLinkContextRef.current));
+      if (!youtubeLinkContextRef.current) {
+        fetchYouTubeMetadataInBackground(controls.videoUrl);
+      }
       return;
     }
 
@@ -235,7 +293,13 @@ export function App() {
         setIsFetchingLink(false);
       }
     }
-  }, [controls.videoUrl, replaceRenderedClips, replaceSourceMedia, safeRevokeObjectUrl]);
+  }, [
+    controls.videoUrl,
+    fetchYouTubeMetadataInBackground,
+    replaceRenderedClips,
+    replaceSourceMedia,
+    safeRevokeObjectUrl,
+  ]);
 
   const handleClearSource = useCallback(() => {
     replaceSourceMedia(null);
@@ -244,13 +308,20 @@ export function App() {
 
   const handleResetWorkspace = useCallback(() => {
     if (progress.status === 'running') return;
+    oembedAbortRef.current?.abort();
+    updateYoutubeLinkContext(null);
     replaceSourceMedia(null);
     replaceRenderedClips([]);
     setControls(INITIAL_CONTROLS);
     setSourceError(null);
     setProgress(INITIAL_PROGRESS);
     setActiveTab('studio');
-  }, [progress.status, replaceRenderedClips, replaceSourceMedia]);
+  }, [
+    progress.status,
+    replaceRenderedClips,
+    replaceSourceMedia,
+    updateYoutubeLinkContext,
+  ]);
 
   const handleCancelPipeline = useCallback(() => {
     abortRef.current?.abort();
@@ -358,6 +429,23 @@ export function App() {
         'Step 3/5: Inspecting video frames & fetching live US YouTube niche trends...'
       );
 
+      const activeYoutubeCtx = youtubeLinkContextRef.current;
+      const effectiveSourceLabel = activeYoutubeCtx?.title
+        ? `${activeYoutubeCtx.title}${
+            activeYoutubeCtx.authorName ? ` — ${activeYoutubeCtx.authorName}` : ''
+          } (${activeSource.label})`
+        : activeSource.label;
+      const effectiveCustomAngle = activeYoutubeCtx?.title
+        ? [
+            controls.customAngle.trim(),
+            `YouTube context: "${activeYoutubeCtx.title}"${
+              activeYoutubeCtx.authorName ? ` by ${activeYoutubeCtx.authorName}` : ''
+            }`,
+          ]
+            .filter(Boolean)
+            .join(' | ')
+        : controls.customAngle;
+
       let sharedNicheTrends: YouTubeTrendVideo[] = [];
       const clipMetadataList: TrendMetadata[] = [];
       for (let i = 0; i < preparedClips.length; i++) {
@@ -368,10 +456,10 @@ export function App() {
 
         const meta = await translateClipAndBuildSeoStep3({
           clip,
-          sourceLabel: activeSource.label,
+          sourceLabel: effectiveSourceLabel,
           language: controls.language,
           aiEngine: controls.aiEngine,
-          customAngle: controls.customAngle,
+          customAngle: effectiveCustomAngle,
           trends: sharedNicheTrends,
           allowYouTubeLookup: i === 0,
           signal,
@@ -487,7 +575,7 @@ export function App() {
       const saved = saveRenderRecord({
         runTag,
         completedAt: new Date().toISOString(),
-        sourceLabel: activeSource.label,
+        sourceLabel: effectiveSourceLabel,
         sourceDurationSec: activeSource.durationSec,
         mode: activeSource.mode,
         customAngle: controls.customAngle,
@@ -566,11 +654,14 @@ export function App() {
                 }
                 onVideoUrlChange={(videoUrl) => {
                   const nextExtracted = extractVideoUrl(videoUrl);
-                  setSourceError(
-                    nextExtracted?.isYouTube
-                      ? YOUTUBE_DIRECT_FETCH_BLOCKED_MSG
-                      : null
-                  );
+                  if (nextExtracted?.isYouTube) {
+                    setSourceError(YOUTUBE_DIRECT_FETCH_BLOCKED_MSG);
+                    fetchYouTubeMetadataInBackground(videoUrl);
+                  } else {
+                    oembedAbortRef.current?.abort();
+                    updateYoutubeLinkContext(null);
+                    setSourceError(null);
+                  }
                   if (sourceMedia?.sourceType === 'link') {
                     replaceSourceMedia(null);
                   }
