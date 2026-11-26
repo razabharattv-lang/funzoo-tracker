@@ -61,7 +61,7 @@ const INITIAL_CONTROLS: StudioControlsState = {
 
 const INITIAL_CONNECTION_STATUS: ConnectionStatusState = {
   gemini: 'Fallback',
-  nvidia: 'Key-Missing',
+  nvidia: 'Static-Skip',
   youtube: 'Fallback',
   voice: 'Browser-Speech',
   backendAvailable: false,
@@ -316,6 +316,9 @@ export function App() {
         onProgress: (detail) =>
           markStep('step_1_fetch_clip', 16, `Step 1/5: ${detail}`),
       });
+      if (segments.length === 0) {
+        throw new Error('Step 1 returned no usable video segments to process.');
+      }
 
       completedSteps.push('step_1_fetch_clip');
 
@@ -335,6 +338,9 @@ export function App() {
       });
 
       if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      if (preparedClips.length === 0) {
+        throw new Error('Step 2 failed to prepare vertical visual clips.');
+      }
       completedSteps.push('step_2_clean_grade');
 
       // STEP 3: Vision-to-Action + Niche YouTube Trends (1 single YouTube call on detected topic)
@@ -454,6 +460,9 @@ export function App() {
         });
       }
 
+      if (outputs.length === 0) {
+        throw new Error('Step 5 produced no playable output clips.');
+      }
       completedSteps.push('step_5_mux_output');
       replaceRenderedClips(outputs);
 

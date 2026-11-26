@@ -535,24 +535,24 @@ async function runSingleMediaRecorderAttempt(params: {
       // Ignore if browser restricts playbackRate on this stream
     }
 
-    // Precompute soft radial vignette gradient for crisp cinematic finish
+    // Precompute balanced cinematic radial vignette for crisp subject focus
     const vignetteGrad = ctx.createRadialGradient(
       width * 0.5,
       height * 0.48,
-      Math.min(width, height) * 0.28,
+      Math.min(width, height) * 0.26,
       width * 0.5,
       height * 0.5,
-      Math.max(width, height) * 0.78
+      Math.max(width, height) * 0.76
     );
     vignetteGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
-    vignetteGrad.addColorStop(0.75, 'rgba(10, 18, 34, 0.08)');
-    vignetteGrad.addColorStop(1, 'rgba(6, 12, 24, 0.34)');
+    vignetteGrad.addColorStop(0.7, 'rgba(10, 18, 34, 0.12)');
+    vignetteGrad.addColorStop(1, 'rgba(6, 12, 24, 0.42)');
 
-    // Subtle cinema split-tone wash (cool shadow top / warm highlight center-low)
+    // Visible cinema split-tone wash (rich teal shadows / warm golden highlights)
     const gradeWash = ctx.createLinearGradient(0, 0, 0, height);
-    gradeWash.addColorStop(0, 'rgba(14, 116, 144, 0.09)');
-    gradeWash.addColorStop(0.55, 'rgba(255, 196, 120, 0.06)');
-    gradeWash.addColorStop(1, 'rgba(15, 23, 42, 0.14)');
+    gradeWash.addColorStop(0, 'rgba(14, 116, 144, 0.15)');
+    gradeWash.addColorStop(0.5, 'rgba(255, 190, 110, 0.10)');
+    gradeWash.addColorStop(1, 'rgba(12, 20, 38, 0.20)');
 
     let drawnFrames = 0;
     const paintFrame = (elapsedSec: number) => {
@@ -561,10 +561,10 @@ async function runSingleMediaRecorderAttempt(params: {
         ctx.fillRect(0, 0, width, height);
 
         if (video.readyState >= 2) {
-          // Full-bleed 9:16 anti-copyright push-in (1.07x -> 1.14x) + subtle motion drift (no dark sidebars)
+          // Full-bleed 9:16 anti-copyright push-in (1.08x -> 1.15x) + subtle motion drift (no dark sidebars)
           const tFrac = Math.max(0, Math.min(1, elapsedSec / Math.max(0.1, durationSec)));
           const smoothT = tFrac * tFrac * (3 - 2 * tFrac);
-          const zoom = 1.07 + 0.07 * smoothT;
+          const zoom = 1.08 + 0.07 * smoothT;
           const zoomSw = Math.max(16, Math.round(drawSw / zoom));
           const zoomSh = Math.max(16, Math.round(drawSh / zoom));
           const zoomSx = Math.max(
@@ -583,11 +583,11 @@ async function runSingleMediaRecorderAttempt(params: {
           );
 
           ctx.save();
-          ctx.filter = 'contrast(1.18) saturate(1.28) brightness(1.03)';
+          ctx.filter = 'contrast(1.24) saturate(1.34) brightness(1.04)';
           ctx.drawImage(video, zoomSx, zoomSy, zoomSw, zoomSh, 0, 0, width, height);
           ctx.restore();
 
-          // Noticeable cinema split-tone wash + crisp soft vignette
+          // Visible cinema split-tone wash + balanced clarity vignette
           ctx.save();
           ctx.globalCompositeOperation = 'soft-light';
           ctx.fillStyle = gradeWash;
@@ -597,21 +597,21 @@ async function runSingleMediaRecorderAttempt(params: {
           ctx.fillStyle = vignetteGrad;
           ctx.fillRect(0, 0, width, height);
 
-          // Seamless blended corner delogo patch (samples adjacent clean video area instead of dark box)
+          // Seamless blended corner delogo patch (samples adjacent clean video area with matching color grade)
           for (const z of clip.watermarkZones) {
             if (elapsedSec >= z.startSec && elapsedSec <= z.endSec) {
               const zx = Math.round(z.box[0] * width);
               const zy = Math.round(z.box[1] * height);
               const zw = Math.max(12, Math.round((z.box[2] - z.box[0]) * width));
               const zh = Math.max(12, Math.round((z.box[3] - z.box[1]) * height));
-              const radius = Math.min(20, Math.round(Math.min(zw, zh) * 0.28));
+              const radius = Math.min(22, Math.round(Math.min(zw, zh) * 0.3));
               const isTop = (z.box[1] + z.box[3]) * 0.5 < 0.5;
-              const shiftPx = isTop ? -Math.round(zh * 1.15) : Math.round(zh * 1.15);
+              const shiftPx = isTop ? -Math.round(zh * 1.18) : Math.round(zh * 1.18);
               ctx.save();
               ctx.beginPath();
               ctx.roundRect(zx, zy, zw, zh, radius);
               ctx.clip();
-              ctx.filter = 'blur(16px) contrast(1.12) saturate(1.2)';
+              ctx.filter = 'blur(18px) contrast(1.22) saturate(1.30) brightness(1.03)';
               ctx.drawImage(
                 video,
                 zoomSx,

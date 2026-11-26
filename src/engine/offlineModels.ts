@@ -435,26 +435,44 @@ export async function analyzeVideoTimelineLocally(
       ? { top: 0.02, bottom: 0.025, left: 0.015, right: 0.015 }
       : { top: 0, bottom: 0, left: 0, right: 0 };
 
+  // Trim leading dead-air / black fade-in if the very first frame is dark & static
+  const firstFrame = motionScores[0];
+  const secondFrame = motionScores[1];
+  const leadTrimSec =
+    duration >= 7 &&
+    firstFrame &&
+    secondFrame &&
+    firstFrame.luma < 14 &&
+    secondFrame.luma > 28
+      ? Math.min(1.0, Math.max(0.25, secondFrame.timeSec * 0.65))
+      : 0;
+  const usableStart = Number(leadTrimSec.toFixed(2));
+  const effectiveDuration = Math.max(1.5, duration - usableStart);
+
   const highActionWindows: LocalSceneScanResult['highActionWindows'] = [];
-  if (duration <= 65) {
+  if (duration <= 30) {
     const peak = motionScores.reduce(
       (best, cur) => (cur.score > best.score ? cur : best),
       motionScores[0] ?? { timeSec: duration * 0.45, score: 0.25, luma: 120 }
     );
     highActionWindows.push({
-      startSec: 0,
+      startSec: usableStart,
       endSec: Number(duration.toFixed(2)),
-      climaxSec: Number(peak.timeSec.toFixed(2)),
+      climaxSec: Number(Math.max(usableStart, peak.timeSec).toFixed(2)),
       motionScore: Number(peak.score.toFixed(3)),
     });
   } else {
-    const targetClips = 3;
-    const regionSpan = duration / targetClips;
-    const targetClipLen = Math.min(58, Math.max(30, regionSpan * 0.72));
+    // Long videos (>30s): slice into 2 strongest high-action clips (30-65s) or 3 clips (>65s)
+    const targetClips = duration <= 65 ? 2 : 3;
+    const regionSpan = effectiveDuration / targetClips;
+    const targetClipLen =
+      duration <= 65
+        ? Math.min(26, Math.max(13, regionSpan * 0.88))
+        : Math.min(38, Math.max(20, regionSpan * 0.78));
 
     for (let c = 0; c < targetClips; c++) {
-      const regStart = c * regionSpan;
-      const regEnd = (c + 1) * regionSpan;
+      const regStart = usableStart + c * regionSpan;
+      const regEnd = usableStart + (c + 1) * regionSpan;
       const candidates = motionScores.filter(
         (m) => m.timeSec >= regStart && m.timeSec <= regEnd
       );
@@ -585,7 +603,10 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
     const estEnd = (estStart + 2) % 24;
     const istStart = (avgUtcHour + 5) % 24;
     const istEnd = (istStart + 2) % 24;
-    liveUploadWindow = `YouTube Trend Peak (${trends.length} live videos): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`;
+    liveUploadWindow =
+      language === 'hi'
+        ? `यूट्यूब ट्रेंड पीक (${trends.length} लाइव वीडियो): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`
+        : `YouTube Trend Peak (${trends.length} live videos): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`;
   }
 
   // Compute non-repeating variant seed from clip metrics + session counter
@@ -762,29 +783,47 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
       ? `${displayTitleSubject}\n\nइस ${roundedDur} सेकंड की सस्पेंस क्लिप में:\n• तेज़ हुक और ${climaxSecRounded} सेकंड पर अनपेक्षित ट्विस्ट\n• फुल वर्टिकल फ्रेमिंग, सिनेमा कलर ग्रेड और दमदार हिंदी वॉइसओवर\n\nऐसे ही सस्पेंस और ट्विस्ट शॉर्ट्स के लिए सब्सक्राइब करें।`
       : `${displayTitleSubject}\n\nInside this ${roundedDur}-second suspense clip:\n• Dramatic hook building straight into the ${climaxSecRounded}s twist\n• Full-bleed vertical framing, ${lightingNote} cinema color grade, and powerful narration\n\nSubscribe for daily ${trendKeyword} twists and high-retention stories.`;
 
-  const tagList = [
-    ...(readableTopic ? [readableTopic.toLowerCase()] : []),
-    ...liveTrendTags.slice(0, 6),
-    language === 'hi' ? 'hindi explainer' : 'direct breakdown',
-    language === 'hi' ? 'hindi voiceover' : 'visual explainer',
-    language === 'hi' ? 'viral clip hindi' : 'us shorts explainer',
-    'shorts',
-    'reels',
-    'key moment',
-    trendKeyword.toLowerCase(),
-  ]
-    .filter((v, i, arr) => v.length > 1 && arr.indexOf(v) === i)
-    .slice(0, 12);
+  const tagList =
+    language === 'hi'
+      ? [
+          ...(readableTopic ? [readableTopic] : []),
+          'सस्पेंस शॉर्ट्स',
+          'हिंदी कहानी',
+          'ट्विस्ट वीडियो',
+          'वायरल शॉर्ट्स हिंदी',
+          'रोमांचक क्लिप',
+          'हिंदी वॉइसओवर',
+          'यूट्यूब शॉर्ट्स हिंदी',
+          'ट्रेंडिंग वीडियो',
+        ]
+          .filter((v, i, arr) => v.length > 1 && arr.indexOf(v) === i)
+          .slice(0, 10)
+      : [
+          ...(readableTopic ? [readableTopic.toLowerCase()] : []),
+          ...liveTrendTags.slice(0, 6),
+          'suspense shorts',
+          'plot twist story',
+          'viral shorts explained',
+          'shorts',
+          'reels',
+          'storytelling',
+          trendKeyword.toLowerCase(),
+        ]
+          .filter((v, i, arr) => v.length > 1 && arr.indexOf(v) === i)
+          .slice(0, 12);
 
-  const dynamicHashtags = liveTrendTags
-    .slice(0, 3)
-    .map((tg) => `#${tg.replace(/[^\p{L}\p{N}]+/gu, '')}`)
-    .filter((h) => h.length > 3);
+  const dynamicHashtags =
+    language === 'hi'
+      ? []
+      : liveTrendTags
+          .slice(0, 3)
+          .map((tg) => `#${tg.replace(/[^\p{L}\p{N}]+/gu, '')}`)
+          .filter((h) => h.length > 3);
 
   const baseHashtags =
     language === 'hi'
-      ? ['#Shorts', '#HindiExplainer', '#DirectBreakdown', '#ViralClip', '#TrendingIndia']
-      : ['#Shorts', '#Explainer', '#DirectBreakdown', '#ViralClip', '#TrendingUS'];
+      ? ['#सस्पेंस', '#हिंदीशॉर्ट्स', '#ट्विस्ट', '#वायरलवीडियो', '#रोमांचककहानी']
+      : ['#Shorts', '#Suspense', '#PlotTwist', '#ViralClip', '#Storytelling'];
   const hashtags = [...baseHashtags, ...dynamicHashtags]
     .filter((v, i, arr) => arr.indexOf(v) === i)
     .slice(0, 6)
@@ -793,7 +832,7 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
   const postingTime =
     liveUploadWindow ||
     (language === 'hi'
-      ? 'Best Upload Window: 6:30 PM – 9:00 PM IST (India Peak) | 9:00 AM – 11:30 AM EST (USA Morning)'
+      ? 'सबसे अच्छा अपलोड समय: 6:30 PM – 9:00 PM IST (भारत पीक) | 9:00 AM – 11:30 AM EST (अमेरिका मॉर्निंग)'
       : 'Best Upload Window: 11:30 AM – 2:00 PM EST & 6:00 PM – 8:30 PM EST (USA Peak) | 9:00 PM – 11:30 PM IST (India Peak)');
 
   return {

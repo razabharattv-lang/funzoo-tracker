@@ -172,6 +172,7 @@ export interface TrendMetadata {
 export type GeminiConnectionStatus = 'Connected' | 'Quota-Limit' | 'Fallback';
 export type NvidiaConnectionStatus =
   | 'Connected'
+  | 'Static-Skip'
   | 'CORS-Blocked'
   | 'Key-Missing'
   | 'Quota-Limit'

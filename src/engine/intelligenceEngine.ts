@@ -119,6 +119,7 @@ function formatHour12(hour24: number): string {
 
 function customizeSeoWithNicheYouTubeTrends(params: {
   detectedTopic: string;
+  language: OutputLanguage;
   title: string;
   description: string;
   tags: string;
@@ -132,7 +133,7 @@ function customizeSeoWithNicheYouTubeTrends(params: {
   hashtags: string;
   postingTime: string;
 } {
-  const { detectedTopic, trends } = params;
+  const { detectedTopic, language, trends } = params;
   if (trends.length === 0) {
     return {
       title: params.title,
@@ -140,6 +141,35 @@ function customizeSeoWithNicheYouTubeTrends(params: {
       tags: params.tags,
       hashtags: params.hashtags,
       postingTime: params.postingTime,
+    };
+  }
+
+  let postingTime = params.postingTime;
+  const validPubDates = trends
+    .map((t) => (t.publishedAt ? new Date(t.publishedAt) : null))
+    .filter((d): d is Date => Boolean(d && !Number.isNaN(d.getTime())));
+  if (validPubDates.length > 0) {
+    const avgUtcHour = Math.round(
+      validPubDates.reduce((acc, d) => acc + d.getUTCHours(), 0) / validPubDates.length
+    );
+    const estStart = (avgUtcHour - 5 + 24) % 24;
+    const estEnd = (estStart + 2) % 24;
+    const istStart = (avgUtcHour + 5) % 24;
+    const istEnd = (istStart + 2) % 24;
+    postingTime =
+      language === 'hi'
+        ? `यूट्यूब ट्रेंड पीक (${trends.length} लाइव शॉर्ट्स): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`
+        : `YouTube US Niche Peak (${trends.length} live Shorts · ${detectedTopic || 'Topic'}): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`;
+  }
+
+  // Keep Hindi Title, Description, Tags, Hashtags, and Upload Time strictly in Hindi (no English tag injection)
+  if (language === 'hi') {
+    return {
+      title: params.title,
+      description: params.description.trim(),
+      tags: params.tags,
+      hashtags: params.hashtags,
+      postingTime,
     };
   }
 
@@ -180,24 +210,9 @@ function customizeSeoWithNicheYouTubeTrends(params: {
     .slice(0, 7)
     .join(' ');
 
-  let postingTime = params.postingTime;
-  const validPubDates = trends
-    .map((t) => (t.publishedAt ? new Date(t.publishedAt) : null))
-    .filter((d): d is Date => Boolean(d && !Number.isNaN(d.getTime())));
-  if (validPubDates.length > 0) {
-    const avgUtcHour = Math.round(
-      validPubDates.reduce((acc, d) => acc + d.getUTCHours(), 0) / validPubDates.length
-    );
-    const estStart = (avgUtcHour - 5 + 24) % 24;
-    const estEnd = (estStart + 2) % 24;
-    const istStart = (avgUtcHour + 5) % 24;
-    const istEnd = (istStart + 2) % 24;
-    postingTime = `YouTube US Niche Peak (${trends.length} live Shorts · ${detectedTopic || 'Topic'}): ${formatHour12(estStart)} – ${formatHour12(estEnd)} EST | ${formatHour12(istStart)} – ${formatHour12(istEnd)} IST`;
-  }
-
   const topTrendRef = trends[0]?.title?.trim();
   const description =
-    topTrendRef && !params.description.toLowerCase().includes(nicheKeywords[0] || '__none__')
+    topTrendRef && nicheKeywords.length > 0 && !params.description.toLowerCase().includes(nicheKeywords[0])
       ? `${params.description}\n\nTrending niche keywords: ${nicheKeywords.slice(0, 4).join(' • ')}`
       : params.description;
 
@@ -254,39 +269,49 @@ export async function translateClipAndBuildSeoStep3(params: {
 
   const languageName =
     language === 'hi'
-      ? 'Hindi (dramatic, gripping, suspenseful spoken Devanagari Hindi)'
-      : 'English (USA — dramatic, high-emotion, suspenseful American storytelling Shorts/Reels English)';
+      ? 'Hindi (pure, punchy, dramatic Devanagari Hindi)'
+      : 'English (USA — sharp, dramatic, high-emotion American Shorts storytelling English)';
+  const strictLanguageRule =
+    language === 'hi'
+      ? 'Write voiceover, beats, title, description, tags, hashtags, and posting_time STRICTLY in Devanagari Hindi (keeping only EST/IST timezone abbreviations).'
+      : 'Write voiceover, beats, title, description, tags, hashtags, and posting_time STRICTLY in natural American English (USA).';
+  const hookEndSec = Number(Math.min(1.6, Math.max(1.1, maxSpeechSec * 0.18)).toFixed(1));
+  const targetBeatCount = Math.max(3, Math.min(6, Math.round(maxSpeechSec / 3.5)));
+  const beatSpanSec = Number(((maxSpeechSec - hookEndSec) / Math.max(1, targetBeatCount - 1)).toFixed(1));
+  const beat2EndSec = Number(Math.min(maxSpeechSec - 0.8, hookEndSec + beatSpanSec).toFixed(1));
+  const beat3EndSec = Number(Math.min(maxSpeechSec - 0.4, beat2EndSec + beatSpanSec).toFixed(1));
 
-  const systemPrompt = `You are a master High-Retention Viral Storyteller & YouTube Shorts SEO Strategist.
+  const systemPrompt = `You are a top on-camera YouTube Shorts & Reels creator and viral SEO strategist speaking directly to viewers to maximize 100%+ retention.
 You are inspecting a 3x2 contact sheet of 6 evenly spaced frames (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) taken directly from the user's real video.
 
-STRICT STORYTELLING & VISION RULES:
-1. REAL VISUALS ONLY: Name the exact real objects, people, animals, tools, food, or physical movements visible in Frames 1 through 6.
-2. SUSPENSE + TWIST STRUCTURE: Build genuine emotional tension from Frame 1, escalate the stakes through Frames 3–4, and hit an unforgettable twist or dramatic payoff in Frames 5–6!
-3. ZERO CANNED BOILERPLATE: Strictly FORBIDDEN phrases include "opening frame", "turning point", "second mark", "core detail", "wasted motion", "contact sheet", "crayon", or raw camera filenames like "1000179945".
-4. EXACT DURATION FIT: Write ~${targetWordCount} high-impact spoken words in ${languageName} with punchy dramatic sentences so the voiceover finishes cleanly before ${maxSpeechSec.toFixed(1)}s.
-5. POPULATE ALL SEO FIELDS: Return non-empty "detected_topic", "youtube_search_query", "title", "description", "tags", "hashtags", and "posting_time" (EST/IST). Return ONLY valid JSON.`;
+TOP-CREATOR HIGH-RETENTION RULES:
+1. 1.5-SECOND PATTERN-INTERRUPT HOOK: Beat 1 (0.0s to ${hookEndSec}s) MUST hit immediately with a sharp curiosity trigger or pattern-interrupt directly tied to Frame 1—speak directly to the viewer so nobody scrolls past!
+2. MICRO-TWISTS EVERY 3–4 SECONDS: Break the narration into ${targetBeatCount} fast, punchy, crystal-clear beats spaced every ~3–4 seconds—each beat drops a fresh visual reveal, tension spike, or micro-twist strictly explaining what is happening on screen in Frames 1–6.
+3. ZERO FILLER OR CANNED TEXT: Strictly FORBIDDEN phrases include "opening frame", "turning point", "second mark", "core detail", "wasted motion", "contact sheet", "crayon", or raw filenames like "1000179945".
+4. EXACT DURATION FIT: Write ~${targetWordCount} energetic, crystal-clear spoken words so delivery finishes cleanly before ${maxSpeechSec.toFixed(1)}s with zero cutoffs.
+5. STRICT LANGUAGE LOCK: ${strictLanguageRule} Return non-empty values for ALL JSON fields. Return ONLY valid JSON.`;
 
   const userPrompt = `CLIP HINT: ${safeTopicHint}
 CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (locked duration: ${targetDurSec.toFixed(1)}s, frame timestamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
 OUTPUT LANGUAGE: ${languageName}
-KEY POINTS TO KEEP: ${customAngle.trim() || 'Turn the real objects and step-by-step physical actions across all 6 frames into a gripping, suspenseful, twist-driven story.'}
+KEY POINTS TO KEEP: ${customAngle.trim() || 'Speak like a top creator: hit a sharp 1.5s curiosity pattern-interrupt, drop micro-twists every 3-4 seconds matching the exact real action across frames 1-6, and end on a punchy payoff.'}
 
 RETURN STRICT JSON ONLY:
 {
   "detected_topic": "Exact real subject/action visible on screen (2-5 words)",
   "youtube_search_query": "2-4 clean English YouTube Shorts search words for this exact niche",
-  "voiceover": "Suspenseful, emotional, twist-driven story narration matching the real on-screen visuals (~${targetWordCount} words, finishes before ${maxSpeechSec.toFixed(1)}s)",
+  "voiceover": "Top-creator direct-to-viewer narration starting with a 1.5s pattern-interrupt hook, micro-twists every 3-4s, and crystal-clear on-screen explanation (~${targetWordCount} words, finishes before ${maxSpeechSec.toFixed(1)}s) in ${languageName}",
   "beats": [
-    { "start_sec": 0.0, "end_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "text": "Dramatic suspense hook naming the exact subject/action in frames 1-2" },
-    { "start_sec": ${(maxSpeechSec * 0.32).toFixed(1)}, "end_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "text": "Rising tension describing what unfolds in frames 3-4" },
-    { "start_sec": ${(maxSpeechSec * 0.68).toFixed(1)}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Sharp twist or emotional payoff revealed in frames 5-6" }
+    { "start_sec": 0.0, "end_sec": ${hookEndSec}, "text": "Sharp 1.5s curiosity trigger / pattern-interrupt referencing frame 1 directly" },
+    { "start_sec": ${hookEndSec}, "end_sec": ${beat2EndSec}, "text": "Micro-twist 1 (~3-4s): crisp, energetic explanation of the action in frames 2-3" },
+    { "start_sec": ${beat2EndSec}, "end_sec": ${beat3EndSec}, "text": "Micro-twist 2 (~3-4s): rising tension & unexpected shift in frames 4-5" },
+    { "start_sec": ${beat3EndSec}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Final punchy payoff/reveal shown in frame 6" }
   ],
-  "title": "Curiosity-gap, high-CTR Shorts/Reels title (<= 75 chars) in ${languageName}",
-  "description": "Engaging suspenseful niche SEO description summarizing the real twist + CTA",
-  "tags": "comma, separated, 8-12, targeted, niche, youtube, shorts, tags",
-  "hashtags": "#Shorts #NicheTag1 #NicheTag2 #NicheTag3 #NicheTag4",
-  "posting_time": "Best Upload Window with both USA EST and India IST peak hours"
+  "title": "Curiosity-gap high-CTR title (<= 75 chars) strictly in ${languageName}",
+  "description": "High-retention creator SEO description summarizing the hook/twist + CTA strictly in ${languageName}",
+  "tags": "8-12 comma-separated niche tags strictly in ${languageName}",
+  "hashtags": "5-6 niche hashtags starting with # strictly in ${languageName}",
+  "posting_time": "Best Upload Window with both USA EST and India IST peak hours strictly in ${languageName}"
 }`;
 
   onStatus?.(
@@ -309,7 +334,7 @@ RETURN STRICT JSON ONLY:
     } else if (aiResponse?.provider === 'nvidia') {
       onConnectionPatch?.({
         nvidia: aiResponse.corsBlocked
-          ? 'CORS-Blocked'
+          ? 'Static-Skip'
           : aiResponse.keyMissing
           ? 'Key-Missing'
           : aiResponse.quotaExhausted
@@ -389,6 +414,7 @@ RETURN STRICT JSON ONLY:
 
   const customizedSeo = customizeSeoWithNicheYouTubeTrends({
     detectedTopic,
+    language,
     title: (parsed.title?.trim() || offlineDefaults.title).slice(0, 100),
     description: parsed.description?.trim() || offlineDefaults.description,
     tags: normalizeCommaList(parsed.tags, offlineDefaults.tags),

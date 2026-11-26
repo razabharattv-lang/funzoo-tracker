@@ -66,22 +66,22 @@ uniform int u_zoneCount;
 uniform vec4 u_zones[6]; // x1, y1, x2, y2 in normalized frame coords
 
 vec3 gradeCinema(vec3 c, vec2 uv) {
-  // High-retention cinema S-curve contrast + vibrance/saturation boost
-  c = clamp((c - 0.5) * 1.18 + 0.515, 0.0, 1.0);
+  // High-engagement cinema S-curve contrast + balanced vibrance/saturation boost
+  c = clamp((c - 0.5) * 1.24 + 0.52, 0.0, 1.0);
   float luma = dot(c, vec3(0.299, 0.587, 0.114));
-  c = mix(vec3(luma), c, 1.28);
-  // Subtle teal-shadow / warm-highlight cinematic split tone
-  vec3 shadowTint = vec3(-0.014, 0.008, 0.022) * (1.0 - luma);
-  vec3 highlightTint = vec3(0.022, 0.011, -0.011) * luma;
+  c = mix(vec3(luma), c, 1.34);
+  // Visible cinematic split tone (rich teal shadows / warm golden highlights)
+  vec3 shadowTint = vec3(-0.020, 0.012, 0.032) * (1.0 - luma);
+  vec3 highlightTint = vec3(0.030, 0.015, -0.014) * luma;
   c = clamp(c + shadowTint + highlightTint, 0.0, 1.0);
-  // Soft cinema vignette around outer borders
+  // Balanced cinema vignette around outer borders for crisp center pop
   float dist = distance(uv, vec2(0.5, 0.5));
-  float vig = 1.0 - smoothstep(0.48, 0.94, dist) * 0.22;
+  float vig = 1.0 - smoothstep(0.44, 0.90, dist) * 0.30;
   return clamp(c * vig, 0.0, 1.0);
 }
 
 void main() {
-  // Full-bleed 9:16 vertical cover-fit inside safe crop + dynamic motion push-in (1.07x -> 1.14x)
+  // Full-bleed 9:16 vertical cover-fit inside safe crop + dynamic motion push-in (1.08x -> 1.15x)
   float cropW = max(0.2, 1.0 - u_crop.x - u_crop.z);
   float cropH = max(0.2, 1.0 - u_crop.y - u_crop.w);
   float effSrcW = u_srcSize.x * cropW;
@@ -101,8 +101,8 @@ void main() {
 
   // Smooth full-bleed anti-copyright push-in + gentle motion drift (eliminates dark sidebars)
   float tSmooth = smoothstep(0.0, 1.0, clamp(u_timeFrac, 0.0, 1.0));
-  float zoom = 1.07 + 0.07 * tSmooth;
-  vec2 drift = vec2((tSmooth - 0.5) * 0.012, (tSmooth - 0.5) * 0.016);
+  float zoom = 1.08 + 0.07 * tSmooth;
+  vec2 drift = vec2((tSmooth - 0.5) * 0.014, (tSmooth - 0.5) * 0.018);
   uv = (uv - 0.5) / zoom + 0.5 + drift;
 
   vec2 srcUv = vec2(
@@ -122,7 +122,7 @@ void main() {
     if (inside > maskStrength) {
       maskStrength = inside;
       float dirY = ((z.y + z.w) * 0.5 < 0.5) ? 1.0 : -1.0;
-      patchShift = vec2(0.0, dirY * (z.w - z.y) * 1.15 * cropH);
+      patchShift = vec2(0.0, dirY * (z.w - z.y) * 1.18 * cropH);
     }
   }
 
@@ -130,13 +130,13 @@ void main() {
   vec2 clampedUv = clamp(srcUv, vec2(0.002), vec2(0.998));
   vec3 baseCol = texture(u_tex, clampedUv).rgb;
 
-  // Crisp unsharp-mask sharpness pass for Reels/Shorts clarity
+  // Crisp unsharp-mask clarity pass for high-retention Reels/Shorts sharpness
   vec3 blurNeighbors =
     (texture(u_tex, clamp(clampedUv + vec2(texel.x, 0.0), vec2(0.002), vec2(0.998))).rgb +
      texture(u_tex, clamp(clampedUv - vec2(texel.x, 0.0), vec2(0.002), vec2(0.998))).rgb +
      texture(u_tex, clamp(clampedUv + vec2(0.0, texel.y), vec2(0.002), vec2(0.998))).rgb +
      texture(u_tex, clamp(clampedUv - vec2(0.0, texel.y), vec2(0.002), vec2(0.998))).rgb) * 0.25;
-  vec3 col = clamp(baseCol + (baseCol - blurNeighbors) * 0.45, 0.0, 1.0);
+  vec3 col = clamp(baseCol + (baseCol - blurNeighbors) * 0.58, 0.0, 1.0);
 
   if (maskStrength > 0.01) {
     vec2 cleanCenterUv = clamp(srcUv + patchShift, vec2(0.005), vec2(0.995));

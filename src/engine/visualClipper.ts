@@ -15,12 +15,12 @@ function clamp(v: number, min: number, max: number): number {
 }
 
 function clampSafeCrop(crop: SafeCropInsets): SafeCropInsets {
-  // Enforce subject-safe anti-copyright edge crop (4%–6.5%) to remove outer border watermarks & sidebars
+  // Enforce subject-safe anti-copyright edge crop (4.5%–7.0%) to strip raw borders & watermarks
   return {
-    top: Number(clamp(Math.max(0.04, crop.top || 0), 0.04, 0.065).toFixed(4)),
-    bottom: Number(clamp(Math.max(0.04, crop.bottom || 0), 0.04, 0.065).toFixed(4)),
-    left: Number(clamp(Math.max(0.04, crop.left || 0), 0.04, 0.065).toFixed(4)),
-    right: Number(clamp(Math.max(0.04, crop.right || 0), 0.04, 0.065).toFixed(4)),
+    top: Number(clamp(Math.max(0.045, crop.top || 0), 0.045, 0.07).toFixed(4)),
+    bottom: Number(clamp(Math.max(0.045, crop.bottom || 0), 0.045, 0.07).toFixed(4)),
+    left: Number(clamp(Math.max(0.045, crop.left || 0), 0.045, 0.07).toFixed(4)),
+    right: Number(clamp(Math.max(0.045, crop.right || 0), 0.045, 0.07).toFixed(4)),
   };
 }
 
@@ -34,7 +34,7 @@ function ensureTopCornerMasks(
       id: 'wm_top_left_cover',
       startSec: 0,
       endSec: dur,
-      box: [0.0, 0.0, 0.27, 0.105],
+      box: [0.0, 0.0, 0.28, 0.11],
       action: 'gpu_delogo_patch',
       label: 'Top-left corner delogo patch',
     },
@@ -42,7 +42,7 @@ function ensureTopCornerMasks(
       id: 'wm_top_right_cover',
       startSec: 0,
       endSec: dur,
-      box: [0.73, 0.0, 1.0, 0.105],
+      box: [0.72, 0.0, 1.0, 0.11],
       action: 'gpu_delogo_patch',
       label: 'Top-right corner delogo patch',
     },
@@ -239,13 +239,16 @@ export async function inspectAndSliceSegmentsStep1(params: {
   try {
     const scan = await analyzeVideoTimelineLocally(source, onProgress);
     const totalDur = Math.max(1, source.durationSec);
-    const outroTrim = scan.hasOutroBumper && totalDur >= 10 ? 1.4 : 0;
+    const outroTrim =
+      (scan.hasOutroBumper || source.trimSocialEndCard) && totalDur >= 7
+        ? Math.min(1.6, Math.max(1.0, totalDur * 0.08))
+        : 0;
     const usableEnd = Math.max(2, totalDur - outroTrim);
     const safeCrop = clampSafeCrop(scan.suggestedSafeCropInsets);
 
     const segments: ViralSegment[] = scan.highActionWindows.map((win, idx) => {
-      const startSec = Number(clamp(win.startSec, 0, usableEnd - 1).toFixed(2));
-      const endSec = Number(clamp(win.endSec, startSec + 1, usableEnd).toFixed(2));
+      const startSec = Number(clamp(win.startSec, 0, usableEnd - 1.2).toFixed(2));
+      const endSec = Number(clamp(win.endSec, startSec + 1.2, usableEnd).toFixed(2));
       const climaxSec = Number(clamp(win.climaxSec, startSec, endSec).toFixed(2));
       const clipZones = sanitizeWatermarkZones(
         scan.detectedWatermarkZones,
@@ -260,8 +263,8 @@ export async function inspectAndSliceSegmentsStep1(params: {
         climaxSec,
         reason:
           scan.highActionWindows.length === 1
-            ? `Full usable clip (${(endSec - startSec).toFixed(1)}s) with peak action at ${climaxSec.toFixed(1)}s`
-            : `Highlight clip ${idx + 1} (${(endSec - startSec).toFixed(1)}s) centered on high-motion scene at ${climaxSec.toFixed(1)}s`,
+            ? `Tight trimmed clip (${(endSec - startSec).toFixed(1)}s) with peak action at ${climaxSec.toFixed(1)}s`
+            : `High-retention clip ${idx + 1} (${(endSec - startSec).toFixed(1)}s) centered on peak action at ${climaxSec.toFixed(1)}s`,
         trimRange: { startSec, endSec },
         safeCropInsets: safeCrop,
         watermarkZones: clipZones,
@@ -276,7 +279,35 @@ export async function inspectAndSliceSegmentsStep1(params: {
       };
     }
   } catch {
-    // Fall back to clean full-duration default segmentation if canvas frame decode fails
+    // Fall back to clean multi-clip (>30s) or tight single-clip (<=30s) segmentation
+  }
+
+  const totalDur = Math.max(1, source.durationSec);
+  if (totalDur > 30) {
+    const clipCount = totalDur <= 65 ? 2 : 3;
+    const span = totalDur / clipCount;
+    const targetLen =
+      totalDur <= 65
+        ? Math.min(26, Math.max(13, span * 0.88))
+        : Math.min(38, Math.max(20, span * 0.78));
+    const safeCrop = clampSafeCrop({ top: 0, bottom: 0, left: 0, right: 0 });
+    return {
+      segments: Array.from({ length: clipCount }, (_, i) => {
+        const startSec = Number((i * span).toFixed(2));
+        const endSec = Number(Math.min(totalDur, startSec + targetLen).toFixed(2));
+        return {
+          clipIndex: i + 1,
+          startSec,
+          endSec,
+          climaxSec: Number((startSec + (endSec - startSec) * 0.45).toFixed(2)),
+          reason: `High-retention clip ${i + 1} of ${clipCount} (${(endSec - startSec).toFixed(1)}s)`,
+          trimRange: { startSec, endSec },
+          safeCropInsets: safeCrop,
+          watermarkZones: [],
+        };
+      }),
+      inspectorModel: `Direct Slicer (${PIPELINE_15_WORKER_MODELS.step1[1]} role)`,
+    };
   }
 
   return {

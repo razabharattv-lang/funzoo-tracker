@@ -180,11 +180,13 @@ export async function probeInitialConnectionStatus(): Promise<ConnectionStatusSt
   const health = await probeStudioApiHealth(true);
   return {
     gemini: health.geminiConfigured ? 'Connected' : 'Fallback',
-    nvidia: !health.nvidiaConfigured
+    nvidia: !health.backendAvailable
+      ? 'Static-Skip'
+      : !health.nvidiaConfigured
       ? 'Key-Missing'
-      : health.backendAvailable && !health.nvidiaStaticKeyOnly
+      : !health.nvidiaStaticKeyOnly
       ? 'Connected'
-      : 'CORS-Blocked',
+      : 'Static-Skip',
     youtube: health.youtubeConfigured ? 'Connected' : 'Fallback',
     voice: health.geminiConfigured ? 'Gemini-TTS' : 'Browser-Speech',
     backendAvailable: health.backendAvailable,
@@ -256,7 +258,11 @@ export async function runSingleClipAiRequest(params: {
   if (targetModel === 'auto') {
     if (health.geminiConfigured) {
       targetModel = 'gemini-3.8-flash';
-    } else if (health.nvidiaConfigured) {
+    } else if (
+      health.nvidiaConfigured &&
+      health.backendAvailable &&
+      !health.nvidiaStaticKeyOnly
+    ) {
       targetModel = imageBase64Jpeg
         ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
         : 'nvidia/nemotron-3.5-lightning-30b-a3b';

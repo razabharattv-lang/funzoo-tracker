@@ -102,11 +102,12 @@ async function decodeTtsAudioToBuffer(params: {
 async function masterAndFitVoiceover(params: {
   rawBuffer: AudioBuffer;
   targetDurationSec: number;
+  voiceGender: VoiceGender;
 }): Promise<AudioBuffer> {
-  const { rawBuffer, targetDurationSec } = params;
+  const { rawBuffer, targetDurationSec, voiceGender } = params;
   const outSampleRate = 48000;
   const safeTargetDur = Math.max(1.5, targetDurationSec);
-  const speechBudgetSec = Math.max(1.2, safeTargetDur - 0.25);
+  const speechBudgetSec = Math.max(1.2, safeTargetDur - 0.2);
 
   const rawCh = rawBuffer.getChannelData(0);
   let firstActive = 0;
@@ -128,11 +129,13 @@ async function masterAndFitVoiceover(params: {
   const trimmedLen = Math.max(1, lastActive - firstActive + 1);
   const trimmedDurSec = trimmedLen / rawBuffer.sampleRate;
 
-  let playbackRate = 1.0;
+  // Keep playbackRate tightly bounded (0.95x–1.06x) so AudioBufferSourceNode never pitches
+  // the voice up into a thin, squeaky, or childlike tone.
+  let playbackRate = 0.985;
   if (trimmedDurSec > speechBudgetSec) {
-    playbackRate = Math.min(1.24, trimmedDurSec / speechBudgetSec);
+    playbackRate = Math.min(1.06, trimmedDurSec / speechBudgetSec);
   } else if (trimmedDurSec < speechBudgetSec * 0.72) {
-    playbackRate = Math.max(0.96, trimmedDurSec / (speechBudgetSec * 0.88));
+    playbackRate = Math.max(0.95, trimmedDurSec / (speechBudgetSec * 0.88));
   }
 
   const fittedSpeechDur = trimmedDurSec / playbackRate;
@@ -147,37 +150,56 @@ async function masterAndFitVoiceover(params: {
   src.buffer = trimmedBuf;
   src.playbackRate.value = playbackRate;
 
-  // Studio Broadcast EQ: 85Hz HPF, warm low-mid body (+3.5dB @ 160Hz), crisp presence (+3.8dB @ 3kHz), smooth compression
+  // Deep Broadcast Voice Shaping:
+  // 1) 75Hz HPF clears sub-rumble while preserving full adult fundamental body
   const highPass = offlineCtx.createBiquadFilter();
   highPass.type = 'highpass';
-  highPass.frequency.value = 85;
+  highPass.frequency.value = 75;
   highPass.Q.value = 0.7;
 
-  const bassShelf = offlineCtx.createBiquadFilter();
-  bassShelf.type = 'lowshelf';
-  bassShelf.frequency.value = 160;
-  bassShelf.gain.value = 3.5;
+  // 2) Warm low-end chest body (+5.0dB Male / +4.2dB Female @ 175Hz)
+  const chestBody = offlineCtx.createBiquadFilter();
+  chestBody.type = 'lowshelf';
+  chestBody.frequency.value = 175;
+  chestBody.gain.value = voiceGender === 'male' ? 5.0 : 4.2;
 
+  // 3) Crisp top-creator vocal authority presence (+3.0dB @ 2.6kHz)
   const presencePeak = offlineCtx.createBiquadFilter();
   presencePeak.type = 'peaking';
-  presencePeak.frequency.value = 3000;
-  presencePeak.Q.value = 1.0;
-  presencePeak.gain.value = 3.8;
+  presencePeak.frequency.value = 2600;
+  presencePeak.Q.value = 1.05;
+  presencePeak.gain.value = 3.0;
 
+  // 4) Remove thin/squeaky high-mid childlike resonance (-3.0dB @ 4.8kHz)
+  const deSqueakCut = offlineCtx.createBiquadFilter();
+  deSqueakCut.type = 'peaking';
+  deSqueakCut.frequency.value = 4800;
+  deSqueakCut.Q.value = 1.4;
+  deSqueakCut.gain.value = -3.0;
+
+  // 5) Gentle top-end silk roll-off (-2.2dB @ 7.8kHz) to remove harsh sibilance
+  const smoothTop = offlineCtx.createBiquadFilter();
+  smoothTop.type = 'highshelf';
+  smoothTop.frequency.value = 7800;
+  smoothTop.gain.value = -2.2;
+
+  // 6) Smooth broadcast dynamic leveling
   const compressor = offlineCtx.createDynamicsCompressor();
-  compressor.threshold.value = -16;
-  compressor.knee.value = 14;
-  compressor.ratio.value = 3.5;
-  compressor.attack.value = 0.006;
-  compressor.release.value = 0.15;
+  compressor.threshold.value = -18;
+  compressor.knee.value = 12;
+  compressor.ratio.value = 4.0;
+  compressor.attack.value = 0.005;
+  compressor.release.value = 0.14;
 
   const makeup = offlineCtx.createGain();
-  makeup.gain.value = 1.18;
+  makeup.gain.value = 1.24;
 
   src.connect(highPass);
-  highPass.connect(bassShelf);
-  bassShelf.connect(presencePeak);
-  presencePeak.connect(compressor);
+  highPass.connect(chestBody);
+  chestBody.connect(presencePeak);
+  presencePeak.connect(deSqueakCut);
+  deSqueakCut.connect(smoothTop);
+  smoothTop.connect(compressor);
   compressor.connect(makeup);
   makeup.connect(offlineCtx.destination);
 
@@ -191,7 +213,7 @@ async function masterAndFitVoiceover(params: {
     if (a > peak) peak = a;
   }
   if (peak > 0.001) {
-    const scale = Math.min(2.2, 0.89 / peak);
+    const scale = Math.min(2.4, 0.92 / peak);
     for (let i = 0; i < data.length; i++) {
       data[i] = Math.max(-0.98, Math.min(0.98, data[i] * scale));
     }
@@ -319,8 +341,13 @@ export function pickBestBrowserSpeechVoice(
   const roboticPenaltyHints = [
     'child',
     'kid',
+    'boy',
+    'girl',
+    'baby',
     'princess',
     'bubbles',
+    'squeak',
+    'chipmunk',
     'espeak',
     'compact',
     'festival',
@@ -342,6 +369,12 @@ export function pickBestBrowserSpeechVoice(
     'cellos',
     'hysterical',
     'bahh',
+    'superstar',
+    'organ',
+    'grandma',
+    'sandy',
+    'shelley',
+    'flo',
   ];
   const preferredHints = voiceGender === 'female' ? femaleHints : maleHints;
   const oppositeHints = voiceGender === 'female' ? maleHints : femaleHints;
@@ -401,11 +434,11 @@ export function speakWithBrowserSpeech(params: {
     const segments = sentences.length > 0 ? sentences : [normalizedText];
 
     const words = normalizedText.split(/\s+/).filter(Boolean).length;
-    const estBaseSec = Math.max(1.5, words / 2.35);
+    const estBaseSec = Math.max(1.5, words / 2.3);
     const budgetSec = Math.max(1.5, params.targetDurationSec - 0.35);
-    const baseRate = Math.max(0.95, Math.min(1.11, estBaseSec / budgetSec));
-    // Keep pitch strictly mature & resonant (never high/thin/childish)
-    const basePitch = params.voiceGender === 'female' ? 0.98 : 0.94;
+    const baseRate = Math.max(0.93, Math.min(1.07, estBaseSec / budgetSec));
+    // Deep, mature, resonant pitch (never thin, squeaky, or childlike)
+    const basePitch = params.voiceGender === 'female' ? 0.94 : 0.88;
 
     segments.forEach((sentence, idx) => {
       const utterance = new SpeechSynthesisUtterance(sentence);
@@ -415,13 +448,13 @@ export function speakWithBrowserSpeech(params: {
       const isHook = idx === 0;
       const isTwistPayoff = idx === segments.length - 1 && segments.length > 1;
       const beatRate = isHook
-        ? Math.min(1.12, baseRate * 1.02)
+        ? Math.min(1.08, baseRate * 1.02)
         : isTwistPayoff
-        ? Math.min(1.11, baseRate * 1.01)
-        : Math.max(0.94, baseRate * 0.97);
+        ? Math.min(1.06, baseRate * 1.0)
+        : Math.max(0.92, baseRate * 0.96);
 
       utterance.rate = Number(beatRate.toFixed(2));
-      utterance.pitch = basePitch;
+      utterance.pitch = isTwistPayoff ? Math.max(0.84, basePitch - 0.02) : basePitch;
       utterance.volume = 1.0;
       window.speechSynthesis.speak(utterance);
     });
@@ -479,11 +512,11 @@ export async function synthesizeCommandingVoiceover(params: {
   const styleDesc =
     language === 'hi'
       ? voiceGender === 'female'
-        ? 'Mature, powerful, emotionally gripping female Hindi suspense storyteller. Rich resonant alto tone, dramatic opening hook, rising tension, sharp punch on the twist, never thin, childish, or robotic.'
-        : 'Deep, powerful, emotionally intense male Hindi suspense storyteller. Warm commanding baritone, gripping opening tension, dramatic build-up, explosive clarity on the twist, never thin, childish, or robotic.'
+        ? 'Top on-camera adult female Hindi YouTube & Reels creator (age 30-42). Commanding, crisp, energetic deep alto tone; hit an instant 1.5-second pattern-interrupt hook, punch micro-twists every 3-4 seconds with sharp vocal dynamics and clear authority. Strictly mature powerful voice — never thin, childlike, squeaky, or monotonous.'
+        : 'Top on-camera adult male Hindi YouTube & Reels creator (age 32-44). Deep, commanding, crisp energetic baritone; hit an explosive 1.5-second curiosity hook, drive momentum with crisp micro-twist inflections every 3-4 seconds and authoritative clarity. Strictly deep adult voice — never thin, childlike, squeaky, or monotonous.'
       : voiceGender === 'female'
-      ? 'Mature, commanding, high-emotion American female cinematic storyteller. Rich velvety alto presence, magnetic suspenseful hook, rising emotional tension, bold unforgettable punch on the twist, never childish, thin, or robotic.'
-      : 'Deep, powerful, high-emotion American male cinematic storyteller. Resonant authoritative baritone, intense suspenseful hook, deliberate dramatic tension, commanding emotional impact on the twist, never childish, thin, or robotic.';
+      ? 'Top on-camera adult American female YouTube & Reels creator (age 30-42). Commanding, crisp, energetic resonant alto; hit an instant 1.5-second pattern-interrupt opener, deliver lively vocal shifts on every 3-4 second micro-twist with confident authority. Strictly mature resonant voice — never thin, childlike, squeaky, or monotonous.'
+      : 'Top on-camera adult American male YouTube & Reels creator (age 32-44). Commanding, crisp, energetic deep baritone; punch the first 1.5 seconds with a sharp pattern-interrupt hook, vary energy on every 3-4 second micro-twist with studio broadcast authority. Strictly deep mature voice — never thin, childlike, squeaky, or monotonous.';
 
   if (health.geminiConfigured) {
     onStatus?.(
@@ -600,12 +633,13 @@ export async function synthesizeCommandingVoiceover(params: {
   let masteredBuffer: AudioBuffer | null = null;
   if (rawBuffer) {
     onStatus?.(
-      'Applying Studio EQ (85Hz HPF, +3dB warmth, +4dB vocal clarity) & fitting to clip duration...'
+      'Applying Deep Broadcast EQ (75Hz HPF, warm chest body, de-squeak filter & smooth leveling)...'
     );
     try {
       masteredBuffer = await masterAndFitVoiceover({
         rawBuffer,
         targetDurationSec,
+        voiceGender,
       });
     } catch {
       masteredBuffer = rawBuffer;
