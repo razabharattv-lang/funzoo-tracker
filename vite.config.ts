@@ -8,9 +8,6 @@ export default defineConfig({
   worker: {
     format: 'es',
   },
-  optimizeDeps: {
-    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
-  },
   server: {
     port: 3000,
     host: '0.0.0.0',

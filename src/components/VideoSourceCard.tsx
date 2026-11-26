@@ -78,10 +78,10 @@ export function VideoSourceCard({
             </span>
             <div>
               <h2 className="text-base font-extrabold text-[#0F172A]">
-                1. Universal Video Link Input
+                1. Video Link or Upload
               </h2>
               <p className="text-xs font-medium text-[#64748B]">
-                RedNote · Douyin · TikTok · Facebook · Reels · Shorts &amp; Long Videos (10–60+ min auto-clipped)
+                Paste link/share-text or upload a local video file
               </p>
             </div>
           </div>
@@ -114,7 +114,7 @@ export function VideoSourceCard({
                 if (sourceType !== 'link') onSourceTypeChange('link');
                 onVideoUrlChange(e.target.value);
               }}
-              placeholder="Paste any raw link or full Chinese share-text (e.g., 78 【标题】 http://xhslink.com/abc 复制打开...)"
+              placeholder="Paste video link or share text..."
               className="w-full rounded-xl border-2 border-[#3D5AFE] bg-white pl-3.5 pr-9 py-2.5 text-sm font-semibold text-[#0F172A] placeholder:text-[#94A3B8] focus:outline-none disabled:opacity-55 resize-none"
             />
             {videoUrl && !disabled && !isFetchingLink && (

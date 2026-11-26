@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Check,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Copy,
   Download,
@@ -9,8 +11,11 @@ import {
   Hash,
   Tag,
   Type,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { formatBytes, formatDuration } from '../lib/videoProbe';
+import { speakWithBrowserSpeech, stopBrowserSpeech } from '../engine/audioEngine';
 import type { RenderedClipOutput } from '../types/studio';
 
 interface OutputDeckCardProps {
@@ -21,19 +26,48 @@ interface OutputDeckCardProps {
 export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [browserSpeechSyncEnabled, setBrowserSpeechSyncEnabled] = useState(true);
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
 
   const safeIdx = Math.min(selectedIdx, Math.max(0, clips.length - 1));
   const activeClip = clips[safeIdx] ?? null;
+  const isBrowserSpeechClip = activeClip?.voiceSource === 'Browser-Speech';
+  const hasMultipleClips = clips.length > 1;
+  const isLandscapeClip = Boolean(activeClip && activeClip.width > activeClip.height * 1.15);
+
+  const selectClipIndex = (nextIdx: number) => {
+    if (clips.length === 0) return;
+    const bounded = (nextIdx + clips.length) % clips.length;
+    stopBrowserSpeech();
+    setSelectedIdx(bounded);
+  };
+
+  useEffect(() => {
+    return () => {
+      stopBrowserSpeech();
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, [activeClip?.videoUrl]);
+
+  const scheduleCopiedReset = (key: string) => {
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    setCopiedKey(key);
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopiedKey((prev) => (prev === key ? null : prev));
+      copyTimerRef.current = null;
+    }, 1800);
+  };
 
   const copyField = async (key: string, text: string) => {
     try {
       await navigator.clipboard.writeText(text);
-      setCopiedKey(key);
-      window.setTimeout(() => {
-        setCopiedKey((prev) => (prev === key ? null : prev));
-      }, 1800);
+      scheduleCopiedReset(key);
     } catch {
-      // Clipboard API fallback
       const ta = document.createElement('textarea');
       ta.value = text;
       ta.style.position = 'fixed';
@@ -42,15 +76,12 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
       ta.select();
       document.execCommand('copy');
       document.body.removeChild(ta);
-      setCopiedKey(key);
-      window.setTimeout(() => {
-        setCopiedKey((prev) => (prev === key ? null : prev));
-      }, 1800);
+      scheduleCopiedReset(key);
     }
   };
 
   const handleDownload = (clip: RenderedClipOutput) => {
-    const ext = clip.mimeType.includes('webm') ? 'webm' : 'mp4';
+    const ext = (clip.mimeType ?? '').includes('webm') ? 'webm' : 'mp4';
     const baseName = (runTag || 'studio-clip').replace(/[^a-zA-Z0-9_-]/g, '-');
     const fileName = `${baseName}-clip-${clip.clipIndex}.${ext}`;
     const anchor = document.createElement('a');
@@ -59,6 +90,22 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
+  };
+
+  const handleVideoPlay = () => {
+    if (!activeClip || !isBrowserSpeechClip || !browserSpeechSyncEnabled) return;
+    speakWithBrowserSpeech({
+      scriptText: activeClip.metadata.voiceover,
+      language: activeClip.language,
+      voiceGender: activeClip.voiceGender,
+      targetDurationSec: activeClip.durationSec,
+    });
+  };
+
+  const handleVideoStop = () => {
+    if (isBrowserSpeechClip) {
+      stopBrowserSpeech();
+    }
   };
 
   const copyCards = activeClip
@@ -108,23 +155,35 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
           </span>
           <div>
             <h2 className="text-base font-extrabold text-[#0F172A]">
-              Card 2 · Final Production Output Deck
+              Final Production Output
             </h2>
             <p className="text-xs font-medium text-[#64748B]">
               {activeClip
-                ? `${activeClip.renderEngine} · ${activeClip.metadata.scriptEngine}`
-                : 'Finished video clips, MP4 download, and 5 one-click SEO copy cards appear here'}
+                ? `${activeClip.renderEngine} · ${activeClip.width}×${activeClip.height}`
+                : 'Shorts-style preview, MP4 download & 5 copy cards'}
             </p>
           </div>
         </div>
 
-        {clips.length > 1 && (
-          <div className="flex items-center gap-1.5 flex-wrap">
-            {clips.map((c, idx) => (
+        <div className="flex items-center gap-2 flex-wrap">
+          {activeClip && (
+            <span
+              className={`px-2.5 py-1 rounded-full border-2 text-[11px] font-extrabold whitespace-nowrap ${
+                activeClip.voiceSource === 'Gemini-TTS'
+                  ? 'border-[#00C853] bg-[#E8F9EE] text-[#065F46]'
+                  : 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]'
+              }`}
+            >
+              Voice: {activeClip.voiceSource}
+            </span>
+          )}
+
+          {hasMultipleClips &&
+            clips.map((c, idx) => (
               <button
                 key={c.clipIndex}
                 type="button"
-                onClick={() => setSelectedIdx(idx)}
+                onClick={() => selectClipIndex(idx)}
                 className={`px-3 py-1 rounded-full border-2 text-xs font-extrabold transition-colors cursor-pointer ${
                   idx === safeIdx
                     ? 'border-[#00BFA5] bg-[#00BFA5] text-white'
@@ -134,30 +193,93 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
                 Clip {c.clipIndex}
               </button>
             ))}
-          </div>
-        )}
+        </div>
       </div>
 
       {!activeClip ? (
-        <div className="rounded-xl border-2 border-dashed border-[#CBD5E1] bg-[#F4F6F9] px-5 py-12 text-center space-y-1.5">
+        <div className="rounded-xl border-2 border-dashed border-[#CBD5E1] bg-[#F4F6F9] px-5 py-10 text-center space-y-1">
           <p className="text-sm font-extrabold text-[#334155]">
-            Ready to produce your finished clip &amp; 5 copy cards
+            No finished clip yet
           </p>
           <p className="text-xs font-medium text-[#64748B]">
-            Run the 5-step pipeline to preview your clean graded video, download MP4, and copy Title, Description, Tags, Hashtags, and Best Upload Time (EST/IST).
+            Run the 5-step pipeline to preview clips and copy SEO metadata.
           </p>
         </div>
       ) : (
         <div className="space-y-4">
-          {/* Output Video Player + Download Button */}
-          <div className="rounded-xl border-2 border-[#E2E8F0] bg-[#0F172A] overflow-hidden flex items-center justify-center max-h-[380px]">
-            <video
-              key={activeClip.videoUrl}
-              src={activeClip.videoUrl}
-              controls
-              playsInline
-              className="w-full max-h-[380px] object-contain"
-            />
+          {/* Shorts-Style 9:16 Swipeable Multi-Clip Stage */}
+          <div
+            tabIndex={hasMultipleClips ? 0 : undefined}
+            onKeyDown={(e) => {
+              if (!hasMultipleClips) return;
+              if (e.key === 'ArrowLeft') selectClipIndex(safeIdx - 1);
+              if (e.key === 'ArrowRight') selectClipIndex(safeIdx + 1);
+            }}
+            onTouchStart={(e) => {
+              const t = e.touches[0];
+              touchStartRef.current = t ? { x: t.clientX, y: t.clientY } : null;
+            }}
+            onTouchEnd={(e) => {
+              if (!hasMultipleClips || !touchStartRef.current) return;
+              const t = e.changedTouches[0];
+              const start = touchStartRef.current;
+              touchStartRef.current = null;
+              if (!t) return;
+              const deltaX = t.clientX - start.x;
+              const deltaY = t.clientY - start.y;
+              if (Math.abs(deltaX) >= 48 && Math.abs(deltaX) > Math.abs(deltaY) * 1.3) {
+                selectClipIndex(deltaX < 0 ? safeIdx + 1 : safeIdx - 1);
+              }
+            }}
+            className="relative rounded-2xl border-2 border-[#E2E8F0] bg-[#0F172A] p-3 flex flex-col items-center justify-center gap-3 select-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3D5AFE]"
+          >
+            {hasMultipleClips && (
+              <div className="w-full flex items-center justify-between gap-2 px-1">
+                <button
+                  type="button"
+                  onClick={() => selectClipIndex(safeIdx - 1)}
+                  aria-label="Previous clip"
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#334155] bg-[#1E293B] hover:border-[#00BFA5] text-white text-xs font-extrabold cursor-pointer transition-colors"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" strokeWidth={2.5} />
+                  <span>Prev</span>
+                </button>
+
+                <span className="px-3 py-0.5 rounded-full bg-[#1E293B] border border-[#334155] text-white text-[11px] font-extrabold font-mono-tabular">
+                  Clip {safeIdx + 1} / {clips.length} · Swipe
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() => selectClipIndex(safeIdx + 1)}
+                  aria-label="Next clip"
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#334155] bg-[#1E293B] hover:border-[#00BFA5] text-white text-xs font-extrabold cursor-pointer transition-colors"
+                >
+                  <span>Next</span>
+                  <ChevronRight className="w-3.5 h-3.5" strokeWidth={2.5} />
+                </button>
+              </div>
+            )}
+
+            <div
+              className={`w-full overflow-hidden rounded-xl bg-black flex items-center justify-center ${
+                isLandscapeClip
+                  ? 'max-w-[540px] aspect-video'
+                  : 'max-w-[320px] aspect-[9/16]'
+              }`}
+            >
+              <video
+                key={activeClip.videoUrl}
+                src={activeClip.videoUrl}
+                controls
+                playsInline
+                muted={isBrowserSpeechClip && browserSpeechSyncEnabled}
+                onPlay={handleVideoPlay}
+                onPause={handleVideoStop}
+                onEnded={handleVideoStop}
+                className="w-full h-full object-contain"
+              />
+            </div>
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] p-3">
@@ -180,43 +302,89 @@ export function OutputDeckCard({ clips, runTag }: OutputDeckCardProps) {
               )}
             </div>
 
-            <button
-              type="button"
-              onClick={() => handleDownload(activeClip)}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border-2 border-[#00C853] bg-[#00C853] hover:bg-[#00B248] text-white text-xs font-extrabold transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            >
-              <Download className="w-4 h-4" strokeWidth={2.5} />
-              <span>
-                {activeClip.mimeType.includes('webm')
-                  ? `Download Clip ${activeClip.clipIndex} (WebM)`
-                  : `Download MP4 (Clip ${activeClip.clipIndex})`}
-              </span>
-            </button>
+            <div className="flex items-center gap-2 flex-wrap">
+              {isBrowserSpeechClip && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopBrowserSpeech();
+                    setBrowserSpeechSyncEnabled((prev) => !prev);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border-2 text-xs font-extrabold transition-colors cursor-pointer whitespace-nowrap ${
+                    browserSpeechSyncEnabled
+                      ? 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]'
+                      : 'border-[#CBD5E1] bg-white text-[#475569]'
+                  }`}
+                >
+                  {browserSpeechSyncEnabled ? (
+                    <>
+                      <Volume2 className="w-3.5 h-3.5" strokeWidth={2.5} />
+                      <span>OS Speech Sync: ON</span>
+                    </>
+                  ) : (
+                    <>
+                      <VolumeX className="w-3.5 h-3.5" strokeWidth={2.5} />
+                      <span>Embedded Track</span>
+                    </>
+                  )}
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => handleDownload(activeClip)}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border-2 border-[#00C853] bg-[#00C853] hover:bg-[#00B248] text-white text-xs font-extrabold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Download className="w-4 h-4" strokeWidth={2.5} />
+                <span>
+                  {(activeClip.mimeType ?? '').includes('webm')
+                    ? `Download Clip ${activeClip.clipIndex} (WebM)`
+                    : `Download MP4 (Clip ${activeClip.clipIndex})`}
+                </span>
+              </button>
+            </div>
           </div>
 
           {/* Direct Translation Script Strip */}
           <div className="rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] p-3.5 space-y-2">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs font-extrabold text-[#0F172A]">
                 Direct Translation Voiceover Script ({activeClip.voiceEngine})
               </span>
-              <button
-                type="button"
-                onClick={() => copyField('script', activeClip.metadata.voiceover)}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#00C853] bg-white hover:bg-[#00C853] text-[#008A38] hover:text-white text-[11px] font-extrabold transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                {copiedKey === 'script' ? (
-                  <>
-                    <Check className="w-3.5 h-3.5" strokeWidth={2.5} />
-                    <span>Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" strokeWidth={2.5} />
-                    <span>Copy Script</span>
-                  </>
-                )}
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    speakWithBrowserSpeech({
+                      scriptText: activeClip.metadata.voiceover,
+                      language: activeClip.language,
+                      voiceGender: activeClip.voiceGender,
+                      targetDurationSec: activeClip.durationSec,
+                    })
+                  }
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#3D5AFE] bg-white hover:bg-[#3D5AFE] text-[#3D5AFE] hover:text-white text-[11px] font-extrabold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Volume2 className="w-3.5 h-3.5" strokeWidth={2.5} />
+                  <span>Listen Voice</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => copyField('script', activeClip.metadata.voiceover)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#00C853] bg-white hover:bg-[#00C853] text-[#008A38] hover:text-white text-[11px] font-extrabold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  {copiedKey === 'script' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5" strokeWidth={2.5} />
+                      <span>Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" strokeWidth={2.5} />
+                      <span>Copy Script</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
             <p className="text-xs font-semibold text-[#334155] leading-relaxed whitespace-pre-wrap">
               {activeClip.metadata.voiceover}

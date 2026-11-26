@@ -1,4 +1,5 @@
 import { analyzeVideoTimelineLocally } from './offlineModels';
+import { PIPELINE_15_WORKER_MODELS } from './modelRouter';
 import { buildDefaultViralSegments } from './streamResolver';
 import type {
   PreparedVisualClip,
@@ -215,13 +216,14 @@ export async function inspectAndSliceSegmentsStep1(params: {
         trimRange: { startSec, endSec },
         safeCropInsets: safeCrop,
         watermarkZones: clipZones,
+        visualSummary: scan.visualSummary,
       };
     });
 
     if (segments.length > 0) {
       return {
         segments,
-        inspectorModel: 'Local Scene & Watermark Scanner (0 AI Quota Used)',
+        inspectorModel: `Browser Canvas Fallback (${PIPELINE_15_WORKER_MODELS.step1[0]} / ${PIPELINE_15_WORKER_MODELS.step1[2]} role)`,
       };
     }
   } catch {
@@ -230,7 +232,7 @@ export async function inspectAndSliceSegmentsStep1(params: {
 
   return {
     segments: buildDefaultViralSegments(source),
-    inspectorModel: 'Direct Timeline Slicer (0 AI Quota Used)',
+    inspectorModel: `Direct Slicer (${PIPELINE_15_WORKER_MODELS.step1[1]} role)`,
   };
 }
 
@@ -251,7 +253,7 @@ export async function cleanAndGradeClipsStep2(params: {
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
     onProgress?.(
-      `Cleaning & cinema-grading clip ${i + 1}/${segments.length} (subject-safe crop + delogo inspection)...`
+      `Cleaning & grading clip ${i + 1}/${segments.length} (WebGL2 fallback for ${PIPELINE_15_WORKER_MODELS.step2[2]})...`
     );
 
     const safeCrop = clampSafeCrop(seg.safeCropInsets);
@@ -301,6 +303,7 @@ export async function cleanAndGradeClipsStep2(params: {
       stampedContactSheetJpeg: jpegBase64,
       stampedTimestampsSec: timestampsSec,
       inspectorModel,
+      visualSummary: seg.visualSummary,
     });
   }
 

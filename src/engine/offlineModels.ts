@@ -1,6 +1,8 @@
 import type {
   AlignedWordTiming,
+  ClipVisualSummary,
   LocalSceneScanResult,
+  OfflineModelStatus,
   OutputLanguage,
   PreparedVisualClip,
   SafeCropInsets,
@@ -11,7 +13,6 @@ import type {
   YouTubeTrendVideo,
 } from '../types/studio';
 import { getOfflineModelStatuses } from './cacheManager';
-import type { OfflineModelStatus } from '../types/studio';
 
 const EMPHASIS_WORDS = new Set([
   'WAIT',
@@ -32,19 +33,60 @@ const EMPHASIS_WORDS = new Set([
   'PROOF',
   'WHY',
   'HOW',
-  'MILLION',
-  'BILLION',
-  '100%',
+  'SHIFT',
+  'MOMENT',
+  'DETAIL',
   'असली',
   'सच',
   'ध्यान',
   'देखिए',
   'सीधे',
   'तुरंत',
+  'मुख्य',
+  'बदलाव',
 ]);
 
 export function warmOfflineEngines(): OfflineModelStatus[] {
   return getOfflineModelStatuses();
+}
+
+/**
+ * Strips file extensions and rejects opaque camera/gallery/numeric filenames
+ * (such as `1000179945.mp4`, `VID_20250312_184422.mp4`, `IMG_4921.MOV`, `WhatsApp Video...`)
+ * so raw numbers or IDs NEVER appear inside the spoken narration or SEO titles.
+ */
+export function extractReadableTopicFromLabel(
+  sourceLabel: string,
+  customAngle: string
+): string | null {
+  const customClean = customAngle.trim().replace(/\s+/g, ' ');
+  if (customClean.length >= 4) {
+    return customClean.slice(0, 72);
+  }
+
+  const base = sourceLabel
+    .replace(/\.(mp4|mov|webm|mkv|avi|m4v|3gp)$/i, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!base || base.length < 4) return null;
+
+  // Reject purely numeric IDs or camera/app generated filenames
+  const opaquePatterns = [
+    /^\d[\d\s]*$/,
+    /^(vid|img|pxl|dsc|mov|clip|video|screen|recording|rpreplay|whatsapp|snapchat|tiktok|douyin|xhs|inshot|capcut|snaptik|ssstik|saveinsta|download|file|media|untitled|export|output|local video|web video link)\b/i,
+    /^[a-f0-9]{8,}$/i,
+  ];
+  if (opaquePatterns.some((re) => re.test(base))) return null;
+
+  const lettersOnly = base.replace(/[^\p{L}]/gu, '');
+  const digitsOnly = base.replace(/[^\d]/g, '');
+  // Reject if mostly digits or fewer than 4 real letters
+  if (lettersOnly.length < 4) return null;
+  if (digitsOnly.length >= lettersOnly.length) return null;
+
+  return base.slice(0, 68);
 }
 
 /**
@@ -78,7 +120,6 @@ export function alignCaptionsOffline(params: {
     Math.max(0.5, targetDurationSec)
   );
 
-  // Detect active voice intervals using 25ms RMS windows
   const windowSamples = Math.max(128, Math.floor(sampleRate * 0.025));
   const totalWindows = Math.max(1, Math.floor(channelData.length / windowSamples));
   const energies = new Float32Array(totalWindows);
@@ -97,7 +138,7 @@ export function alignCaptionsOffline(params: {
     if (rms > maxEnergy) maxEnergy = rms;
   }
 
-  const threshold = maxEnergy * 0.07;
+  const threshold = maxEnergy * 0.06;
   let speechStartWin = 0;
   let speechEndWin = totalWindows - 1;
   for (let i = 0; i < totalWindows; i++) {
@@ -120,7 +161,6 @@ export function alignCaptionsOffline(params: {
   );
   const activeSpanSec = Math.max(0.5, speechEndSec - speechStartSec);
 
-  // Distribute words proportionally by character/syllable weight + punctuation pause
   const weights = formattedWords.map((word) => {
     const clean = word.replace(/[^\p{L}\p{N}]/gu, '');
     const base = Math.max(2, clean.length);
@@ -129,7 +169,6 @@ export function alignCaptionsOffline(params: {
   });
   const totalWeight = weights.reduce((acc, w) => acc + w, 0) || 1;
 
-  // If beats are well-formed and match word count closely, anchor within speech span
   const results: AlignedWordTiming[] = [];
   let cursor = speechStartSec;
   for (let i = 0; i < formattedWords.length; i++) {
@@ -153,13 +192,20 @@ export function alignCaptionsOffline(params: {
 
 /**
  * Local zero-API video scanner: samples frames across the real video timeline to find
- * scene cuts, high-action peaks, static corner watermarks, and social outro bumpers.
+ * scene cuts, high-action peaks, static corner watermarks, outro bumpers, and visual pacing.
  */
 export async function analyzeVideoTimelineLocally(
   source: SourceMediaItem,
   onProgress?: (detail: string) => void
 ): Promise<LocalSceneScanResult> {
   const duration = Math.max(1, source.durationSec);
+  const orientation: ClipVisualSummary['orientation'] =
+    source.width > source.height * 1.05
+      ? 'landscape'
+      : Math.abs(source.width - source.height) / Math.max(source.width, source.height) <= 0.12
+      ? 'square'
+      : 'vertical';
+
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
@@ -203,6 +249,12 @@ export async function analyzeVideoTimelineLocally(
       detectedWatermarkZones: [],
       suggestedSafeCropInsets: { top: 0, bottom: 0, left: 0, right: 0 },
       hasOutroBumper: false,
+      visualSummary: {
+        orientation,
+        pacing: 'dynamic',
+        sceneCutCount: 0,
+        lighting: 'cinematic',
+      },
     };
   }
 
@@ -267,12 +319,10 @@ export async function analyzeVideoTimelineLocally(
     motionScores.push({ timeSec: t, score: motion, luma: avgLuma });
   }
 
-  // Release temporary video element
   video.pause();
   video.removeAttribute('src');
   video.load();
 
-  // Detect scene cuts where inter-frame delta spikes
   const sceneCutTimestampsSec: number[] = [];
   for (let i = 1; i < motionScores.length; i++) {
     if (motionScores[i].score > 0.24) {
@@ -280,7 +330,28 @@ export async function analyzeVideoTimelineLocally(
     }
   }
 
-  // Detect abrupt black/white social outro bumper on the tail sample
+  const avgMotion =
+    motionScores.reduce((acc, m) => acc + m.score, 0) / Math.max(1, motionScores.length);
+  const avgBrightness =
+    motionScores.reduce((acc, m) => acc + m.luma, 0) / Math.max(1, motionScores.length);
+
+  const visualSummary: ClipVisualSummary = {
+    orientation,
+    pacing:
+      sceneCutTimestampsSec.length >= 3 || avgMotion > 0.22
+        ? 'fast-cut'
+        : avgMotion > 0.11
+        ? 'dynamic'
+        : 'steady',
+    sceneCutCount: sceneCutTimestampsSec.length,
+    lighting:
+      avgBrightness > 145
+        ? 'bright'
+        : avgBrightness < 80
+        ? 'high-contrast'
+        : 'cinematic',
+  };
+
   const tail = motionScores[motionScores.length - 1];
   const prevTail = motionScores[Math.max(0, motionScores.length - 2)];
   const hasOutroBumper =
@@ -293,7 +364,6 @@ export async function analyzeVideoTimelineLocally(
           (source.trimSocialEndCard && tail.score > 0.38))
     );
 
-  // Detect persistent high-contrast corner logos (low temporal variance + high spatial edge)
   const corners: {
     id: string;
     label: string;
@@ -307,7 +377,6 @@ export async function analyzeVideoTimelineLocally(
 
   const detectedWatermarkZones: WatermarkZone[] = [];
   if (frames.length >= 4) {
-    // Compare interior frames only (exclude first/last bumper frames)
     const sampleFrames = frames.slice(1, frames.length - 1);
     for (const corner of corners) {
       const x0 = Math.floor(corner.box[0] * sampleW);
@@ -339,7 +408,6 @@ export async function analyzeVideoTimelineLocally(
       const avgEdge = edgeEnergy / Math.max(1, count);
       const avgTempDiff = temporalDiff / Math.max(1, count);
 
-      // Strong crisp static text/logo overlay: noticeable edge contrast + very low motion over time
       if (avgEdge > 16 && avgTempDiff < 14) {
         detectedWatermarkZones.push({
           id: corner.id,
@@ -353,13 +421,11 @@ export async function analyzeVideoTimelineLocally(
     }
   }
 
-  // Only suggest minimal subject-safe edge crop (<= 3%) when platform borders or multiple edge marks exist
   const suggestedSafeCropInsets: SafeCropInsets =
     detectedWatermarkZones.length >= 2 || source.trimSocialEndCard
       ? { top: 0.02, bottom: 0.025, left: 0.015, right: 0.015 }
       : { top: 0, bottom: 0, left: 0, right: 0 };
 
-  // Build ranked high-action windows across full duration (no artificial length cap)
   const highActionWindows: LocalSceneScanResult['highActionWindows'] = [];
   if (duration <= 65) {
     const peak = motionScores.reduce(
@@ -373,7 +439,6 @@ export async function analyzeVideoTimelineLocally(
       motionScore: Number(peak.score.toFixed(3)),
     });
   } else {
-    // Divide long video into 3 clean non-overlapping highlight regions centered on peak motion
     const targetClips = 3;
     const regionSpan = duration / targetClips;
     const targetClipLen = Math.min(58, Math.max(30, regionSpan * 0.72));
@@ -415,13 +480,14 @@ export async function analyzeVideoTimelineLocally(
     detectedWatermarkZones,
     suggestedSafeCropInsets,
     hasOutroBumper,
+    visualSummary,
   };
 }
 
 /**
- * Clean local fallback when cloud AI quota is unavailable or offline.
- * Produces a faithful, timing-locked narration script + 5 copy-ready SEO fields
- * (Title, Description, Tags, Hashtags, Best Upload Time USA EST + India IST).
+ * Clean, natural, duration-calibrated local fallback when cloud AI is blocked or offline.
+ * NEVER speaks raw camera/numeric filenames (like `1000179945`) and matches exact clip
+ * duration (e.g., 17s -> ~34-38 punchy words finishing cleanly before 16.5s).
  */
 export function generateOfflineDirectTranslationAndMetadata(params: {
   clip: PreparedVisualClip;
@@ -433,74 +499,112 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
 }): TrendMetadata {
   const { clip, sourceLabel, language, customAngle, trends, fallbackReason } = params;
   const dur = Math.max(4, clip.lockedVisualDurationSec);
+  const safeSpeechEnd = Math.max(2.5, dur - 0.35);
 
-  const cleanTopic = (customAngle.trim() || sourceLabel)
-    .replace(/\.(mp4|mov|webm|mkv|avi)$/i, '')
-    .replace(/[_-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const readableTopic = extractReadableTopicFromLabel(sourceLabel, customAngle);
+  const visual = clip.visualSummary;
+  const climaxSecRounded = Math.max(1, Math.round(clip.climaxSec));
+  const isFast = visual?.pacing === 'fast-cut';
+  const formatWord = visual?.orientation === 'landscape' ? 'widescreen' : 'vertical';
 
-  const topicTitle = cleanTopic.length > 3 ? cleanTopic.slice(0, 62) : 'Key Moment Breakdown';
   const trendKeyword =
     trends[0]?.tags?.[0] ||
     trends[0]?.title?.split(/\s+/).slice(0, 3).join(' ') ||
-    'Explained';
+    'Breakdown';
 
-  const beatCount = dur <= 12 ? 2 : dur <= 28 ? 3 : 4;
-  const beatSpan = dur / beatCount;
+  // Calibrate number of sentences strictly to clip duration (~2.15 words/sec)
+  const sentenceCount = dur <= 10 ? 2 : dur <= 22 ? 3 : 4;
 
-  const enLines = [
-    `Watch closely at what happens right here in ${topicTitle}.`,
-    `Notice the exact moment the main detail shifts on screen and drives the outcome.`,
-    `Every step in this sequence builds directly toward the core takeaway.`,
-    `That is the key point behind ${topicTitle} — clear, direct, and easy to verify.`,
-  ];
+  let chosenLines: string[];
+  if (language === 'hi') {
+    const hiPool = readableTopic
+      ? [
+          `${readableTopic} के इस दृश्य को ध्यान से देखिए, क्योंकि असली बात शुरुआत के पहले ही सेकंड से तय हो जाती है।`,
+          `लगभग ${climaxSecRounded} सेकंड के आसपास मुख्य बदलाव सामने आता है, जहाँ पूरा फोकस सीधे नतीजे की ओर मुड़ता है।`,
+          `हर फ्रेम बिना किसी भटकाव के इसी मुख्य बिंदु को साफ साबित करता है।`,
+          `यही ${readableTopic} का सीधा और स्पष्ट सार है, जिसे आप इस क्लिप में तुरंत समझ सकते हैं।`,
+        ]
+      : [
+          `इस क्लिप के पहले ही पल को ध्यान से देखिए, क्योंकि असली बदलाव यहीं से शुरू होता है।`,
+          `${isFast ? 'तेज़ कट्स के बीच ' : ''}लगभग ${climaxSecRounded} सेकंड पर वह मुख्य मोड़ आता है, जिसे ज़्यादातर लोग पहली बार में छोड़ देते हैं।`,
+          `अंत तक पहुँचते-पहुँचते पूरी तस्वीर बिल्कुल साफ हो जाती है और मुख्य बात सीधे सामने आ जाती है।`,
+          `ऐसे ही स्पष्ट और तेज़ विश्लेषण के लिए इस वीडियो को सेव करें और चैनल से जुड़े रहें।`,
+        ];
+    chosenLines = hiPool.slice(0, sentenceCount);
+  } else {
+    const enPool = readableTopic
+      ? [
+          `Watch this moment in ${readableTopic} closely — the key shift starts right from the opening frame.`,
+          `Right around the ${climaxSecRounded}-second mark, the main action turns and reveals what actually drives the outcome.`,
+          `Every beat in this sequence locks onto that core detail with zero filler.`,
+          `That is the exact takeaway from ${readableTopic} — clear, direct, and easy to verify on screen.`,
+        ]
+      : [
+          `Watch the opening frame closely — the key detail that changes everything happens faster than most viewers expect.`,
+          `${isFast ? 'Across the rapid cuts, right' : 'Right'} around the ${climaxSecRounded}-second mark, the main turning point locks in and drives the entire sequence.`,
+          `By the final second, the full picture comes together cleanly with zero wasted motion.`,
+          `Save this breakdown and follow for more direct, frame-by-frame visual explainers.`,
+        ];
+    chosenLines = enPool.slice(0, sentenceCount);
+  }
 
-  const hiLines = [
-    `यहाँ ${topicTitle} में जो हो रहा है, उसे ध्यान से देखिए।`,
-    `ठीक इस पल पर मुख्य बदलाव सामने आता है और पूरा नतीजा तय करता है।`,
-    `इस क्लिप का हर हिस्सा सीधे मुख्य बात को स्पष्ट करता है।`,
-    `यही ${topicTitle} की असली और सीधी बात है, जिसे आप साफ देख सकते हैं।`,
-  ];
-
-  const chosenLines = (language === 'hi' ? hiLines : enLines).slice(0, beatCount);
-  const beats: ScriptBeat[] = chosenLines.map((text, idx) => ({
-    startSec: Number((idx * beatSpan).toFixed(2)),
-    endSec: Number(Math.min(dur, (idx + 1) * beatSpan).toFixed(2)),
-    text,
-  }));
+  // Distribute beat timings proportionally to word length inside safeSpeechEnd
+  const wordCounts = chosenLines.map((l) => l.split(/\s+/).filter(Boolean).length);
+  const totalWords = wordCounts.reduce((a, b) => a + b, 0) || 1;
+  let cursor = 0.05;
+  const beats: ScriptBeat[] = chosenLines.map((text, idx) => {
+    const share = (wordCounts[idx] / totalWords) * (safeSpeechEnd - 0.1);
+    const startSec = Number(cursor.toFixed(2));
+    const endSec = Number(
+      (idx === chosenLines.length - 1 ? safeSpeechEnd : Math.min(safeSpeechEnd, cursor + share)).toFixed(2)
+    );
+    cursor = endSec;
+    return { startSec, endSec, text };
+  });
 
   const voiceover = beats.map((b) => b.text).join(' ');
 
+  const displayTitleSubject =
+    readableTopic ||
+    (language === 'hi'
+      ? `${Math.round(dur)} सेकंड में मुख्य पल का सीधा विश्लेषण`
+      : `The ${climaxSecRounded}-Second Turning Point Most Viewers Miss`);
+
   const title =
     language === 'hi'
-      ? `${topicTitle} | सीधी हिंदी व्याख्या और मुख्य बात`
-      : `${topicTitle} — Direct Breakdown & Key Takeaway`;
+      ? readableTopic
+        ? `${readableTopic} | सीधी हिंदी व्याख्या और असली मोड़`
+        : `${displayTitleSubject} | हिंदी एक्सप्लेनर`
+      : readableTopic
+      ? `${readableTopic} — Direct Breakdown & Key Moment`
+      : `${displayTitleSubject} (Direct Breakdown)`;
 
   const description =
     language === 'hi'
-      ? `${topicTitle} के सबसे महत्वपूर्ण हिस्से का सीधा हिंदी अनुवाद और स्पष्ट विश्लेषण।\n\nमुख्य बिंदु:\n• क्लिप के असली दृश्य और महत्वपूर्ण पल\n• स्पष्ट और तेज़ जानकारी\n\nसब्सक्राइब करें और पूरा वीडियो देखें।`
-      : `Direct English breakdown of ${topicTitle}, preserving every key visual and spoken point cleanly.\n\nHighlights:\n• Exact sequence breakdown from start to finish\n• Clear, high-authority narration synced to the footage\n\nSubscribe for daily breakdowns and ${trendKeyword} highlights.`;
+      ? `${displayTitleSubject} का स्पष्ट और सीधा हिंदी विश्लेषण।\n\nइस क्लिप में क्या खास है:\n• शुरुआती फ्रेम से लेकर ${climaxSecRounded} सेकंड के मुख्य मोड़ तक सीधा कवरेज\n• साफ ${formatWord} फ्रेमिंग, सिनेमा कलर ग्रेड और क्रिस्प वॉइसओवर\n\nऐसे और सीधे वीडियो ब्रेकडाउन के लिए सब्सक्राइब करें।`
+      : `Direct English breakdown of ${displayTitleSubject}, keeping every key on-screen moment crystal clear.\n\nWhat happens in this clip:\n• Opening setup leading straight into the ${climaxSecRounded}-second turning point\n• Clean ${formatWord} framing, cinema color grade, and synced commanding narration\n\nSubscribe for daily visual breakdowns and ${trendKeyword} highlights.`;
 
   const tagList = [
-    topicTitle.toLowerCase(),
-    language === 'hi' ? 'hindi explanation' : 'direct breakdown',
-    language === 'hi' ? 'hindi voiceover' : 'us explainer',
+    ...(readableTopic ? [readableTopic.toLowerCase()] : []),
+    language === 'hi' ? 'hindi explainer' : 'direct breakdown',
+    language === 'hi' ? 'hindi voiceover' : 'visual explainer',
+    language === 'hi' ? 'viral clip hindi' : 'us shorts explainer',
     'shorts',
-    'viral clip',
-    'fact check',
+    'reels',
+    'key moment',
+    'frame by frame',
     trendKeyword.toLowerCase(),
   ].filter((v, i, arr) => v.length > 1 && arr.indexOf(v) === i);
 
   const hashtags =
     language === 'hi'
-      ? '#Shorts #HindiExplainer #ViralClip #DirectTranslation #Trending'
+      ? '#Shorts #HindiExplainer #DirectBreakdown #ViralClip #TrendingIndia'
       : '#Shorts #Explainer #DirectBreakdown #ViralClip #TrendingUS';
 
   const postingTime =
     language === 'hi'
       ? 'Best Upload Window: 6:30 PM – 9:00 PM IST (India Peak) | 9:00 AM – 11:30 AM EST (USA Morning)'
-      : 'Best Upload Window: 11:30 AM – 2:00 PM EST / 6:00 PM – 8:30 PM EST (USA Peak) | 9:00 PM – 11:30 PM IST (India Peak)';
+      : 'Best Upload Window: 11:30 AM – 2:00 PM EST & 6:00 PM – 8:30 PM EST (USA Peak) | 9:00 PM – 11:30 PM IST (India Peak)';
 
   return {
     voiceover,

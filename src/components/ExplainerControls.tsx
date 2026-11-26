@@ -171,7 +171,7 @@ export function ExplainerControls({
           disabled={isRendering}
           value={customAngle}
           onChange={(e) => onCustomAngleChange(e.target.value)}
-          placeholder="Optional: paste original transcript, key facts, or terminology to preserve faithfully in the direct translation..."
+          placeholder="Optional: paste spoken points or key terms to preserve..."
           className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3 py-2 text-xs font-semibold text-[#0F172A] placeholder:text-[#94A3B8] focus:border-[#3D5AFE] focus:bg-white focus:outline-none disabled:opacity-55 resize-none"
         />
       </div>

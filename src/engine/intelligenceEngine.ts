@@ -3,9 +3,13 @@ import {
   fetchYouTubeTrendsFromApi,
   runSingleClipAiRequest,
 } from './modelRouter';
-import { generateOfflineDirectTranslationAndMetadata } from './offlineModels';
+import {
+  extractReadableTopicFromLabel,
+  generateOfflineDirectTranslationAndMetadata,
+} from './offlineModels';
 import type {
   AiEnginePreference,
+  ConnectionStatusState,
   OutputLanguage,
   PreparedVisualClip,
   ScriptBeat,
@@ -26,7 +30,7 @@ interface AiTranslationSeoPayload {
 export async function fetchLiveYouTubeTrends(
   topicQuery: string,
   signal?: AbortSignal
-): Promise<YouTubeTrendVideo[]> {
+): Promise<{ items: YouTubeTrendVideo[]; connected: boolean }> {
   return fetchYouTubeTrendsFromApi(topicQuery, signal);
 }
 
@@ -35,7 +39,7 @@ function normalizeBeats(
   voiceover: string,
   lockedDurationSec: number
 ): ScriptBeat[] {
-  const safeDur = Math.max(1.5, lockedDurationSec - 0.25);
+  const safeDur = Math.max(1.5, lockedDurationSec - 0.3);
 
   if (Array.isArray(rawBeats) && rawBeats.length > 0) {
     const valid = rawBeats
@@ -66,7 +70,6 @@ function normalizeBeats(
     }
   }
 
-  // Split voiceover cleanly into sentences if AI omitted explicit beat timings
   const sentences = voiceover
     .split(/(?<=[.!?।])\s+/)
     .map((s) => s.trim())
@@ -109,7 +112,8 @@ function normalizeHashtags(value: string | string[] | undefined, fallback: strin
  * STEP 3 (Direct Translation & SEO):
  * Makes STRICTLY ONE primary AI request per clip (using Gemini 3.8 Flash or the selected
  * NVIDIA NIM model) combined with live US YouTube Data API v3 trend signals.
- * Zero retry loops on 429 — falls back immediately to local direct-translation SEO if quota fails.
+ * Zero retry loops on 429 — falls back cleanly to natural clip-specific local script + SEO
+ * and reports live connection status updates to the UI.
  */
 export async function translateClipAndBuildSeoStep3(params: {
   clip: PreparedVisualClip;
@@ -120,6 +124,7 @@ export async function translateClipAndBuildSeoStep3(params: {
   trends: YouTubeTrendVideo[];
   signal?: AbortSignal;
   onStatus?: (detail: string) => void;
+  onConnectionPatch?: (patch: Partial<ConnectionStatusState>) => void;
 }): Promise<TrendMetadata> {
   const {
     clip,
@@ -130,12 +135,16 @@ export async function translateClipAndBuildSeoStep3(params: {
     trends,
     signal,
     onStatus,
+    onConnectionPatch,
   } = params;
 
   const targetDurSec = clip.lockedVisualDurationSec;
   const maxSpeechSec = Math.max(2, targetDurSec - 0.35);
-  // ~2.35 words/sec for bold commanding delivery so speech fits comfortably without mid-sentence cutoff
-  const targetWordCount = Math.max(10, Math.round(maxSpeechSec * 2.35));
+  // ~2.2 words/sec for commanding broadcast clarity so speech finishes cleanly inside exact clip duration
+  const targetWordCount = Math.max(10, Math.round(maxSpeechSec * 2.2));
+  const safeTopicLabel =
+    extractReadableTopicFromLabel(sourceLabel, customAngle) ||
+    'Visual Video Clip (do not mention any raw filename or file ID)';
 
   const languageName =
     language === 'hi'
@@ -156,14 +165,15 @@ export async function translateClipAndBuildSeoStep3(params: {
   const systemPrompt = `You are a precision Direct Translation & Video SEO Producer.
 Your job is to inspect the stamped 3x2 keyframe contact sheet (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) and deliver a DIRECT, FAITHFUL translation/narration of the clip's actual on-screen/spoken main points into ${languageName}.
 RULES:
-1. Do NOT invent unrelated clickbait stories. Preserve every visible action, on-screen text, and core point faithfully in ${languageName}.
-2. Keep the narration bold, clear, and commanding, sized to ~${targetWordCount} words so it finishes cleanly before ${maxSpeechSec.toFixed(1)}s with zero mid-sentence cutoff.
-3. Return ONLY valid JSON matching the exact schema below. No markdown fences or commentary.`;
+1. Never mention raw filenames, numeric camera IDs (e.g. 1000179945.mp4), or technical terms like "contact sheet".
+2. Preserve every visible action, on-screen text, and core point faithfully in ${languageName}.
+3. Write with high-authority, punchy, energetic broadcast rhythm—short crisp sentences with natural emphasis, zero flat/monotone filler, sized to ~${targetWordCount} words so narration finishes cleanly before ${maxSpeechSec.toFixed(1)}s.
+4. Return ONLY valid JSON matching the exact schema below.`;
 
-  const userPrompt = `SOURCE FILE / LABEL: ${sourceLabel}
+  const userPrompt = `CLIP TOPIC HINT: ${safeTopicLabel}
 CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (${clip.sourceStartSec.toFixed(1)}s–${clip.sourceEndSec.toFixed(1)}s, locked duration: ${targetDurSec.toFixed(1)}s, keyframe stamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
 OUTPUT LANGUAGE: ${languageName}
-USER CONTEXT / SPOKEN NOTES (if provided, translate and preserve these exact points): ${customAngle.trim() || 'Translate and narrate the main visual/spoken points directly from the stamped frames.'}
+USER CONTEXT / SPOKEN NOTES: ${customAngle.trim() || 'Translate and narrate the main visual/spoken points directly from the stamped frames.'}
 
 LIVE US YOUTUBE TRENDS (regionCode=US):
 ${trendSummary}
@@ -187,7 +197,6 @@ RETURN STRICT JSON ONLY:
     `Running single-call direct translation & SEO for Clip ${clip.clipIndex}/${clip.totalClips}...`
   );
 
-  // STRICT 1-CALL QUOTA GUARDRAIL: exactly one primary AI call per clip, zero 429 retries
   const aiResponse = await runSingleClipAiRequest({
     preference: aiEngine,
     systemPrompt,
@@ -197,6 +206,22 @@ RETURN STRICT JSON ONLY:
   });
 
   if (!aiResponse || !aiResponse.rawText.trim()) {
+    if (aiResponse?.provider === 'gemini') {
+      onConnectionPatch?.({
+        gemini: aiResponse.quotaExhausted ? 'Quota-Limit' : 'Fallback',
+      });
+    } else if (aiResponse?.provider === 'nvidia') {
+      onConnectionPatch?.({
+        nvidia: aiResponse.corsBlocked
+          ? 'CORS-Blocked'
+          : aiResponse.keyMissing
+          ? 'Key-Missing'
+          : aiResponse.quotaExhausted
+          ? 'Quota-Limit'
+          : 'Fallback',
+      });
+    }
+
     return generateOfflineDirectTranslationAndMetadata({
       clip,
       sourceLabel,
@@ -217,6 +242,12 @@ RETURN STRICT JSON ONLY:
       trends,
       fallbackReason: `${aiResponse.modelUsed} returned non-JSON`,
     });
+  }
+
+  if (aiResponse.provider === 'gemini') {
+    onConnectionPatch?.({ gemini: 'Connected' });
+  } else if (aiResponse.provider === 'nvidia') {
+    onConnectionPatch?.({ nvidia: 'Connected' });
   }
 
   const offlineDefaults = generateOfflineDirectTranslationAndMetadata({

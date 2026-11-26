@@ -23,12 +23,12 @@ export function SourcePreviewCard({
           </span>
           <div className="min-w-0">
             <h2 className="text-base font-extrabold text-[#0F172A] truncate">
-              Card 1 · Source Video Preview
+              Source Video Preview
             </h2>
             <p className="text-xs font-medium text-[#64748B] truncate">
               {sourceMedia
-                ? `${sourceMedia.platform} · ${sourceMedia.label}`
-                : 'Loaded source clip appears here immediately with real duration & resolution'}
+                ? `${sourceMedia.platform} · ${formatDuration(sourceMedia.durationSec)}`
+                : 'Preview appears here once a video is loaded'}
             </p>
           </div>
         </div>

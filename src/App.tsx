@@ -22,10 +22,12 @@ import {
   fetchLiveYouTubeTrends,
   translateClipAndBuildSeoStep3,
 } from './engine/intelligenceEngine';
+import { probeInitialConnectionStatus } from './engine/modelRouter';
 import { synthesizeCommandingVoiceover } from './engine/audioEngine';
 import { renderProductionMp4Gpu } from './engine/gpuRenderer';
 import { warmOfflineEngines } from './engine/offlineModels';
 import type {
+  ConnectionStatusState,
   PipelineProgress,
   PipelineStepId,
   RenderedClipOutput,
@@ -56,6 +58,14 @@ const INITIAL_CONTROLS: StudioControlsState = {
   customAngle: '',
 };
 
+const INITIAL_CONNECTION_STATUS: ConnectionStatusState = {
+  gemini: 'Fallback',
+  nvidia: 'Key-Missing',
+  youtube: 'Fallback',
+  voice: 'Browser-Speech',
+  backendAvailable: false,
+};
+
 export function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('studio');
   const [controls, setControls] = useState<StudioControlsState>(INITIAL_CONTROLS);
@@ -63,6 +73,9 @@ export function App() {
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [isFetchingLink, setIsFetchingLink] = useState(false);
 
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusState>(
+    INITIAL_CONNECTION_STATUS
+  );
   const [progress, setProgress] = useState<PipelineProgress>(INITIAL_PROGRESS);
   const [renderedClips, setRenderedClips] = useState<RenderedClipOutput[]>([]);
   const [savedRenders, setSavedRenders] = useState<SavedRenderRecord[]>(() =>
@@ -75,12 +88,22 @@ export function App() {
 
   useEffect(() => {
     warmOfflineEngines();
+    void probeInitialConnectionStatus().then((snapshot) => {
+      setConnectionStatus(snapshot);
+    });
     return () => {
       abortRef.current?.abort();
       if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
       renderedUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
     };
   }, []);
+
+  const patchConnectionStatus = useCallback(
+    (patch: Partial<ConnectionStatusState>) => {
+      setConnectionStatus((prev) => ({ ...prev, ...patch }));
+    },
+    []
+  );
 
   const replaceSourceMedia = useCallback((next: SourceMediaItem | null) => {
     if (sourceUrlRef.current && sourceUrlRef.current !== next?.objectUrl) {
@@ -112,7 +135,7 @@ export function App() {
         replaceSourceMedia(probed);
         setProgress({
           ...INITIAL_PROGRESS,
-          statusDetail: `Loaded "${probed.label}" (${probed.durationSec.toFixed(1)}s, ${probed.width}×${probed.height}). Ready to run all 5 steps.`,
+          statusDetail: `Video ready (${probed.durationSec.toFixed(1)}s · ${probed.width}×${probed.height}). Click Run 5-Step Pipeline.`,
         });
       } catch (err) {
         setSourceError(
@@ -191,7 +214,9 @@ export function App() {
     const { signal } = controller;
 
     const runTag = `studio-${Date.now().toString(36)}`;
+    const runStartedAtMs = Date.now();
     const completedSteps: PipelineStepId[] = [];
+    const outputs: RenderedClipOutput[] = [];
     const markStep = (
       activeStep: PipelineStepId,
       percent: number,
@@ -206,7 +231,7 @@ export function App() {
         statusDetail,
         clipProgressLabel,
         runTag,
-        startedAtMs: Date.now(),
+        startedAtMs: runStartedAtMs,
         errorMessage: null,
       });
     };
@@ -269,7 +294,10 @@ export function App() {
       const trendQuery =
         controls.customAngle.trim() ||
         activeSource.label.replace(/\.(mp4|mov|webm|mkv)$/i, '');
-      const trends = await fetchLiveYouTubeTrends(trendQuery, signal);
+      const trendResult = await fetchLiveYouTubeTrends(trendQuery, signal);
+      patchConnectionStatus({
+        youtube: trendResult.connected ? 'Connected' : 'Fallback',
+      });
 
       const clipMetadataList: TrendMetadata[] = [];
       for (let i = 0; i < preparedClips.length; i++) {
@@ -284,18 +312,21 @@ export function App() {
           language: controls.language,
           aiEngine: controls.aiEngine,
           customAngle: controls.customAngle,
-          trends,
+          trends: trendResult.items,
           signal,
           onStatus: (detail) =>
             markStep('step_3_translate_seo', stepPct, `Step 3/5: ${detail}`, clipLabel),
+          onConnectionPatch: patchConnectionStatus,
         });
         clipMetadataList.push(meta);
       }
 
       completedSteps.push('step_3_translate_seo');
 
-      // STEP 4: Commanding Voiceover (Gemini 3.8 Flash TTS + Broadcast EQ + Duration Fit)
-      const voiceResults = [];
+      // STEP 4: Commanding Voiceover (Gemini 3.8 Flash TTS or Real Browser Speech Voiceover)
+      const voiceResults: Awaited<
+        ReturnType<typeof synthesizeCommandingVoiceover>
+      >[] = [];
       for (let i = 0; i < preparedClips.length; i++) {
         if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
         const clip = preparedClips[i];
@@ -314,6 +345,7 @@ export function App() {
             markStep('step_4_voiceover', stepPct, `Step 4/5: ${detail}`, clipLabel),
         });
 
+        patchConnectionStatus({ voice: voice.voiceSource });
         meta.wordTimings = voice.wordTimings;
         voiceResults.push(voice);
       }
@@ -321,7 +353,6 @@ export function App() {
       completedSteps.push('step_4_voiceover');
 
       // STEP 5: Fast, Phone-Safe Mux & Output Deck
-      const outputs: RenderedClipOutput[] = [];
       for (let i = 0; i < preparedClips.length; i++) {
         if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
         const clip = preparedClips[i];
@@ -363,6 +394,7 @@ export function App() {
           language: controls.language,
           voiceGender: controls.voiceGender,
           voiceEngine: voice.voiceEngine,
+          voiceSource: voice.voiceSource,
           renderEngine: rendered.renderEngine,
           watermarkBoxesRemoved: clip.delogoZoneCount,
           endCardTrimmedSec: clip.bumperTrimmedSec,
@@ -398,6 +430,7 @@ export function App() {
         errorMessage: null,
       });
     } catch (err) {
+      outputs.forEach((o) => URL.revokeObjectURL(o.videoUrl));
       if ((err as Error).name === 'AbortError') return;
       const msg =
         err instanceof Error ? err.message : 'Unexpected pipeline error occurred.';
@@ -408,7 +441,13 @@ export function App() {
         errorMessage: msg,
       }));
     }
-  }, [controls, replaceRenderedClips, replaceSourceMedia, sourceMedia]);
+  }, [
+    controls,
+    patchConnectionStatus,
+    replaceRenderedClips,
+    replaceSourceMedia,
+    sourceMedia,
+  ]);
 
   const isRendering = progress.status === 'running';
   const canRun =
@@ -448,6 +487,9 @@ export function App() {
                 }
                 onVideoUrlChange={(videoUrl) => {
                   setSourceError(null);
+                  if (sourceMedia?.sourceType === 'link') {
+                    replaceSourceMedia(null);
+                  }
                   setControls((prev) => ({ ...prev, videoUrl }));
                 }}
                 onFetchLinkPreview={handleFetchLinkPreview}
@@ -484,11 +526,18 @@ export function App() {
               />
             </div>
 
-            {/* Right Column: 5-Step Pipeline Progress -> Card 2 Final Production Output Deck */}
+            {/* Right Column: 5-Step Pipeline Progress + Live Connection Pills -> Card 2 Final Production Output Deck */}
             <div className="lg:col-span-7 space-y-5">
-              <CloudProgressBar progress={progress} />
+              <CloudProgressBar
+                progress={progress}
+                connectionStatus={connectionStatus}
+              />
 
-              <OutputDeckCard clips={renderedClips} runTag={progress.runTag} />
+              <OutputDeckCard
+                key={progress.runTag ?? 'empty'}
+                clips={renderedClips}
+                runTag={progress.runTag}
+              />
             </div>
           </div>
         )}

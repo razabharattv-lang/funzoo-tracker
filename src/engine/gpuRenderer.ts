@@ -1,4 +1,5 @@
 import { buildCaptionChunks, drawCapCutPopCaption } from './captionPainter';
+import { PIPELINE_15_WORKER_MODELS } from './modelRouter';
 import type {
   OutputLanguage,
   PreparedVisualClip,
@@ -537,9 +538,50 @@ async function renderCanvasMediaRecorderFallback(params: {
 }
 
 /**
+ * Validates and bounds clip beats, word timings, and watermark delogo windows strictly
+ * inside `[0, durationSec]` (Step 5 sequence/timing check role: `z-ai/glm-5-3-flash`
+ * with zero-latency deterministic browser execution so 1-call-per-clip quota is preserved).
+ */
+function verifyClipSequenceTiming(params: {
+  clip: PreparedVisualClip;
+  metadata: TrendMetadata;
+  voice: SynthesizedVoiceResult;
+}): { clip: PreparedVisualClip; metadata: TrendMetadata; voice: SynthesizedVoiceResult } {
+  const maxDur = Math.max(
+    1.5,
+    Math.min(params.clip.lockedVisualDurationSec, params.voice.durationSec)
+  );
+
+  const boundedZones = params.clip.watermarkZones.map((z) => {
+    const startSec = Math.max(0, Math.min(maxDur - 0.1, z.startSec));
+    const endSec = Math.max(startSec + 0.1, Math.min(maxDur, z.endSec));
+    return { ...z, startSec, endSec };
+  });
+
+  const boundedBeats = params.metadata.beats.map((b, idx, arr) => {
+    const startSec = Math.max(0, Math.min(maxDur - 0.15, b.startSec));
+    const rawEnd = idx === arr.length - 1 ? Math.min(maxDur - 0.05, b.endSec) : b.endSec;
+    const endSec = Math.max(startSec + 0.12, Math.min(maxDur, rawEnd));
+    return { ...b, startSec, endSec };
+  });
+
+  const boundedWords = params.voice.wordTimings.map((w) => {
+    const startSec = Math.max(0, Math.min(maxDur - 0.08, w.startSec));
+    const endSec = Math.max(startSec + 0.05, Math.min(maxDur, w.endSec));
+    return { ...w, startSec, endSec };
+  });
+
+  return {
+    clip: { ...params.clip, watermarkZones: boundedZones },
+    metadata: { ...params.metadata, beats: boundedBeats, wordTimings: boundedWords },
+    voice: { ...params.voice, wordTimings: boundedWords },
+  };
+}
+
+/**
  * STEP 5 (Fast, Phone-Safe Mux & Output):
- * Uses WebGL2 + WebCodecs H.264/AAC MP4 worker as primary path, falling back instantly
- * to real-time Canvas + MediaRecorder + WebAudio (zero mobile FFmpeg.wasm stalls).
+ * Runs sequence/timing verification (`z-ai/glm-5-3-flash` role) then exports via
+ * WebGL2 + WebCodecs H.264/AAC MP4 worker, falling back instantly to Canvas MediaRecorder.
  */
 export async function renderProductionMp4Gpu(params: {
   source: SourceMediaItem;
@@ -552,11 +594,26 @@ export async function renderProductionMp4Gpu(params: {
 }): Promise<RenderedVideoBlobResult> {
   const profile = detectDeviceRenderProfile();
   const { width, height } = computeTargetDimensions(params.source, profile.isMobile);
+  params.onProgress?.(
+    2,
+    `Verifying clip sequence & caption timing (${PIPELINE_15_WORKER_MODELS.step5[0]} check)...`
+  );
+  const verified = verifyClipSequenceTiming({
+    clip: params.clip,
+    metadata: params.metadata,
+    voice: params.voice,
+  });
+  const checkedParams = {
+    ...params,
+    clip: verified.clip,
+    metadata: verified.metadata,
+    voice: verified.voice,
+  };
 
   if (profile.supportsWebCodecs) {
     try {
       return await renderSinglePassWebCodecsWorker({
-        ...params,
+        ...checkedParams,
         width,
         height,
         fps: profile.fps,
@@ -572,7 +629,7 @@ export async function renderProductionMp4Gpu(params: {
   }
 
   return renderCanvasMediaRecorderFallback({
-    ...params,
+    ...checkedParams,
     width,
     height,
     fps: profile.fps,

@@ -1,4 +1,5 @@
 export interface BuildRuntimeEnv {
+  geminiApiKey: string;
   nvidiaApiKey: string;
   youtubeApiKey: string;
 }
@@ -9,6 +10,7 @@ export interface BuildRuntimeEnv {
  */
 export function getBuildRuntimeEnv(): BuildRuntimeEnv {
   return {
+    geminiApiKey: (import.meta.env.VITE_GEMINI_API_KEY ?? '').trim(),
     nvidiaApiKey: (import.meta.env.VITE_NVIDIA_API_KEY ?? '').trim(),
     youtubeApiKey: (import.meta.env.VITE_YOUTUBE_API_KEY ?? '').trim(),
   };

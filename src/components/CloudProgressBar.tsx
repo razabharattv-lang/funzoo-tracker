@@ -3,12 +3,18 @@ import {
   CheckCircle2,
   Circle,
   Loader2,
+  Radio,
   Sparkles,
 } from 'lucide-react';
-import type { PipelineProgress, PipelineStepId } from '../types/studio';
+import type {
+  ConnectionStatusState,
+  PipelineProgress,
+  PipelineStepId,
+} from '../types/studio';
 
 interface CloudProgressBarProps {
   progress: PipelineProgress;
+  connectionStatus: ConnectionStatusState;
 }
 
 const STEPS: { id: PipelineStepId; num: string; label: string }[] = [
@@ -19,7 +25,23 @@ const STEPS: { id: PipelineStepId; num: string; label: string }[] = [
   { id: 'step_5_mux_output', num: '5', label: 'Mux & Output' },
 ];
 
-export function CloudProgressBar({ progress }: CloudProgressBarProps) {
+function pillStyle(value: string): string {
+  if (value === 'Connected' || value === 'Gemini-TTS') {
+    return 'border-[#00C853] bg-[#E8F9EE] text-[#065F46]';
+  }
+  if (value === 'CORS-Blocked' || value === 'Quota-Limit') {
+    return 'border-[#FF1744] bg-[#FFF1F3] text-[#B71C1C]';
+  }
+  if (value === 'Browser-Speech') {
+    return 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]';
+  }
+  return 'border-[#CBD5E1] bg-[#F4F6F9] text-[#475569]';
+}
+
+export function CloudProgressBar({
+  progress,
+  connectionStatus,
+}: CloudProgressBarProps) {
   const pct = Math.max(0, Math.min(100, Math.round(progress.percent)));
 
   const statusColor =
@@ -37,6 +59,13 @@ export function CloudProgressBar({ progress }: CloudProgressBarProps) {
       : progress.status === 'completed'
       ? 'bg-[#00C853]'
       : 'bg-[#3D5AFE]';
+
+  const statusPills = [
+    { label: 'Gemini', value: connectionStatus.gemini },
+    { label: 'NVIDIA', value: connectionStatus.nvidia },
+    { label: 'YouTube', value: connectionStatus.youtube },
+    { label: 'Voice', value: connectionStatus.voice },
+  ];
 
   return (
     <section
@@ -69,6 +98,28 @@ export function CloudProgressBar({ progress }: CloudProgressBarProps) {
             {pct}%
           </span>
         </div>
+      </div>
+
+      {/* Live Connection Status Pills */}
+      <div
+        aria-label="Live API & Voice Connection Status"
+        className="flex flex-wrap items-center gap-2 pt-0.5"
+      >
+        <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-[#64748B] mr-0.5">
+          <Radio className="w-3.5 h-3.5 text-[#3D5AFE]" strokeWidth={2.5} />
+          <span>Live Status:</span>
+        </span>
+        {statusPills.map((pill) => (
+          <span
+            key={pill.label}
+            className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full border-2 text-[11px] font-extrabold whitespace-nowrap ${pillStyle(
+              pill.value
+            )}`}
+          >
+            <span>{pill.label}:</span>
+            <span>{pill.value}</span>
+          </span>
+        ))}
       </div>
 
       {/* Progress Track */}

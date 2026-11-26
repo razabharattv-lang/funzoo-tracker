@@ -8,10 +8,13 @@ export type AiEnginePreference =
   | 'auto'
   | 'gemini-3.8-flash'
   | 'nvidia/nemotron-3.5-super-vl-120b-a12b'
-  | 'nvidia/nemotron-3.5-lightning-30b-a3b'
-  | 'mistralai/mistral-large-4'
+  | 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'
+  | 'nvidia/cosmos3-nano-reasoner'
   | 'nvidia/riva-translate-4b-instruct-v2'
-  | 'nvidia/nemotron-3.5-content-safety';
+  | 'mistralai/mistral-large-4'
+  | 'nvidia/nemotron-3.5-lightning-30b-a3b'
+  | 'nvidia/nemotron-3.5-content-safety'
+  | 'z-ai/glm-5-3-flash';
 
 export type PipelineStepId =
   | 'step_1_fetch_clip'
@@ -53,6 +56,7 @@ export interface LocalSceneScanResult {
   detectedWatermarkZones: WatermarkZone[];
   suggestedSafeCropInsets: SafeCropInsets;
   hasOutroBumper: boolean;
+  visualSummary?: ClipVisualSummary;
 }
 
 export interface StudioControlsState {
@@ -119,6 +123,7 @@ export interface ViralSegment {
   trimRange: TrimRange;
   safeCropInsets: SafeCropInsets;
   watermarkZones: WatermarkZone[];
+  visualSummary?: ClipVisualSummary;
 }
 
 export interface PreparedVisualClip {
@@ -139,6 +144,7 @@ export interface PreparedVisualClip {
   stampedContactSheetJpeg: string;
   stampedTimestampsSec: number[];
   inspectorModel: string;
+  visualSummary?: ClipVisualSummary;
 }
 
 export interface YouTubeTrendVideo {
@@ -163,6 +169,31 @@ export interface TrendMetadata {
   youtubeTrendsCount: number;
 }
 
+export type GeminiConnectionStatus = 'Connected' | 'Quota-Limit' | 'Fallback';
+export type NvidiaConnectionStatus =
+  | 'Connected'
+  | 'CORS-Blocked'
+  | 'Key-Missing'
+  | 'Quota-Limit'
+  | 'Fallback';
+export type YoutubeConnectionStatus = 'Connected' | 'Fallback';
+export type VoiceConnectionStatus = 'Gemini-TTS' | 'Browser-Speech';
+
+export interface ConnectionStatusState {
+  gemini: GeminiConnectionStatus;
+  nvidia: NvidiaConnectionStatus;
+  youtube: YoutubeConnectionStatus;
+  voice: VoiceConnectionStatus;
+  backendAvailable: boolean;
+}
+
+export interface ClipVisualSummary {
+  orientation: 'vertical' | 'landscape' | 'square';
+  pacing: 'fast-cut' | 'dynamic' | 'steady';
+  sceneCutCount: number;
+  lighting: 'bright' | 'high-contrast' | 'cinematic';
+}
+
 export interface RenderedClipOutput {
   clipIndex: number;
   totalClips: number;
@@ -179,6 +210,7 @@ export interface RenderedClipOutput {
   language: OutputLanguage;
   voiceGender: VoiceGender;
   voiceEngine: string;
+  voiceSource: VoiceConnectionStatus;
   renderEngine: string;
   watermarkBoxesRemoved: number;
   endCardTrimmedSec: number;

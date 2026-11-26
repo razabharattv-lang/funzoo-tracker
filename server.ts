@@ -18,11 +18,25 @@ const GEMINI_PRIMARY_TTS_MODEL = 'gemini-3.8-flash-tts';
 const GEMINI_FALLBACK_TTS_MODEL = 'gemini-3.8-flash-lite-tts';
 
 const ALLOWED_NVIDIA_MODELS = new Set([
+  // Step 1 (Fetch & Clip)
   'nvidia/nemotron-3.5-super-vl-120b-a12b',
-  'nvidia/nemotron-3.5-lightning-30b-a3b',
-  'mistralai/mistral-large-4',
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
+  'nvidia/nemotron-ocr-v1',
+  // Step 2 (Clean & Grade)
+  'nvidia/nemotron-3.5-parse',
+  'nvidia/cosmos3-nano-reasoner',
+  'nvidia/video-super-resolution-nim',
+  // Step 3 (Direct Translation & SEO)
   'nvidia/riva-translate-4b-instruct-v2',
+  'mistralai/mistral-large-4',
+  'nvidia/nemotron-3.5-lightning-30b-a3b',
   'nvidia/nemotron-3.5-content-safety',
+  // Step 4 (Voiceover DSP / TTS workers)
+  'nvidia/magpie-tts-zeroshot',
+  'nvidia/studio-voice',
+  'nvidia/background-noise-removal',
+  // Step 5 (Mux & Sequence Timing Check)
+  'z-ai/glm-5-3-flash',
 ]);
 
 const NVIDIA_NIM_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
@@ -316,7 +330,12 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      const supportsVision = model === 'nvidia/nemotron-3.5-super-vl-120b-a12b';
+      const supportsVision =
+        model === 'nvidia/nemotron-3.5-super-vl-120b-a12b' ||
+        model === 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning' ||
+        model === 'nvidia/nemotron-ocr-v1' ||
+        model === 'nvidia/nemotron-3.5-parse' ||
+        model === 'nvidia/cosmos3-nano-reasoner';
       const userContent =
         supportsVision && imageBase64Jpeg
           ? [
