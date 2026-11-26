@@ -1,0 +1,5 @@
+{
+  "name": "US Explainer Video Studio",
+  "description": "Private Flat Material React + Vite studio hosted on GitHub Pages and connected to Cloudinary and GitHub Actions for 7GB cloud AI US explainer video rendering and viral metadata generation.",
+  "requestFramePermissions": []
+}

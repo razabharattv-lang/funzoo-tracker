@@ -1,46 +1,97 @@
-name: FunzooKids Pro Cloud Engine
+name: US Explainer Video Studio Cloud Engine
+run-name: "US Explainer Render [${{ inputs.job_id }}]"
 
 on:
   workflow_dispatch:
     inputs:
-      file_id:
-        description: 'Telegram Video File ID'
+      job_id:
+        description: 'Unique Studio Render Job ID'
         required: true
-      chat_id:
-        description: 'Telegram Chat ID'
+        type: string
+      raw_video_url:
+        description: 'Temporary Cloudinary Raw Video URL'
         required: true
-      caption:
-        description: 'User Hint'
+        type: string
+      raw_public_id:
+        description: 'Cloudinary Raw Video Public ID (deleted after render)'
+        required: true
+        type: string
+      custom_prompt:
+        description: 'Optional Custom US Explainer Angle / Hook'
         required: false
-      status_msg_id:
-        description: 'Progress Message ID'
+        default: ''
+        type: string
+      voice_gender:
+        description: 'Voice Gender (female or male)'
         required: false
+        default: 'female'
+        type: string
+      shield_options:
+        description: 'Comma-separated Anti-Copyright Shield flags'
+        required: false
+        default: 'crop_watermark,micro_zoom,color_grade,strip_metadata'
+        type: string
+      caption_theme:
+        description: 'ASS Pop-up Caption Theme'
+        required: false
+        default: 'capcut_yellow_white'
+        type: string
 
 jobs:
-  process-videos:
+  render-explainer:
+    name: 7GB Cloud US Explainer Render
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+      CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+      CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+      CLOUDINARY_UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
+      JOB_ID: ${{ github.event.inputs.job_id }}
+      RAW_VIDEO_URL: ${{ github.event.inputs.raw_video_url }}
+      RAW_PUBLIC_ID: ${{ github.event.inputs.raw_public_id }}
+      CUSTOM_PROMPT: ${{ github.event.inputs.custom_prompt }}
+      VOICE_GENDER: ${{ github.event.inputs.voice_gender }}
+      SHIELD_OPTIONS: ${{ github.event.inputs.shield_options }}
+      CAPTION_THEME: ${{ github.event.inputs.caption_theme }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python & FFmpeg
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg & Audio Tools
+      - name: Install Render Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
-          pip install requests edge-tts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          pip install --quiet --upgrade pip
+          pip install --quiet -r requirements.txt
 
-      - name: Run 7GB Pro Video Upgrader
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
-          INPUT_CHAT_ID: ${{ github.event.inputs.chat_id }}
-          INPUT_CAPTION: ${{ github.event.inputs.caption }}
-          STATUS_MSG_ID: ${{ github.event.inputs.status_msg_id }}
-        run: python process_video.py
+      - name: AI Vision & Script
+        run: python process_video.py --stage analyze
+
+      - name: Voice & Captions
+        run: python process_video.py --stage voice
+
+      - name: FFmpeg Anti-Copyright Render
+        run: python process_video.py --stage render
+
+      - name: Upload Output & Cleanup
+        run: python process_video.py --stage publish
+
+      - name: Save Render Manifest Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-result-${{ github.event.inputs.job_id }}
+          path: result_manifest.json
+          retention-days: 7
+
+      - name: Cleanup Raw Input on Failure
+        if: failure()
+        run: python process_video.py --stage cleanup_raw
