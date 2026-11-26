@@ -11,10 +11,7 @@ import {
   buildDefaultViralSegments,
   getUsableSourceDuration,
 } from './streamResolver';
-
-const GEMINI_PRIMARY_MODEL = 'gemini-3.8-flash';
-const GEMINI_FALLBACK_MODEL = 'gemini-3.5-flash';
-const API_TIMEOUT_MS = 12_000;
+import { runStep1VisionJson } from './modelRouter';
 
 export const MAX_SAFE_CROP_INSET = 0.14;
 export const MAX_AUTO_EDGE_CROP = 0.12;
@@ -418,22 +415,6 @@ async function blobToBase64(blob: Blob): Promise<string> {
   return dataUrl.split(',')[1] ?? '';
 }
 
-function stripJsonFences(raw: string): string {
-  let cleaned = raw.trim();
-  if (cleaned.startsWith('```')) {
-    const lines = cleaned.split('\n');
-    if (lines[0]?.startsWith('```')) lines.shift();
-    if (lines[lines.length - 1]?.trim() === '```') lines.pop();
-    cleaned = lines.join('\n').trim();
-  }
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    cleaned = cleaned.slice(start, end + 1);
-  }
-  return cleaned;
-}
-
 async function seekVideoOnce(
   video: HTMLVideoElement,
   seekSec: number
@@ -457,76 +438,29 @@ async function seekVideoOnce(
   });
 }
 
-async function callGeminiVisionOnce(
-  apiKey: string,
-  parts: Record<string, unknown>[],
-  signal?: AbortSignal
-): Promise<{ parsed: Record<string, unknown>; modelUsed: string } | null> {
-  if (!apiKey) return null;
-  const modelsToTry = [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL];
-  const payload = JSON.stringify({
-    contents: [{ role: 'user', parts }],
-    generationConfig: { responseMimeType: 'application/json' },
-  });
-
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const model = modelsToTry[i];
-    const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
-    const onParentAbort = () => ctrl.abort();
-    signal?.addEventListener('abort', onParentAbort, { once: true });
-
-    try {
-      const resp = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-          apiKey
-        )}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: payload,
-          signal: ctrl.signal,
-        }
-      );
-      if (!resp.ok) {
-        if (i === 0 && (resp.status === 404 || resp.status >= 500 || resp.status === 429)) {
-          continue;
-        }
-        return null;
-      }
-      const data = (await resp.json()) as {
-        candidates?: { content?: { parts?: { text?: string }[] } }[];
-      };
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-      if (!text) continue;
-      return {
-        parsed: JSON.parse(stripJsonFences(text)) as Record<string, unknown>,
-        modelUsed: model,
-      };
-    } catch (err) {
-      if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    } finally {
-      window.clearTimeout(timer);
-      signal?.removeEventListener('abort', onParentAbort);
-    }
-  }
-  return null;
-}
-
 /**
- * Stage 1A (Long Video > 65s):
+ * Step 1 (Long Video > 65s):
  * Seeks across 18 proportional timestamps (4% to 96%) without buffering the whole
  * file in RAM, builds ONE 6x3 contact sheet (<= 768px wide), and makes strictly ONE
- * Gemini Vision call to identify the top 3-5 viral windows + watermark decisions.
+ * Vision call (Nemotron 3.5 VL / Cosmos 3 / OCR -> Gemini 3.8 Flash) to identify
+ * top 3-5 viral windows + bumper/watermark decisions.
  */
 async function scanLongVideo18FramesOnce(params: {
   source: SourceMediaItem;
   customAngle: string;
+  nvidiaApiKey: string;
   geminiApiKey: string;
   onStatus?: (msg: string) => void;
   signal?: AbortSignal;
-}): Promise<ViralSegment[]> {
-  const { source, customAngle, geminiApiKey, onStatus, signal } = params;
+}): Promise<{ segments: ViralSegment[]; inspectorModel: string }> {
+  const {
+    source,
+    customAngle,
+    nvidiaApiKey,
+    geminiApiKey,
+    onStatus,
+    signal,
+  } = params;
   const totalDurationSec = Math.max(10, source.durationSec);
   const { usableDurationSec } = getUsableSourceDuration(source);
   const fallbackSegments = buildDefaultViralSegments(source);
@@ -640,7 +574,7 @@ async function scanLongVideo18FramesOnce(params: {
   }
 
   onStatus?.(
-    `Stage 1A: Pinpointing top 3–5 viral segments & watermark zones (${GEMINI_PRIMARY_MODEL})...`
+    'Step 1: Pinpointing top 3–5 viral moments, OCR text & watermark zones...'
   );
 
   const prompt = `
@@ -679,18 +613,24 @@ Rules:
   )}s.
 `.trim();
 
-  const res = await callGeminiVisionOnce(
+  const res = await runStep1VisionJson({
+    nvidiaApiKey,
     geminiApiKey,
-    [
-      { text: prompt },
-      { inlineData: { mimeType: 'image/jpeg', data: base64Jpeg } },
-    ],
-    signal
-  );
+    systemPrompt:
+      'You are an expert computer-vision video clipper and watermark inspector. Output strictly valid JSON.',
+    userPrompt: prompt,
+    imageBase64Jpeg: base64Jpeg,
+    signal,
+  });
 
-  if (!res) return fallbackSegments;
+  if (!res) {
+    return {
+      segments: fallbackSegments,
+      inspectorModel: 'Timeline Heuristic Slicer',
+    };
+  }
 
-  const { parsed } = res;
+  const { parsed, modelUsed } = res;
   const globalZones = sanitizeWatermarkZones(
     parsed.watermark_zones ?? parsed.watermarkZones,
     parsed.watermark_boxes,
@@ -711,13 +651,16 @@ Rules:
 
   const rawSegments = parsed.viral_segments;
   if (!Array.isArray(rawSegments)) {
-    return fallbackSegments.map((seg) => ({
-      ...seg,
-      safeCropInsets: { ...globalDecision.safeCropInsets },
-      watermarkZones: globalDecision.zones.filter(
-        (z) => z.endSec > seg.startSec && z.startSec < seg.endSec
-      ),
-    }));
+    return {
+      segments: fallbackSegments.map((seg) => ({
+        ...seg,
+        safeCropInsets: { ...globalDecision.safeCropInsets },
+        watermarkZones: globalDecision.zones.filter(
+          (z) => z.endSec > seg.startSec && z.startSec < seg.endSec
+        ),
+      })),
+      inspectorModel: modelUsed,
+    };
   }
 
   const cleaned: ViralSegment[] = [];
@@ -800,17 +743,23 @@ Rules:
   }
 
   if (cleaned.length < 2) {
-    return fallbackSegments.map((seg) => ({
-      ...seg,
-      safeCropInsets: { ...globalDecision.safeCropInsets },
-      watermarkZones: globalDecision.zones.filter(
-        (z) => z.endSec > seg.startSec && z.startSec < seg.endSec
-      ),
-    }));
+    return {
+      segments: fallbackSegments.map((seg) => ({
+        ...seg,
+        safeCropInsets: { ...globalDecision.safeCropInsets },
+        watermarkZones: globalDecision.zones.filter(
+          (z) => z.endSec > seg.startSec && z.startSec < seg.endSec
+        ),
+      })),
+      inspectorModel: modelUsed,
+    };
   }
 
   cleaned.sort((a, b) => a.startSec - b.startSec);
-  return cleaned.map((seg, idx) => ({ ...seg, clipIndex: idx + 1 }));
+  return {
+    segments: cleaned.map((seg, idx) => ({ ...seg, clipIndex: idx + 1 })),
+    inspectorModel: modelUsed,
+  };
 }
 
 /**
@@ -978,60 +927,66 @@ async function buildCleanedStampedContactSheet(params: {
 }
 
 /**
- * STAGE 1 ENTRYPOINT — Build & Lock Clean Visual Timeline FIRST:
- * - Short (<= 65s): auto-trims social creator end-card (-2.6s), locks peak action
- *   window (12s-45s), builds cleaned cinema-graded 9-frame stamped contact sheet
- *   (0 Vision calls spent in Stage 1 so Stage 2 spends strictly 1 call total).
- * - Long (> 65s): 18-keyframe proportional scan (4%..96%, 1 Vision call) to extract
- *   top 3-5 viral segments (30s/40s/60s) + watermark decisions, then locks each
- *   clip's clean visual timeline and builds its 9-frame stamped contact sheet.
+ * STEP 1 — Fetch & Smart Inspector:
+ * - Short (<= 65s): trims creator outro bumper (-2.6s) and locks peak action timeline (12s-45s).
+ * - Long (> 65s): scans 18 proportional keyframes (4%-96%) via Step 1 Vision router to slice top 3-5 viral windows.
  */
-export async function prepareLockedVisualClipsStage1(params: {
+export async function inspectAndSliceSegmentsStep1(params: {
   source: SourceMediaItem;
   customAngle: string;
+  nvidiaApiKey: string;
   geminiApiKey: string;
   onStatus?: (msg: string) => void;
   signal?: AbortSignal;
-}): Promise<PreparedVisualClip[]> {
-  const { source, customAngle, geminiApiKey, onStatus, signal } = params;
+}): Promise<{ segments: ViralSegment[]; inspectorModel: string }> {
+  const {
+    source,
+    customAngle,
+    nvidiaApiKey,
+    geminiApiKey,
+    onStatus,
+    signal,
+  } = params;
 
-  let segments: ViralSegment[];
   if (source.mode === 'long') {
-    segments = await scanLongVideo18FramesOnce({
+    return scanLongVideo18FramesOnce({
       source,
       customAngle,
+      nvidiaApiKey,
       geminiApiKey,
       onStatus,
       signal,
     });
-  } else {
-    // Short video (<= 65s): auto-trim social bumper (-2.6s) & keep peak action (12s-45s)
-    const { usableDurationSec, endCardTrimmedSec } =
-      getUsableSourceDuration(source);
-    const clipLen =
-      usableDurationSec <= 45
-        ? usableDurationSec
-        : Math.min(45, Math.max(12, usableDurationSec));
-    const startSec =
-      usableDurationSec > 45
-        ? Number(((usableDurationSec - clipLen) * 0.25).toFixed(2))
-        : 0;
-    const endSec = Number(Math.min(usableDurationSec, startSec + clipLen).toFixed(2));
-    const bumperZones: WatermarkZone[] =
-      endCardTrimmedSec > 0
-        ? [
-            {
-              id: 'social_outro_bumper',
-              startSec: usableDurationSec,
-              endSec: Number(source.durationSec.toFixed(2)),
-              box: [0, 0, 1000, 1000],
-              action: 'trim_bumper',
-              label: `${source.platform} Creator Outro Bumper`,
-            },
-          ]
-        : [];
+  }
 
-    segments = [
+  const { usableDurationSec, endCardTrimmedSec } =
+    getUsableSourceDuration(source);
+  const clipLen =
+    usableDurationSec <= 45
+      ? usableDurationSec
+      : Math.min(45, Math.max(12, usableDurationSec));
+  const startSec =
+    usableDurationSec > 45
+      ? Number(((usableDurationSec - clipLen) * 0.25).toFixed(2))
+      : 0;
+  const endSec = Number(Math.min(usableDurationSec, startSec + clipLen).toFixed(2));
+  const bumperZones: WatermarkZone[] =
+    endCardTrimmedSec > 0
+      ? [
+          {
+            id: 'social_outro_bumper',
+            startSec: usableDurationSec,
+            endSec: Number(source.durationSec.toFixed(2)),
+            box: [0, 0, 1000, 1000],
+            action: 'trim_bumper',
+            label: `${source.platform} Creator Outro Bumper`,
+          },
+        ]
+      : [];
+
+  return {
+    inspectorModel: 'Smart Timeline Inspector',
+    segments: [
       {
         clipIndex: 1,
         startSec,
@@ -1045,10 +1000,25 @@ export async function prepareLockedVisualClipsStage1(params: {
         safeCropInsets: { ...ZERO_CROP_INSETS },
         watermarkZones: bumperZones,
       },
-    ];
-  }
+    ],
+  };
+}
 
-  // Open source video ONCE in metadata mode to build cleaned stamped contact sheets
+/**
+ * STEP 2 — Anti-Copyright & Motion Grade:
+ * Locks usable intervals, trims bumpers, prepares GPU delogo/safe-crop masks,
+ * and builds the cinema-graded 9-frame relative-second stamped contact sheet
+ * ready for Step 3 beat-synced script generation.
+ */
+export async function cleanAndGradeClipsStep2(params: {
+  source: SourceMediaItem;
+  segments: ViralSegment[];
+  inspectorModel: string;
+  onStatus?: (msg: string) => void;
+  signal?: AbortSignal;
+}): Promise<PreparedVisualClip[]> {
+  const { source, segments, inspectorModel, onStatus, signal } = params;
+
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
@@ -1059,7 +1029,7 @@ export async function prepareLockedVisualClipsStage1(params: {
   try {
     await new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(
-        () => reject(new Error('Source video load timed out in Stage 1.')),
+        () => reject(new Error('Source video load timed out in Step 2.')),
         12_000
       );
       video.onloadeddata = () => {
@@ -1068,7 +1038,7 @@ export async function prepareLockedVisualClipsStage1(params: {
       };
       video.onerror = () => {
         window.clearTimeout(timer);
-        reject(new Error('Could not decode source video in Stage 1.'));
+        reject(new Error('Could not decode source video in Step 2.'));
       };
     });
 
@@ -1088,10 +1058,10 @@ export async function prepareLockedVisualClipsStage1(params: {
 
       onStatus?.(
         segments.length > 1
-          ? `Stage 1B: Locking clean visual timeline & cinema grade for Clip ${i + 1}/${segments.length} (${lockedVisualDurationSec.toFixed(
+          ? `Step 2: Applying anti-copyright cleanups & cinema grade to Clip ${i + 1}/${segments.length} (${lockedVisualDurationSec.toFixed(
               1
             )}s)...`
-          : `Stage 1B: Locking clean visual timeline (${lockedVisualDurationSec.toFixed(
+          : `Step 2: Locking clean visual timeline (${lockedVisualDurationSec.toFixed(
               1
             )}s) & cinema grade...`
       );
@@ -1134,6 +1104,7 @@ export async function prepareLockedVisualClipsStage1(params: {
         delogoZoneCount,
         stampedContactSheetJpeg: base64Jpeg,
         stampedTimestampsSec,
+        inspectorModel,
       });
     }
 

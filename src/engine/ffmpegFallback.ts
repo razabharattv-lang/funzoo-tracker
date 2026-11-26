@@ -1,6 +1,7 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import type {
+  DocumentaryChapter,
   OutputLanguage,
   SafeCropInsets,
   ScriptBeat,
@@ -474,5 +475,290 @@ export async function renderWithLazyFFmpegFallback(
     safeCropApplied,
     characterMode,
     renderEngine: `FFmpeg.wasm Fallback (${targetWidth}×${targetHeight} @ ${targetFps}fps)`,
+  };
+}
+
+export async function renderDocumentarySceneFallback(opts: {
+  chapter: DocumentaryChapter;
+  targetWidth: number;
+  targetHeight: number;
+  targetFps: number;
+  audio: ProcessedStudioAudio;
+  scriptText: string;
+  beats: ScriptBeat[];
+  language: OutputLanguage;
+  characterEnabled: boolean;
+  characterPortraitUrl: string;
+  onStatus: (msg: string) => void;
+  onProgressPct: (pct: number) => void;
+  signal?: AbortSignal;
+}): Promise<FallbackRenderResult> {
+  const {
+    chapter,
+    targetWidth,
+    targetHeight,
+    targetFps,
+    audio,
+    scriptText,
+    beats,
+    language,
+    characterEnabled,
+    characterPortraitUrl,
+    onStatus,
+    onProgressPct,
+    signal,
+  } = opts;
+
+  if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+  const ffmpeg = await getLazyFFmpeg(onStatus);
+  onProgressPct(15);
+
+  const lockedDurationSec = chapter.targetDurationSec;
+  let portraitBitmap: ImageBitmap | null = null;
+  let portraitSource: PortraitSource | null = null;
+  let characterMode = 'disabled';
+
+  if (characterEnabled && characterPortraitUrl) {
+    try {
+      portraitBitmap = await loadPortraitBitmap(characterPortraitUrl);
+      const crop = computeSquarePortraitCrop(
+        portraitBitmap.width,
+        portraitBitmap.height
+      );
+      portraitSource = { source: portraitBitmap, ...crop };
+      characterMode = 'webaudio-reactive-popin';
+    } catch {
+      portraitBitmap = null;
+    }
+  }
+
+  let bgBitmap: ImageBitmap | null = null;
+  if (chapter.externalVisualDataUrl) {
+    try {
+      const resp = await fetch(chapter.externalVisualDataUrl, { signal });
+      if (resp.ok) bgBitmap = await createImageBitmap(await resp.blob());
+    } catch {
+      bgBitmap = null;
+    }
+  }
+
+  const tempFiles = ['scene_vo.wav', 'scene_raw.webm', 'scene_out.mp4'];
+  for (const f of tempFiles) await safeDelete(ffmpeg, f);
+
+  const paddedSamples = Math.ceil(lockedDurationSec * audio.sampleRate);
+  const paddedPcm = new Float32Array(paddedSamples);
+  paddedPcm.set(
+    audio.pcmMono.subarray(0, Math.min(paddedSamples, audio.pcmMono.length)),
+    0
+  );
+  await ffmpeg.writeFile(
+    'scene_vo.wav',
+    encodeFloat32ToWavBytes(paddedPcm, audio.sampleRate)
+  );
+
+  const canvas = document.createElement('canvas');
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+  const ctx = canvas.getContext('2d');
+  const chosenMime =
+    typeof MediaRecorder !== 'undefined'
+      ? ['video/webm;codecs=vp8', 'video/webm'].find((m) =>
+          MediaRecorder.isTypeSupported(m)
+        )
+      : undefined;
+
+  if (ctx && chosenMime) {
+    const schedule = buildCharacterPopInSchedule(
+      chapter.climaxSec,
+      lockedDurationSec
+    );
+    const chunks = buildCaptionChunks(
+      scriptText,
+      lockedDurationSec,
+      language,
+      beats
+    );
+    const stream = canvas.captureStream(targetFps);
+    const recorder = new MediaRecorder(stream, {
+      mimeType: chosenMime,
+      videoBitsPerSecond: targetWidth >= 1000 ? 4_500_000 : 3_200_000,
+    });
+    const parts: BlobPart[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) parts.push(e.data);
+    };
+    const stopDone = new Promise<Blob>((res) => {
+      recorder.onstop = () => res(new Blob(parts, { type: chosenMime }));
+    });
+
+    onStatus('Rendering procedural documentary canvas scene...');
+    recorder.start(250);
+    const startPerf = performance.now();
+    const totalMs = lockedDurationSec * 1000;
+
+    await new Promise<void>((res, rej) => {
+      const tick = () => {
+        if (signal?.aborted) {
+          try {
+            recorder.stop();
+          } catch {
+            // ignore
+          }
+          rej(new DOMException('Cancelled', 'AbortError'));
+          return;
+        }
+        const elapsed = performance.now() - startPerf;
+        const t = elapsed / 1000;
+
+        ctx.fillStyle = '#0B1120';
+        ctx.fillRect(0, 0, targetWidth, targetHeight);
+        if (bgBitmap) {
+          const z = 1.03 + 0.06 * (elapsed / totalMs);
+          const dw = targetWidth * z;
+          const dh = targetHeight * z;
+          ctx.drawImage(
+            bgBitmap,
+            (targetWidth - dw) / 2,
+            (targetHeight - dh) / 2,
+            dw,
+            dh
+          );
+          ctx.fillStyle = 'rgba(11, 17, 32, 0.35)';
+          ctx.fillRect(0, 0, targetWidth, targetHeight);
+        } else {
+          ctx.strokeStyle = chapter.accentHex;
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(
+            targetWidth / 2,
+            targetHeight * 0.44,
+            targetWidth * (0.22 + 0.03 * Math.sin(t * 2)),
+            0,
+            Math.PI * 2
+          );
+          ctx.stroke();
+        }
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = `900 ${Math.round(targetWidth * 0.055)}px "Plus Jakarta Sans", sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText(
+          chapter.captionCallout.slice(0, 26),
+          targetWidth / 2,
+          targetHeight * 0.22
+        );
+
+        if (portraitSource) {
+          drawTalkingCharacterOverlay({
+            ctx,
+            portrait: portraitSource,
+            timeSec: t,
+            schedule,
+            amplitudeEnvelope: audio.amplitudeEnvelope,
+            mouthOpenEnvelope: audio.mouthOpenEnvelope,
+            envelopeFps: audio.envelopeFps,
+            canvasWidth: targetWidth,
+            canvasHeight: targetHeight,
+          });
+        }
+        drawCapCutPopCaption({
+          ctx,
+          chunks,
+          timeSec: t,
+          language,
+          canvasWidth: targetWidth,
+          canvasHeight: targetHeight,
+        });
+
+        onProgressPct(Math.round(20 + (elapsed / totalMs) * 58));
+        if (elapsed >= totalMs) {
+          res();
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+
+    recorder.stop();
+    const recorded = await stopDone;
+    await ffmpeg.writeFile('scene_raw.webm', await fetchFile(recorded));
+    await ffmpeg.exec([
+      '-y',
+      '-i',
+      'scene_raw.webm',
+      '-i',
+      'scene_vo.wav',
+      '-map',
+      '0:v:0',
+      '-map',
+      '1:a:0',
+      '-t',
+      lockedDurationSec.toFixed(2),
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-crf',
+      '22',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-movflags',
+      '+faststart',
+      '-map_metadata',
+      '-1',
+      'scene_out.mp4',
+    ]);
+  } else {
+    await ffmpeg.exec([
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      `color=c=0x0B1120:s=${targetWidth}x${targetHeight}:r=${targetFps}:d=${lockedDurationSec.toFixed(2)}`,
+      '-i',
+      'scene_vo.wav',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-movflags',
+      '+faststart',
+      'scene_out.mp4',
+    ]);
+  }
+
+  portraitBitmap?.close();
+  bgBitmap?.close();
+
+  const outBytes = (await ffmpeg.readFile('scene_out.mp4')) as Uint8Array;
+  const finalBlob = new Blob([outBytes.slice().buffer], { type: 'video/mp4' });
+  const blobUrl = URL.createObjectURL(finalBlob);
+  for (const f of tempFiles) await safeDelete(ffmpeg, f);
+  onProgressPct(100);
+
+  return {
+    blob: finalBlob,
+    blobUrl,
+    sizeBytes: finalBlob.size,
+    durationSec: Number(lockedDurationSec.toFixed(2)),
+    width: targetWidth,
+    height: targetHeight,
+    fps: targetFps,
+    delogoCount: 0,
+    bumperTrimmedSec: 0,
+    safeCropApplied: false,
+    characterMode,
+    renderEngine: `FFmpeg.wasm Scene Fallback (${targetWidth}×${targetHeight} @ ${targetFps}fps)`,
   };
 }

@@ -45,7 +45,7 @@ export function RecentRendersView({
             No completed renders yet
           </h2>
           <p className="text-sm font-medium text-[#64748B] max-w-md mx-auto mt-1.5">
-            Paste a video link or upload a clip in the Studio Workspace to render your first viral explainer video on your device GPU.
+            Paste a video link, upload a clip, or enter a documentary script/topic in the Studio Workspace to render on your device GPU.
           </p>
           <button
             type="button"
@@ -63,6 +63,9 @@ export function RecentRendersView({
             const completedDate = record.completedAt
               ? new Date(record.completedAt).toLocaleString()
               : '';
+            const isDoc =
+              record.studioMode === 'documentary' ||
+              record.mode === 'documentary';
 
             return (
               <article
@@ -77,7 +80,7 @@ export function RecentRendersView({
                     <div className="flex items-center gap-1.5 shrink-0">
                       {record.clips.length > 1 && (
                         <span className="px-2 py-0.5 rounded-full bg-[#3D5AFE] text-white text-[11px] font-extrabold whitespace-nowrap">
-                          {record.clips.length} Clips
+                          {record.clips.length} {isDoc ? 'Ch' : 'Clips'}
                         </span>
                       )}
                       <span className="px-2 py-0.5 rounded-full bg-[#00C853] text-white text-[11px] font-extrabold whitespace-nowrap">

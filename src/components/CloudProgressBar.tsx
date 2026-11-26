@@ -8,28 +8,36 @@ interface CloudProgressBarProps {
   onDismissError: () => void;
 }
 
-const PIPELINE_STEPS: { id: PipelineStepId; label: string; shortLabel: string }[] = [
+const PIPELINE_STEPS: {
+  id: PipelineStepId;
+  label: string;
+  shortLabel: string;
+}[] = [
   {
-    id: 'resolving_stream',
-    label: 'Resolving Stream',
-    shortLabel: 'Resolving Stream',
+    id: 'step_1_inspect',
+    label: 'Step 1 — Fetch & Smart Inspector',
+    shortLabel: 'Fetch & Inspect',
   },
   {
-    id: 'visual_clip',
-    label: 'Clean & Lock Clip',
-    shortLabel: 'Clean & Lock Clip',
+    id: 'step_2_clean_visuals',
+    label: 'Step 2 — Anti-Copyright & Motion Grade',
+    shortLabel: 'Clean & Grade',
   },
   {
-    id: 'ai_sync_trends',
-    label: 'Beat-Sync AI & Trends',
-    shortLabel: 'Beat-Sync & Trends',
+    id: 'step_3_script_trends',
+    label: 'Step 3 — Beat-Synced Script & US Trends',
+    shortLabel: 'Script & Trends',
   },
   {
-    id: 'voice_mux',
-    label: 'Voice & Fast GPU Mux',
-    shortLabel: 'Voice & GPU Mux',
+    id: 'step_4_voice_character',
+    label: 'Step 4 — Punchy Voice & Character',
+    shortLabel: 'Voice & Avatar',
   },
-  { id: 'ready', label: 'Ready', shortLabel: 'Ready' },
+  {
+    id: 'step_5_gpu_mux',
+    label: 'Step 5 — GPU Mux & Output Deck',
+    shortLabel: 'GPU Mux & Ready',
+  },
 ];
 
 function formatElapsed(ms: number): string {
@@ -86,7 +94,7 @@ export function CloudProgressBar({
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-base font-extrabold text-[#0F172A]">
-              In-Browser GPU Engine
+              5-Step Multi-Model Studio Pipeline
             </h2>
             {isCompleted && (
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-[#00C853] text-white text-xs font-extrabold whitespace-nowrap">

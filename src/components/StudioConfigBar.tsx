@@ -9,7 +9,11 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { StudioConfig } from '../types/studio';
-import { getMissingConfigFields, isAutoWiredFromBuild } from '../lib/env';
+import {
+  getMissingConfigFields,
+  hasExternalGpuConfigured,
+  isAutoWiredFromBuild,
+} from '../lib/env';
 
 interface StudioConfigBarProps {
   config: StudioConfig;
@@ -30,6 +34,7 @@ export function StudioConfigBar({
   const [showGemini, setShowGemini] = useState(false);
   const [showNvidia, setShowNvidia] = useState(false);
   const [showYoutube, setShowYoutube] = useState(false);
+  const [showGpuKey, setShowGpuKey] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
 
   useEffect(() => {
@@ -39,6 +44,7 @@ export function StudioConfigBar({
   const missing = getMissingConfigFields(config);
   const isConfigured = missing.length === 0;
   const autoWired = isAutoWiredFromBuild();
+  const hasExternalGpu = hasExternalGpuConfigured(config);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -53,10 +59,13 @@ export function StudioConfigBar({
 
   const connectedServices: string[] = [];
   if (config.geminiApiKey) connectedServices.push('Gemini');
-  if (config.nvidiaApiKey) connectedServices.push('NVIDIA');
+  if (config.nvidiaApiKey) connectedServices.push('NVIDIA NIM');
   if (config.youtubeApiKey) connectedServices.push('YouTube');
   if (config.cloudinaryCloudName && config.cloudinaryUploadPreset) {
     connectedServices.push('Cloudinary');
+  }
+  if (hasExternalGpu) {
+    connectedServices.push('External GPU');
   }
 
   return (
@@ -151,13 +160,13 @@ export function StudioConfigBar({
       {isExpanded && (
         <form onSubmit={handleSubmit} className="p-5 space-y-4 bg-white">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {/* Gemini API Key (Required) */}
+            {/* Gemini API Key */}
             <div>
               <label
                 htmlFor="studio-gemini-key"
                 className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
               >
-                Gemini API Key (Required — Vision, TTS &amp; Outfit)
+                Gemini API Key (Vision 3.8, TTS &amp; Outfit)
               </label>
               <div className="relative">
                 <input
@@ -189,13 +198,13 @@ export function StudioConfigBar({
               </div>
             </div>
 
-            {/* NVIDIA NIM API Key (Optional) */}
+            {/* NVIDIA NIM API Key */}
             <div>
               <label
                 htmlFor="studio-nvidia-key"
                 className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
               >
-                NVIDIA API Key (Optional — Llama-3.3-70B)
+                NVIDIA NIM Key (Nemotron, Mistral 4, Riva)
               </label>
               <div className="relative">
                 <input
@@ -233,7 +242,7 @@ export function StudioConfigBar({
                 htmlFor="studio-youtube-key"
                 className="block text-xs font-extrabold text-[#0F172A] mb-1.5"
               >
-                YouTube Data API v3 Key (US Trends &amp; Chapters)
+                YouTube Data API v3 Key (US Trends &amp; Tags)
               </label>
               <div className="relative">
                 <input
@@ -340,10 +349,73 @@ export function StudioConfigBar({
             </div>
           </div>
 
+          {/* Optional External GPU Worker Endpoint (FLUX / TRELLIS / Magpie / LipSync) */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1 border-t-2 border-[#F1F5F9]">
+            <div>
+              <label
+                htmlFor="studio-external-gpu-endpoint"
+                className="block text-xs font-bold text-[#475569] mb-1"
+              >
+                External GPU Worker URL (Optional — FLUX / TRELLIS / Magpie / LipSync)
+              </label>
+              <input
+                id="studio-external-gpu-endpoint"
+                type="url"
+                autoComplete="off"
+                value={draft.externalGpuEndpoint}
+                onChange={(e) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    externalGpuEndpoint: e.target.value,
+                  }))
+                }
+                placeholder="https://your-gpu-worker.example.com"
+                className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] px-3.5 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="studio-external-gpu-key"
+                className="block text-xs font-bold text-[#475569] mb-1"
+              >
+                External GPU Worker Key / Bearer Token (Optional)
+              </label>
+              <div className="relative">
+                <input
+                  id="studio-external-gpu-key"
+                  type={showGpuKey ? 'text' : 'password'}
+                  autoComplete="off"
+                  value={draft.externalGpuKey}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      externalGpuKey: e.target.value,
+                    }))
+                  }
+                  placeholder="Optional Bearer token"
+                  className="w-full rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] pl-3.5 pr-10 py-2 text-xs font-bold text-[#0F172A] font-mono-tabular placeholder:text-[#94A3B8] focus:bg-white focus:border-[#3D5AFE] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowGpuKey((v) => !v)}
+                  aria-label={showGpuKey ? 'Hide GPU key' : 'Show GPU key'}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-[#64748B] hover:text-[#0F172A] cursor-pointer"
+                >
+                  {showGpuKey ? (
+                    <EyeOff className="w-4 h-4" strokeWidth={2.25} />
+                  ) : (
+                    <Eye className="w-4 h-4" strokeWidth={2.25} />
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+
           <div className="pt-3 border-t-2 border-[#F1F5F9] flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs font-medium text-[#64748B]">
               {autoWired
-                ? 'API keys are auto-wired from GitHub Secrets on GitHub Pages. Everything runs 100% inside your browser GPU (WebGL2 + WebCodecs Worker) with zero GitHub Actions wait.'
+                ? 'API keys are auto-wired from GitHub Secrets on GitHub Pages. Everything runs 100% inside your browser GPU (WebGL2 + WebCodecs Worker) with optional External GPU offload.'
                 : 'Saved locally in browser localStorage for instant preview. On GitHub Pages, repository secrets auto-wire automatically.'}
             </p>
 

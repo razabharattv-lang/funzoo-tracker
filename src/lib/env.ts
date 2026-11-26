@@ -1,6 +1,6 @@
 import type { SavedCharacterAsset, StudioConfig } from '../types/studio';
 
-const CONFIG_STORAGE_KEY = 'explainer_studio_browser_config_v3';
+const CONFIG_STORAGE_KEY = 'explainer_studio_browser_config_v4';
 
 interface StoredStudioConfig {
   geminiApiKey?: string;
@@ -8,6 +8,8 @@ interface StoredStudioConfig {
   youtubeApiKey?: string;
   cloudinaryCloudName?: string;
   cloudinaryUploadPreset?: string;
+  externalGpuEndpoint?: string;
+  externalGpuKey?: string;
   characterImageUrl?: string;
   savedCharacters?: SavedCharacterAsset[];
 }
@@ -18,6 +20,8 @@ export function getBuildWiredDefaults(): {
   youtubeApiKey: string;
   cloudinaryCloudName: string;
   cloudinaryUploadPreset: string;
+  externalGpuEndpoint: string;
+  externalGpuKey: string;
 } {
   return {
     geminiApiKey: (import.meta.env.VITE_GEMINI_API_KEY ?? '').trim(),
@@ -27,12 +31,21 @@ export function getBuildWiredDefaults(): {
     cloudinaryUploadPreset: (
       import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET ?? ''
     ).trim(),
+    externalGpuEndpoint: (
+      import.meta.env.VITE_EXTERNAL_GPU_ENDPOINT ?? ''
+    ).trim(),
+    externalGpuKey: (import.meta.env.VITE_EXTERNAL_GPU_KEY ?? '').trim(),
   };
 }
 
 export function isAutoWiredFromBuild(): boolean {
   const wired = getBuildWiredDefaults();
-  return Boolean(wired.geminiApiKey);
+  return Boolean(wired.geminiApiKey || wired.nvidiaApiKey);
+}
+
+export function hasExternalGpuConfigured(config: StudioConfig): boolean {
+  const ep = config.externalGpuEndpoint.trim();
+  return ep.startsWith('http://') || ep.startsWith('https://');
 }
 
 export function loadStudioConfig(): StudioConfig {
@@ -42,6 +55,7 @@ export function loadStudioConfig(): StudioConfig {
   try {
     const raw =
       window.localStorage.getItem(CONFIG_STORAGE_KEY) ||
+      window.localStorage.getItem('explainer_studio_browser_config_v3') ||
       window.localStorage.getItem('explainer_studio_config_v2');
     if (raw) {
       const parsed = JSON.parse(raw) as unknown;
@@ -95,6 +109,16 @@ export function loadStudioConfig(): StudioConfig {
       wired.cloudinaryUploadPreset ||
       ''
     ).trim(),
+    externalGpuEndpoint: (
+      stored.externalGpuEndpoint ||
+      wired.externalGpuEndpoint ||
+      ''
+    ).trim(),
+    externalGpuKey: (
+      stored.externalGpuKey ||
+      wired.externalGpuKey ||
+      ''
+    ).trim(),
     characterImageUrl,
     savedCharacters,
   };
@@ -126,6 +150,10 @@ export function saveStudioConfig(config: StudioConfig): StudioConfig {
       config.cloudinaryCloudName.trim() || wired.cloudinaryCloudName,
     cloudinaryUploadPreset:
       config.cloudinaryUploadPreset.trim() || wired.cloudinaryUploadPreset,
+    externalGpuEndpoint:
+      config.externalGpuEndpoint.trim().replace(/\/+$/, '') ||
+      wired.externalGpuEndpoint.replace(/\/+$/, ''),
+    externalGpuKey: config.externalGpuKey.trim() || wired.externalGpuKey,
     characterImageUrl: cleanCharUrl,
     savedCharacters: nextCharacters,
   };
@@ -152,6 +180,14 @@ export function saveStudioConfig(config: StudioConfig): StudioConfig {
         normalized.cloudinaryUploadPreset !== wired.cloudinaryUploadPreset
           ? normalized.cloudinaryUploadPreset
           : '',
+      externalGpuEndpoint:
+        normalized.externalGpuEndpoint !== wired.externalGpuEndpoint
+          ? normalized.externalGpuEndpoint
+          : '',
+      externalGpuKey:
+        normalized.externalGpuKey !== wired.externalGpuKey
+          ? normalized.externalGpuKey
+          : '',
       characterImageUrl: normalized.characterImageUrl,
       savedCharacters: normalized.savedCharacters,
     };
@@ -171,6 +207,8 @@ export function clearStudioKeysOnly(current: StudioConfig): StudioConfig {
     youtubeApiKey: wired.youtubeApiKey,
     cloudinaryCloudName: wired.cloudinaryCloudName,
     cloudinaryUploadPreset: wired.cloudinaryUploadPreset,
+    externalGpuEndpoint: wired.externalGpuEndpoint,
+    externalGpuKey: wired.externalGpuKey,
     characterImageUrl: current.characterImageUrl,
     savedCharacters: current.savedCharacters,
   };
@@ -179,6 +217,8 @@ export function clearStudioKeysOnly(current: StudioConfig): StudioConfig {
 
 export function getMissingConfigFields(config: StudioConfig): string[] {
   const missing: string[] = [];
-  if (!config.geminiApiKey) missing.push('Gemini API Key');
+  if (!config.geminiApiKey && !config.nvidiaApiKey) {
+    missing.push('Gemini or NVIDIA API Key');
+  }
   return missing;
 }

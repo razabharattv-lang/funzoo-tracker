@@ -1,4 +1,5 @@
 import type {
+  DocumentaryChapter,
   OutputLanguage,
   PreparedVisualClip,
   ScriptBeat,
@@ -10,6 +11,19 @@ import { loadPortraitBitmap } from './characterAnimator';
 export interface GpuRenderOptions {
   source: SourceMediaItem;
   clip: PreparedVisualClip;
+  audio: ProcessedStudioAudio;
+  scriptText: string;
+  beats: ScriptBeat[];
+  language: OutputLanguage;
+  characterEnabled: boolean;
+  characterPortraitUrl: string;
+  onStatus: (msg: string) => void;
+  onProgressPct: (pct: number) => void;
+  signal?: AbortSignal;
+}
+
+export interface DocumentarySceneRenderOptions {
+  chapter: DocumentaryChapter;
   audio: ProcessedStudioAudio;
   scriptText: string;
   beats: ScriptBeat[];
@@ -212,7 +226,6 @@ function waitNextDecodedVideoFrame(
 
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    // Watchdog ensures playback stalls never hang the frame loop
     const watchdog = window.setTimeout(() => {
       finish(video.currentTime);
     }, 120);
@@ -229,13 +242,57 @@ function waitNextDecodedVideoFrame(
   });
 }
 
-/**
- * Fast Single-Pass Continuous GPU Pipeline:
- * - Zero frame-by-frame `video.currentTime` seek loops!
- * - Streams continuous hardware-decoded frames via `requestVideoFrameCallback`
- *   into the background WebGL2 + WebCodecs Web Worker (`prefer-hardware`, `mp4-muxer`).
- * - Strictly <= 1 frame in memory at any instant (`bitmap.close()` + `videoFrame.close()`).
- */
+function createWorkerRpc(
+  worker: Worker,
+  signal?: AbortSignal
+): (expectedType: string) => Promise<Record<string, unknown>> {
+  let pendingResolve: ((data: Record<string, unknown>) => void) | null = null;
+  let pendingReject: ((err: Error) => void) | null = null;
+
+  worker.onmessage = (ev: MessageEvent<Record<string, unknown>>) => {
+    const data = ev.data;
+    if (data.type === 'error') {
+      const err = new Error(String(data.message || 'renderWorker error'));
+      pendingReject?.(err);
+      pendingResolve = null;
+      pendingReject = null;
+      return;
+    }
+    pendingResolve?.(data);
+    pendingResolve = null;
+    pendingReject = null;
+  };
+
+  worker.onerror = (ev) => {
+    const err = new Error(ev.message || 'renderWorker crashed');
+    pendingReject?.(err);
+    pendingResolve = null;
+    pendingReject = null;
+  };
+
+  return (expectedType: string) =>
+    new Promise<Record<string, unknown>>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('Cancelled', 'AbortError'));
+        return;
+      }
+      pendingResolve = (data) => {
+        if (data.type === expectedType) {
+          resolve(data);
+        } else {
+          reject(
+            new Error(
+              `Unexpected worker reply "${String(
+                data.type
+              )}" (expected "${expectedType}")`
+            )
+          );
+        }
+      };
+      pendingReject = reject;
+    });
+}
+
 async function renderSinglePassWebCodecsWorker(
   opts: GpuRenderOptions,
   profile: DeviceRenderProfile
@@ -320,52 +377,7 @@ async function renderSinglePassWebCodecsWorker(
 
     const srcW = video.videoWidth || source.width || 1080;
     const srcH = video.videoHeight || source.height || 1920;
-
-    let pendingResolve: ((data: Record<string, unknown>) => void) | null = null;
-    let pendingReject: ((err: Error) => void) | null = null;
-
-    worker.onmessage = (ev: MessageEvent<Record<string, unknown>>) => {
-      const data = ev.data;
-      if (data.type === 'error') {
-        const err = new Error(String(data.message || 'renderWorker error'));
-        pendingReject?.(err);
-        pendingResolve = null;
-        pendingReject = null;
-        return;
-      }
-      pendingResolve?.(data);
-      pendingResolve = null;
-      pendingReject = null;
-    };
-
-    worker.onerror = (ev) => {
-      const err = new Error(ev.message || 'renderWorker crashed');
-      pendingReject?.(err);
-      pendingResolve = null;
-      pendingReject = null;
-    };
-
-    const awaitWorkerReply = (expectedType: string) =>
-      new Promise<Record<string, unknown>>((resolve, reject) => {
-        if (signal?.aborted) {
-          reject(new DOMException('Cancelled', 'AbortError'));
-          return;
-        }
-        pendingResolve = (data) => {
-          if (data.type === expectedType) {
-            resolve(data);
-          } else {
-            reject(
-              new Error(
-                `Unexpected worker reply "${String(
-                  data.type
-                )}" (expected "${expectedType}")`
-              )
-            );
-          }
-        };
-        pendingReject = reject;
-      });
+    const awaitWorkerReply = createWorkerRpc(worker, signal);
 
     const actionSummary = describeSurgicalAction(clip);
     onStatus(
@@ -388,6 +400,7 @@ async function renderSinglePassWebCodecsWorker(
     worker.postMessage(
       {
         type: 'init',
+        renderMode: 'video',
         width: profile.width,
         height: profile.height,
         fps: profile.fps,
@@ -419,7 +432,6 @@ async function renderSinglePassWebCodecsWorker(
         : `Single-Pass WebGL2 (${profile.width}×${profile.height} @ ${profile.fps}fps)`;
     onProgressPct(12);
 
-    // Continuous playback capture across usable intervals (ZERO frame-by-frame seeking!)
     let intervalIdx = 0;
     let priorDurationSec = 0;
     let currentInterval = intervals[0];
@@ -447,7 +459,6 @@ async function renderSinglePassWebCodecsWorker(
       if (continuousPlayActive) {
         mediaTime = await waitNextDecodedVideoFrame(video, signal);
 
-        // If playback reached the end of current usable interval (skipping any trim_bumper), advance cleanly
         if (mediaTime >= currentInterval.endSec - 0.03 || video.ended) {
           const hasNextInterval = intervalIdx + 1 < intervals.length;
           const remainingFrames = totalFrames - frameIndex;
@@ -468,14 +479,12 @@ async function renderSinglePassWebCodecsWorker(
             lastMediaTime = mediaTime;
             stallTicks = 0;
           } else {
-            // Hold final clean frame for the remaining sub-0.5s tail so we never flash frame 0 at clip end
             video.pause();
             mediaTime = Math.min(mediaTime, currentInterval.endSec - 0.02);
             priorDurationSec = Math.max(priorDurationSec, targetClipTimeSec);
           }
         }
 
-        // Detect stalled media clock and step gently without hanging
         if (Math.abs(mediaTime - lastMediaTime) < 0.002) {
           stallTicks++;
           if (stallTicks > 8) {
@@ -492,7 +501,6 @@ async function renderSinglePassWebCodecsWorker(
         }
         lastMediaTime = mediaTime;
       } else {
-        // Fallback only if browser policy blocked muted video.play()
         const relInClip = targetClipTimeSec;
         let rem = relInClip;
         let chosen = intervals[0];
@@ -512,13 +520,10 @@ async function renderSinglePassWebCodecsWorker(
       const elapsedInClipSec =
         priorDurationSec + Math.max(0, mediaTime - currentInterval.startSec);
 
-      // Wait until continuous hardware playback advances to the next target CFR frame
       if (continuousPlayActive && elapsedInClipSec + 0.004 < targetClipTimeSec) {
         continue;
       }
 
-      // Emit 1..2 CFR frames if playback advanced slightly faster than worker round-trip
-      // while pausing briefly on backpressure to guarantee smooth 0-drop motion
       const framesToEmit = continuousPlayActive
         ? Math.max(
             1,
@@ -608,12 +613,176 @@ async function renderSinglePassWebCodecsWorker(
   }
 }
 
-/**
- * STAGE 3B ENTRYPOINT — Fast Single-Pass GPU Mux:
- * Locks MP4 output strictly to `clip.lockedVisualDurationSec` (built in Stage 1),
- * streams decoded frames continuously via `requestVideoFrameCallback` into WebGL2 + WebCodecs
- * Worker (`prefer-hardware`), and lazy-loads FFmpeg.wasm ONLY if WebCodecs is unavailable.
- */
+async function renderSceneWebCodecsWorker(
+  opts: DocumentarySceneRenderOptions,
+  profile: DeviceRenderProfile
+): Promise<RenderedHardwareMp4> {
+  const {
+    chapter,
+    audio,
+    scriptText,
+    beats,
+    language,
+    characterEnabled,
+    characterPortraitUrl,
+    onStatus,
+    onProgressPct,
+    signal,
+  } = opts;
+
+  if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+  const lockedDurationSec = chapter.targetDurationSec;
+  const totalFrames = Math.max(
+    profile.fps * 3,
+    Math.round(lockedDurationSec * profile.fps)
+  );
+
+  let portraitBitmap: ImageBitmap | null = null;
+  let characterMode = 'disabled';
+  if (characterEnabled && characterPortraitUrl) {
+    try {
+      portraitBitmap = await loadPortraitBitmap(characterPortraitUrl);
+      characterMode = 'webaudio-reactive-popin';
+    } catch {
+      portraitBitmap = null;
+      characterMode = 'disabled';
+    }
+  }
+
+  let sceneBgBitmap: ImageBitmap | null = null;
+  if (chapter.externalVisualDataUrl) {
+    try {
+      const resp = await fetch(chapter.externalVisualDataUrl, { signal });
+      if (resp.ok) {
+        sceneBgBitmap = await createImageBitmap(await resp.blob());
+      }
+    } catch {
+      sceneBgBitmap = null;
+    }
+  }
+
+  const worker = new Worker(new URL('./renderWorker.ts', import.meta.url), {
+    type: 'module',
+  });
+
+  const onAbort = () => {
+    try {
+      worker.postMessage({ type: 'abort' });
+    } catch {
+      // ignore
+    }
+    worker.terminate();
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    const awaitWorkerReply = createWorkerRpc(worker, signal);
+    onStatus(
+      `Step 5: Rendering ${chapter.visualEngineLabel} (${profile.width}×${profile.height} @ ${profile.fps}fps)...`
+    );
+
+    const pcmCopy = new Float32Array(audio.pcmMono);
+    const ampCopy = new Float32Array(audio.amplitudeEnvelope);
+    const mouthCopy = new Float32Array(audio.mouthOpenEnvelope);
+    const initTransfer: Transferable[] = [
+      pcmCopy.buffer,
+      ampCopy.buffer,
+      mouthCopy.buffer,
+    ];
+    if (portraitBitmap) initTransfer.push(portraitBitmap);
+    if (sceneBgBitmap) initTransfer.push(sceneBgBitmap);
+
+    const readyPromise = awaitWorkerReply('ready');
+    worker.postMessage(
+      {
+        type: 'init',
+        renderMode: 'scene',
+        width: profile.width,
+        height: profile.height,
+        fps: profile.fps,
+        bitrate: profile.bitrate,
+        durationSec: lockedDurationSec,
+        scriptText,
+        beats,
+        language,
+        safeCropInsets: { top: 0, bottom: 0, left: 0, right: 0 },
+        watermarkZones: [],
+        climaxSecond: chapter.climaxSec,
+        portraitBitmap,
+        pcmMono: pcmCopy,
+        sampleRate: audio.sampleRate,
+        amplitudeEnvelope: ampCopy,
+        mouthOpenEnvelope: mouthCopy,
+        envelopeFps: audio.envelopeFps,
+        sceneStyle: chapter.style,
+        shaderPreset: chapter.shaderPreset,
+        accentHex: chapter.accentHex,
+        chapterTitle: chapter.title,
+        captionCallout: chapter.captionCallout,
+        sceneBgBitmap,
+      },
+      initTransfer
+    );
+    portraitBitmap = null;
+    sceneBgBitmap = null;
+
+    const readyData = await readyPromise;
+    const hwAccel = String(readyData.hardwareAcceleration ?? 'prefer-hardware');
+    const engineName = `${chapter.visualEngineLabel} · ${
+      hwAccel === 'prefer-hardware' ? 'WebCodecs H.264 GPU' : 'WebGL2 H.264'
+    }`;
+    onProgressPct(10);
+
+    const frameStepSec = 1 / profile.fps;
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+      if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+      const timeSec = frameIndex * frameStepSec;
+      const frameAck = awaitWorkerReply('frame_done');
+      worker.postMessage({
+        type: 'render_scene_frame',
+        frameIndex,
+        timeSec,
+      });
+      await frameAck;
+
+      if (frameIndex % 15 === 0 || frameIndex === totalFrames - 1) {
+        onProgressPct(10 + Math.round(((frameIndex + 1) / totalFrames) * 84));
+      }
+    }
+
+    onStatus('Finalizing H.264 + AAC Documentary MP4...');
+    const finishPromise = awaitWorkerReply('complete');
+    worker.postMessage({ type: 'finish' });
+    const completeData = await finishPromise;
+
+    const mp4Buffer = completeData.buffer as ArrayBuffer;
+    const finalBlob = new Blob([mp4Buffer], { type: 'video/mp4' });
+    const blobUrl = URL.createObjectURL(finalBlob);
+    onProgressPct(100);
+
+    return {
+      blob: finalBlob,
+      blobUrl,
+      sizeBytes: finalBlob.size,
+      durationSec: Number(lockedDurationSec.toFixed(2)),
+      width: profile.width,
+      height: profile.height,
+      fps: profile.fps,
+      delogoCount: 0,
+      bumperTrimmedSec: 0,
+      safeCropApplied: false,
+      characterMode,
+      renderEngine: engineName,
+    };
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    portraitBitmap?.close();
+    sceneBgBitmap?.close();
+    worker.terminate();
+  }
+}
+
 export async function renderProductionMp4Gpu(
   opts: GpuRenderOptions
 ): Promise<RenderedHardwareMp4> {
@@ -648,6 +817,40 @@ export async function renderProductionMp4Gpu(
     beats: opts.beats,
     language: opts.language,
     climaxSecond: opts.clip.climaxSec,
+    characterEnabled: opts.characterEnabled,
+    characterPortraitUrl: opts.characterPortraitUrl,
+    onStatus: opts.onStatus,
+    onProgressPct: opts.onProgressPct,
+    signal: opts.signal,
+  });
+}
+
+export async function renderDocumentarySceneMp4Gpu(
+  opts: DocumentarySceneRenderOptions
+): Promise<RenderedHardwareMp4> {
+  const profile = detectDeviceRenderProfile();
+
+  if (supportsWebCodecsWorkerPipeline()) {
+    try {
+      return await renderSceneWebCodecsWorker(opts, profile);
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') throw err;
+      opts.onStatus(
+        'WebCodecs unavailable — lazy-loading FFmpeg.wasm scene fallback...'
+      );
+    }
+  }
+
+  const { renderDocumentarySceneFallback } = await import('./ffmpegFallback');
+  return renderDocumentarySceneFallback({
+    chapter: opts.chapter,
+    targetWidth: profile.width,
+    targetHeight: profile.height,
+    targetFps: profile.fps,
+    audio: opts.audio,
+    scriptText: opts.scriptText,
+    beats: opts.beats,
+    language: opts.language,
     characterEnabled: opts.characterEnabled,
     characterPortraitUrl: opts.characterPortraitUrl,
     onStatus: opts.onStatus,

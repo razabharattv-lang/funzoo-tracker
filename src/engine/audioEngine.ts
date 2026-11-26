@@ -1,4 +1,9 @@
-import type { OutputLanguage, VoiceGender } from '../types/studio';
+import type {
+  OutputLanguage,
+  StudioConfig,
+  VoiceGender,
+} from '../types/studio';
+import { requestExternalGpuVoice } from './modelRouter';
 
 export interface ProcessedStudioAudio {
   /** Broadcast-mastered mono Float32 PCM (1.07x pace) ready for WebCodecs AudioEncoder */
@@ -396,6 +401,8 @@ export async function synthesizeCommandingVoiceover(params: {
   language: OutputLanguage;
   voiceGender: VoiceGender;
   geminiApiKey: string;
+  config?: StudioConfig;
+  useExternalGpu?: boolean;
   lockedVisualDurationSec?: number;
   onStatus: (msg: string) => void;
   signal?: AbortSignal;
@@ -405,6 +412,8 @@ export async function synthesizeCommandingVoiceover(params: {
     language,
     voiceGender,
     geminiApiKey,
+    config,
+    useExternalGpu = false,
     lockedVisualDurationSec,
     onStatus,
     signal,
@@ -428,7 +437,25 @@ export async function synthesizeCommandingVoiceover(params: {
   let wavBytes: Uint8Array | null = null;
   let engineLabel = '';
 
-  if (geminiApiKey) {
+  if (useExternalGpu && config?.externalGpuEndpoint) {
+    onStatus(
+      'Step 4: Synthesizing voice via External GPU (magpie-tts-zeroshot + Studio Voice + Noise Removal)...'
+    );
+    const ext = await requestExternalGpuVoice({
+      config,
+      useExternalGpu,
+      scriptText,
+      language,
+      voiceGender,
+      signal,
+    });
+    if (ext) {
+      wavBytes = ext.wavBytes;
+      engineLabel = ext.engineLabel;
+    }
+  }
+
+  if (!wavBytes && geminiApiKey) {
     const ttsCandidates = [
       { model: PRIMARY_TTS_MODEL, tag: `Gemini 3.8 TTS (${voiceName})` },
       { model: SECONDARY_TTS_MODEL, tag: `Gemini 3.8 Lite TTS (${voiceName})` },
@@ -440,7 +467,7 @@ export async function synthesizeCommandingVoiceover(params: {
       const cand = ttsCandidates[i];
       onStatus(
         i === 0
-          ? `Synthesizing commanding ${
+          ? `Step 4: Synthesizing commanding ${
               isMale ? 'Fenrir Male' : 'Kore Female'
             } narration (${cand.model})...`
           : `Falling back to ${cand.model} (${voiceName})...`
@@ -461,7 +488,7 @@ export async function synthesizeCommandingVoiceover(params: {
   }
 
   onStatus(
-    'Mastering OfflineAudioContext broadcast DSP (85Hz HP, +4dB 120Hz, +5dB 3.2kHz, -18dB comp, time-fit)...'
+    'Step 4: Mastering OfflineAudioContext EQ (+4dB bass, +5dB presence, compression, time-fit)...'
   );
 
   if (wavBytes) {

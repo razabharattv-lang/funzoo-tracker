@@ -1,4 +1,5 @@
 import type {
+  DocumentaryChapter,
   OutputLanguage,
   PreparedVisualClip,
   ScriptBeat,
@@ -14,15 +15,15 @@ import {
   hasNonZeroInsets,
   sanitizeWatermarkZones,
 } from './visualClipper';
+import {
+  callGeminiJsonOnce,
+  fetchWithTimeout,
+  runStep1VisionJson,
+  runStep3ScriptJson,
+} from './modelRouter';
 
-const GEMINI_PRIMARY_MODEL = 'gemini-3.8-flash';
-const GEMINI_FALLBACK_MODEL = 'gemini-3.5-flash';
 const GEMINI_IMAGE_EDIT_PRIMARY = 'gemini-3.1-flash-lite-image';
 const GEMINI_IMAGE_EDIT_FALLBACK = 'gemini-2.5-flash-image';
-
-const NVIDIA_NIM_ENDPOINT =
-  'https://integrate.api.nvidia.com/v1/chat/completions';
-const NVIDIA_NIM_MODEL = 'meta/llama-3.3-70b-instruct';
 
 const API_TIMEOUT_MS = 12_000;
 
@@ -50,101 +51,7 @@ export function getStrictWordBudget(
   return Math.max(12, Math.floor(lockedVisualDurationSec * rate));
 }
 
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  parentSignal?: AbortSignal,
-  timeoutMs = API_TIMEOUT_MS
-): Promise<Response> {
-  const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
-  const onParentAbort = () => ctrl.abort();
-  if (parentSignal?.aborted) {
-    window.clearTimeout(timer);
-    throw new DOMException('Cancelled', 'AbortError');
-  }
-  parentSignal?.addEventListener('abort', onParentAbort, { once: true });
-
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } catch (err) {
-    if (parentSignal?.aborted) {
-      throw new DOMException('Cancelled', 'AbortError');
-    }
-    throw err;
-  } finally {
-    window.clearTimeout(timer);
-    parentSignal?.removeEventListener('abort', onParentAbort);
-  }
-}
-
-function stripJsonFences(raw: string): string {
-  let cleaned = raw.trim();
-  if (cleaned.startsWith('```')) {
-    const lines = cleaned.split('\n');
-    if (lines[0]?.startsWith('```')) lines.shift();
-    if (lines[lines.length - 1]?.trim() === '```') lines.pop();
-    cleaned = lines.join('\n').trim();
-  }
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    cleaned = cleaned.slice(start, end + 1);
-  }
-  return cleaned;
-}
-
-async function callGeminiOnceWithSingleFallback(
-  apiKey: string,
-  parts: Record<string, unknown>[],
-  signal?: AbortSignal
-): Promise<{ parsed: Record<string, unknown>; modelUsed: string } | null> {
-  if (!apiKey) return null;
-
-  const modelsToTry = [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL];
-  const payload = JSON.stringify({
-    contents: [{ role: 'user', parts }],
-    generationConfig: { responseMimeType: 'application/json' },
-  });
-
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const model = modelsToTry[i];
-    try {
-      const resp = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-          apiKey
-        )}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: payload,
-        },
-        signal,
-        API_TIMEOUT_MS
-      );
-
-      if (!resp.ok) {
-        if (i === 0 && (resp.status === 404 || resp.status >= 500 || resp.status === 429)) {
-          continue;
-        }
-        return null;
-      }
-
-      const data = (await resp.json()) as {
-        candidates?: { content?: { parts?: { text?: string }[] } }[];
-      };
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-      if (!text) continue;
-      return {
-        parsed: JSON.parse(stripJsonFences(text)) as Record<string, unknown>,
-        modelUsed: model,
-      };
-    } catch (err) {
-      if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    }
-  }
-  return null;
-}
+// Shared API helpers now routed centrally via ./modelRouter
 
 function cleanSpokenLine(raw: string): string {
   return raw
@@ -313,6 +220,7 @@ export async function inspectLockedVisualClipOneCall(params: {
   preparedClip: PreparedVisualClip;
   language: OutputLanguage;
   customAngle: string;
+  nvidiaApiKey?: string;
   geminiApiKey: string;
   signal?: AbortSignal;
 }): Promise<Stage2ClipInspection> {
@@ -321,6 +229,7 @@ export async function inspectLockedVisualClipOneCall(params: {
     preparedClip,
     language,
     customAngle,
+    nvidiaApiKey = '',
     geminiApiKey,
     signal,
   } = params;
@@ -383,19 +292,30 @@ Return ONLY valid JSON:
 }
 `.trim();
 
-  const res = await callGeminiOnceWithSingleFallback(
-    geminiApiKey,
-    [
-      { text: prompt },
-      {
-        inlineData: {
-          mimeType: 'image/jpeg',
-          data: preparedClip.stampedContactSheetJpeg,
-        },
-      },
-    ],
-    signal
-  );
+  const res =
+    source.mode === 'short'
+      ? await runStep1VisionJson({
+          nvidiaApiKey,
+          geminiApiKey,
+          systemPrompt:
+            'You are a viral US Shorts director and watermark inspector. Output strictly valid JSON.',
+          userPrompt: prompt,
+          imageBase64Jpeg: preparedClip.stampedContactSheetJpeg,
+          signal,
+        })
+      : await callGeminiJsonOnce({
+          apiKey: geminiApiKey,
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: preparedClip.stampedContactSheetJpeg,
+              },
+            },
+          ],
+          signal,
+        });
 
   if (!res) {
     const topic = customAngle.trim() || preparedClip.reason || 'Viral moment';
@@ -608,62 +528,10 @@ export async function fetchLiveYouTubeTrends(
   }
 }
 
-async function tryNvidiaNimOnce(
-  prompt: string,
-  nvidiaApiKey: string,
-  signal?: AbortSignal
-): Promise<Record<string, unknown> | null> {
-  if (!nvidiaApiKey) return null;
-  try {
-    const resp = await fetchWithTimeout(
-      NVIDIA_NIM_ENDPOINT,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${nvidiaApiKey}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          model: NVIDIA_NIM_MODEL,
-          messages: [
-            {
-              role: 'system',
-              content:
-                'You are an elite viral US YouTube Shorts suspense scriptwriter and SEO strategist. Output strictly valid JSON only.',
-            },
-            { role: 'user', content: prompt },
-          ],
-          temperature: 0.6,
-          top_p: 0.9,
-          max_tokens: 1100,
-          response_format: { type: 'json_object' },
-        }),
-      },
-      signal,
-      API_TIMEOUT_MS
-    );
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as {
-      choices?: { message?: { content?: string } }[];
-    };
-    const content = data.choices?.[0]?.message?.content ?? '';
-    if (!content) return null;
-    const parsed = JSON.parse(stripJsonFences(content)) as Record<
-      string,
-      unknown
-    >;
-    if ((parsed.beats || parsed.voiceover) && parsed.title) return parsed;
-    return null;
-  } catch (err) {
-    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-    return null;
-  }
-}
-
 /**
- * STAGE 2B — Refine Beat-Synced Script & US Trend Metadata:
- * Uses NVIDIA NIM (meta/llama-3.3-70b-instruct -> single Gemini 3.8 fallback)
+ * STEP 3 — Beat-Synced Script & US Trends:
+ * Routes across Mistral Large 4 / glm-5-3-flash / nemotron-3.5-lightning-30b-a3b /
+ * riva-translate-4b-instruct-v2 / nemotron-3.5-content-safety / gemini-3.8-flash,
  * grounded in live US YouTube Shorts trends while strictly locking total spoken
  * words to <= maxWords so narration ALWAYS completes 0.5s before clip end.
  */
@@ -731,21 +599,17 @@ Return ONLY valid JSON:
 }
 `.trim();
 
-  let scriptEngine = 'NVIDIA Llama-3.3-70B';
-  let parsed = await tryNvidiaNimOnce(prompt, config.nvidiaApiKey, signal);
+  const routed = await runStep3ScriptJson({
+    config,
+    language,
+    systemPrompt:
+      'You are an elite viral US YouTube Shorts suspense scriptwriter and SEO strategist. Output strictly valid JSON only.',
+    userPrompt: prompt,
+    signal,
+  });
 
-  if (!parsed) {
-    const geminiRes = await callGeminiOnceWithSingleFallback(
-      config.geminiApiKey,
-      [{ text: prompt }],
-      signal
-    );
-    if (geminiRes) {
-      parsed = geminiRes.parsed;
-      scriptEngine = geminiRes.modelUsed;
-    }
-  }
-
+  const parsed = routed?.parsed ?? null;
+  const scriptEngine = routed?.modelUsed || `${inspection.visionModel} Beat Sync`;
   const visionFallbackVoiceover = inspection.beats.map((b) => b.text).join(' ');
 
   if (!parsed) {
@@ -774,7 +638,7 @@ Return ONLY valid JSON:
           : '#shorts #viral #explainer #trending #facts #storytime #fyp',
       postingTime:
         '6:30 PM EST / 5:00 AM IST — Peak US Evening & Early India Feed',
-      scriptEngine: `${inspection.visionModel} Beat Sync`,
+      scriptEngine,
       youtubeTrendsCount: trends.length,
     };
   }
@@ -791,6 +655,123 @@ Return ONLY valid JSON:
     beats: enforced.beats,
     title: String(parsed.title || inspection.coreTopic).trim(),
     description: String(parsed.description || '').trim(),
+    tags: String(parsed.tags || '').trim(),
+    hashtags: String(parsed.hashtags || '').trim(),
+    postingTime: String(
+      parsed.posting_time ||
+        '6:30 PM EST / 5:00 AM IST — Peak US Evening & Early India Feed'
+    ).trim(),
+    scriptEngine,
+    youtubeTrendsCount: trends.length,
+  };
+}
+
+/**
+ * STEP 3 (Documentary / Motion Graphics / 3D-Blender Mode):
+ * Refines each chapter's chronological beat-synced narration & US trend SEO deck
+ * strictly within the chapter's word budget so voiceover finishes 0.5s before scene end.
+ */
+export async function refineDocumentaryChapterScriptAndMetadata(params: {
+  chapter: DocumentaryChapter;
+  seriesTitle: string;
+  trends: YouTubeTrendVideo[];
+  language: OutputLanguage;
+  customAngle: string;
+  config: StudioConfig;
+  signal?: AbortSignal;
+}): Promise<TrendMetadata> {
+  const {
+    chapter,
+    seriesTitle,
+    trends,
+    language,
+    customAngle,
+    config,
+    signal,
+  } = params;
+
+  const dur = chapter.targetDurationSec;
+  const maxWords = getStrictWordBudget(dur, language);
+  const finishSec = Number(Math.max(2.5, dur - 0.5).toFixed(1));
+  const langLabel =
+    language === 'hi'
+      ? 'Hindi (authoritative punchy Devanagari script)'
+      : 'American English (cinematic US documentary / explainer narrator)';
+
+  const prompt = `
+You are an executive YouTube Shorts documentary & motion-graphics writer.
+
+SERIES TITLE: ${seriesTitle}
+CHAPTER ${chapter.chapterIndex}/${chapter.totalChapters}: ${chapter.title}
+VISUAL STYLE: ${chapter.style} (${chapter.visualPrompt})
+LOCKED SCENE DURATION: ${dur.toFixed(1)}s (narration MUST finish by ${finishSec}s)
+STRICT WORD BUDGET: <= ${maxWords} spoken words total!
+DRAFT NARRATION: "${chapter.rawNarration}"
+${customAngle ? `CUSTOM HOOK ANGLE: "${customAngle}"` : ''}
+LIVE US TRENDS CONTEXT: ${
+    trends.length > 0 ? JSON.stringify(trends.slice(0, 5)) : 'US Shorts Documentary/Science/Explainer'
+  }
+OUTPUT LANGUAGE: ${langLabel}
+
+Return ONLY valid JSON:
+{
+  "beats": [{"startSec": 0.0, "endSec": 3.0, "text": "Punchy opening beat."}],
+  "title": "High-CTR title (max 68 chars)",
+  "description": "2-line SEO description",
+  "tags": "15 comma-separated tags",
+  "hashtags": "7 hashtags starting with #",
+  "posting_time": "Best USA EST + India IST upload window"
+}
+`.trim();
+
+  const routed = await runStep3ScriptJson({
+    config,
+    language,
+    systemPrompt:
+      'You are a viral US YouTube Shorts documentary writer and SEO strategist. Output strictly valid JSON only.',
+    userPrompt: prompt,
+    signal,
+  });
+
+  const parsed = routed?.parsed ?? null;
+  const scriptEngine = routed?.modelUsed || 'Documentary Beat Sync';
+
+  if (!parsed) {
+    const enforced = enforceStrictWordBudgetAndBeats({
+      rawBeats: chapter.beats,
+      fallbackVoiceover: chapter.rawNarration,
+      lockedVisualDurationSec: dur,
+      language,
+    });
+    return {
+      voiceover: enforced.voiceover,
+      beats: enforced.beats,
+      title: `${seriesTitle.slice(0, 46)} — ${chapter.title}`.slice(0, 68),
+      description: `${chapter.visualPrompt.slice(0, 140)}`,
+      tags: `${seriesTitle}, documentary shorts, 3d explainer, motion graphics, us trending, breakdown`,
+      hashtags:
+        language === 'hi'
+          ? '#shorts #documentary #facts #hindi #3danimation #explainer #viral'
+          : '#shorts #documentary #3d #motiongraphics #explainer #facts #viral',
+      postingTime:
+        '6:30 PM EST / 5:00 AM IST — Peak US Evening & Early India Feed',
+      scriptEngine,
+      youtubeTrendsCount: trends.length,
+    };
+  }
+
+  const enforced = enforceStrictWordBudgetAndBeats({
+    rawBeats: parsed.beats,
+    fallbackVoiceover: String(parsed.voiceover || chapter.rawNarration),
+    lockedVisualDurationSec: dur,
+    language,
+  });
+
+  return {
+    voiceover: enforced.voiceover,
+    beats: enforced.beats,
+    title: String(parsed.title || `${seriesTitle} — ${chapter.title}`).trim(),
+    description: String(parsed.description || chapter.visualPrompt).trim(),
     tags: String(parsed.tags || '').trim(),
     hashtags: String(parsed.hashtags || '').trim(),
     postingTime: String(

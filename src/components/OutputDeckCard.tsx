@@ -12,7 +12,7 @@ import {
   Tag,
   Type,
 } from 'lucide-react';
-import type { RenderedClipOutput } from '../types/studio';
+import type { DocumentaryStyle, RenderedClipOutput } from '../types/studio';
 import { formatBytes, formatDuration } from '../lib/videoProbe';
 
 interface OutputDeckCardProps {
@@ -80,6 +80,13 @@ const METADATA_FIELDS: MetadataFieldSpec[] = [
   },
 ];
 
+function styleBadgeText(style?: DocumentaryStyle): string {
+  if (style === '3d_blender') return '3D Blender';
+  if (style === 'motion_graphics') return 'Motion Graphics';
+  if (style === 'documentary') return 'Documentary';
+  return 'Explainer';
+}
+
 function ClipOutputBlock({
   clip,
   runTag,
@@ -91,6 +98,8 @@ function ClipOutputBlock({
   const [videoExpired, setVideoExpired] = useState(false);
 
   const qualityBadge = clip.width >= 1000 ? '1080p' : '720p';
+  const isDoc = clip.studioMode === 'documentary';
+  const unitLabel = isDoc ? 'Chapter' : 'Clip';
 
   const handleCopy = async (key: string, value: string) => {
     if (!value) return;
@@ -125,8 +134,9 @@ function ClipOutputBlock({
 
   const handleDownloadMp4 = () => {
     if (!clip.videoUrl || videoExpired) return;
-    const suffix = clip.totalClips > 1 ? `-clip${clip.clipIndex}` : '';
-    const fileName = `explainer-${runTag}${suffix}.mp4`;
+    const prefix = isDoc ? 'doc' : 'explainer';
+    const suffix = clip.totalClips > 1 ? `-${unitLabel.toLowerCase()}${clip.clipIndex}` : '';
+    const fileName = `${prefix}-${runTag}${suffix}.mp4`;
     const anchor = document.createElement('a');
     anchor.href = clip.videoUrl;
     anchor.download = fileName;
@@ -145,10 +155,15 @@ function ClipOutputBlock({
               <CheckCircle2 className="w-3.5 h-3.5" strokeWidth={2.5} />
               <span>
                 {clip.totalClips > 1
-                  ? `Clip ${clip.clipIndex} of ${clip.totalClips}`
+                  ? `${unitLabel} ${clip.clipIndex} of ${clip.totalClips}`
                   : 'Production Ready'}
               </span>
             </span>
+            {isDoc && (
+              <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-[#3D5AFE] text-white text-[11px] font-extrabold whitespace-nowrap">
+                {styleBadgeText(clip.documentaryStyle)}
+              </span>
+            )}
             <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-white border border-[#00A344] text-[11px] font-extrabold text-[#065F46] font-mono-tabular whitespace-nowrap">
               {qualityBadge} · {clip.fps}fps
             </span>
@@ -252,7 +267,7 @@ function ClipOutputBlock({
               {videoExpired
                 ? 'Re-render for MP4'
                 : clip.totalClips > 1
-                ? `Download Clip ${clip.clipIndex} MP4`
+                ? `Download ${unitLabel} ${clip.clipIndex} MP4`
                 : 'Download MP4'}
             </span>
           </button>
@@ -366,7 +381,7 @@ function ClipOutputBlock({
 
 /**
  * Compact Card 2 — Final Production Output Deck
- * Placed directly below the progress bar. Lists ALL finished 9:16 MP4 clips
+ * Placed directly below the progress bar. Lists ALL finished 9:16 MP4 clips or chapters
  * sequentially one after another, each with playable video, Download MP4, and
  * 5 individual 1-Click Copy cards.
  */
@@ -399,6 +414,8 @@ export function OutputDeckCard({
     );
   }
 
+  const isDocDeck = clips[0]?.studioMode === 'documentary';
+
   return (
     <section
       aria-label="Final Production Output Deck"
@@ -411,21 +428,25 @@ export function OutputDeckCard({
           </h2>
           <p className="text-xs font-medium text-[#64748B]">
             {clips.length > 1
-              ? `${clips.length} viral 9:16 MP4 clips extracted${
+              ? `${clips.length} ${isDocDeck ? 'documentary / 3D chapters' : 'viral 9:16 MP4 clips'} rendered${
                   sourceDurationSec
-                    ? ` from ${formatDuration(sourceDurationSec)} source`
+                    ? ` (${formatDuration(sourceDurationSec)} total)`
                     : ''
-                } — preview, download & copy each clip below`
+                } — preview, download & copy each below`
               : 'Hardware-rendered 9:16 MP4 with instant local download and 5 one-click copy cards'}
           </p>
         </div>
 
         <span className="inline-flex items-center px-3 py-1 rounded-full bg-[#00C853] text-white text-xs font-extrabold whitespace-nowrap">
-          {clips.length} {clips.length === 1 ? 'MP4 Ready' : 'Clips Ready'}
+          {clips.length}{' '}
+          {clips.length === 1
+            ? 'MP4 Ready'
+            : isDocDeck
+            ? 'Chapters Ready'
+            : 'Clips Ready'}
         </span>
       </div>
 
-      {/* List ALL finished clips cleanly one after another */}
       <div className="space-y-4">
         {clips.map((clip) => (
           <ClipOutputBlock

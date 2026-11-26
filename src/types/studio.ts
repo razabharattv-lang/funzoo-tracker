@@ -1,3 +1,9 @@
+export type StudioMode = 'explainer' | 'documentary';
+
+export type DocumentaryStyle = 'documentary' | 'motion_graphics' | '3d_blender';
+
+export type DocumentaryInputKind = 'topic' | 'script';
+
 export type SourceType = 'upload' | 'link';
 
 export type OutputLanguage = 'en' | 'hi';
@@ -5,11 +11,11 @@ export type OutputLanguage = 'en' | 'hi';
 export type VoiceGender = 'male' | 'female';
 
 export type PipelineStepId =
-  | 'resolving_stream'
-  | 'visual_clip'
-  | 'ai_sync_trends'
-  | 'voice_mux'
-  | 'ready';
+  | 'step_1_inspect'
+  | 'step_2_clean_visuals'
+  | 'step_3_script_trends'
+  | 'step_4_voice_character'
+  | 'step_5_gpu_mux';
 
 export interface SavedCharacterAsset {
   id: string;
@@ -25,13 +31,20 @@ export interface StudioConfig {
   youtubeApiKey: string;
   cloudinaryCloudName: string;
   cloudinaryUploadPreset: string;
+  externalGpuEndpoint: string;
+  externalGpuKey: string;
   characterImageUrl: string;
   savedCharacters: SavedCharacterAsset[];
 }
 
 export interface StudioControlsState {
+  studioMode: StudioMode;
   sourceType: SourceType;
   videoUrl: string;
+  documentaryStyle: DocumentaryStyle;
+  documentaryInputKind: DocumentaryInputKind;
+  documentaryInput: string;
+  useExternalGpu: boolean;
   language: OutputLanguage;
   voiceGender: VoiceGender;
   customAngle: string;
@@ -97,9 +110,57 @@ export interface ViralSegment {
   watermarkZones: WatermarkZone[];
 }
 
+export type MotionShaderPreset =
+  | 'cinema_grid'
+  | 'neon_motion_hud'
+  | 'blender_3d_extrude'
+  | 'orbital_nebula';
+
+export interface DocumentarySceneCard {
+  sceneIndex: number;
+  heading: string;
+  visualPrompt: string;
+  captionCallout: string;
+  shaderPreset: MotionShaderPreset;
+  accentHex: string;
+  targetDurationSec: number;
+  narrationDraft: string;
+  externalVisualDataUrl?: string;
+}
+
+export interface DocumentaryChapter {
+  chapterIndex: number;
+  totalChapters: number;
+  title: string;
+  style: DocumentaryStyle;
+  targetDurationSec: number;
+  climaxSec: number;
+  visualPrompt: string;
+  captionCallout: string;
+  shaderPreset: MotionShaderPreset;
+  accentHex: string;
+  rawNarration: string;
+  beats: ScriptBeat[];
+  searchQueries: string[];
+  externalVisualDataUrl?: string;
+  stampedContactSheetJpeg?: string;
+  stampedTimestampsSec: number[];
+  visualEngineLabel: string;
+}
+
+export interface DocumentaryOutline {
+  id: string;
+  topicOrTitle: string;
+  style: DocumentaryStyle;
+  inputKind: DocumentaryInputKind;
+  chapters: DocumentaryChapter[];
+  totalDurationSec: number;
+  plannerModel: string;
+}
+
 /**
- * Stage 1 Output: Locked, trimmed, de-watermarked & cinema-graded visual clip
- * with an exact duration and stamped relative-second contact sheet ready for Stage 2 AI inspection.
+ * Step 1 & Step 2 Output: Locked, trimmed, de-watermarked & cinema-graded visual clip
+ * with an exact duration and stamped relative-second contact sheet ready for Step 3 AI inspection.
  */
 export interface PreparedVisualClip {
   clipIndex: number;
@@ -118,6 +179,7 @@ export interface PreparedVisualClip {
   delogoZoneCount: number;
   stampedContactSheetJpeg: string;
   stampedTimestampsSec: number[];
+  inspectorModel: string;
 }
 
 export interface VisionTimelineBeat {
@@ -166,6 +228,8 @@ export interface RenderedClipOutput {
   startSec: number;
   endSec: number;
   reason: string;
+  studioMode: StudioMode;
+  documentaryStyle?: DocumentaryStyle;
   videoUrl: string;
   durationSec: number;
   width: number;
@@ -201,7 +265,8 @@ export interface SavedRenderRecord {
   completedAt: string;
   sourceLabel: string;
   sourceDurationSec: number;
-  mode: 'short' | 'long';
+  mode: 'short' | 'long' | 'documentary';
+  studioMode: StudioMode;
   customAngle: string;
   clips: RenderedClipOutput[];
 }

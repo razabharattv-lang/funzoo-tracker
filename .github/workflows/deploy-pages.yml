@@ -45,6 +45,8 @@ jobs:
           VITE_YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           VITE_CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
           VITE_CLOUDINARY_UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
+          VITE_EXTERNAL_GPU_ENDPOINT: ${{ secrets.EXTERNAL_GPU_ENDPOINT }}
+          VITE_EXTERNAL_GPU_KEY: ${{ secrets.EXTERNAL_GPU_KEY }}
         run: npm run build
 
       - name: Configure GitHub Pages

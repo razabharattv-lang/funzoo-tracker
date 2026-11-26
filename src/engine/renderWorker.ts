@@ -1,6 +1,8 @@
 /// <reference lib="webworker" />
 import { ArrayBufferTarget, Muxer } from 'mp4-muxer';
 import type {
+  DocumentaryStyle,
+  MotionShaderPreset,
   OutputLanguage,
   SafeCropInsets,
   ScriptBeat,
@@ -21,6 +23,7 @@ import {
 
 interface InitMessage {
   type: 'init';
+  renderMode?: 'video' | 'scene';
   width: number;
   height: number;
   fps: number;
@@ -38,6 +41,13 @@ interface InitMessage {
   amplitudeEnvelope: Float32Array;
   mouthOpenEnvelope: Float32Array;
   envelopeFps: number;
+  // Documentary / Motion Graphics / 3D-Blender Scene Mode fields
+  sceneStyle?: DocumentaryStyle;
+  shaderPreset?: MotionShaderPreset;
+  accentHex?: string;
+  chapterTitle?: string;
+  captionCallout?: string;
+  sceneBgBitmap?: ImageBitmap | null;
 }
 
 interface FrameMessage {
@@ -50,6 +60,12 @@ interface FrameMessage {
   sourceHeight: number;
 }
 
+interface RenderSceneFrameMessage {
+  type: 'render_scene_frame';
+  frameIndex: number;
+  timeSec: number;
+}
+
 interface FinishMessage {
   type: 'finish';
 }
@@ -58,7 +74,12 @@ interface AbortMessage {
   type: 'abort';
 }
 
-type WorkerInMessage = InitMessage | FrameMessage | FinishMessage | AbortMessage;
+type WorkerInMessage =
+  | InitMessage
+  | FrameMessage
+  | RenderSceneFrameMessage
+  | FinishMessage
+  | AbortMessage;
 
 interface NormalizedDelogoZone {
   startSec: number;
@@ -81,7 +102,7 @@ void main() {
 }
 `;
 
-const FRAGMENT_SHADER_SRC = `#version 300 es
+const VIDEO_FRAGMENT_SHADER_SRC = `#version 300 es
 precision highp float;
 
 uniform sampler2D u_tex;
@@ -97,7 +118,6 @@ in vec2 v_uv;
 out vec4 outColor;
 
 vec3 multiPassDirectionalDelogo(vec2 uv, vec4 b, vec2 featherUv) {
-  // Multi-radius directional taps strictly outside the watermark perimeter
   vec2 r1 = featherUv * 1.15;
   vec2 r2 = featherUv * 2.35;
   vec2 r3 = featherUv * 3.60;
@@ -108,7 +128,6 @@ vec3 multiPassDirectionalDelogo(vec2 uv, vec4 b, vec2 featherUv) {
   vec3 accum = vec3(0.0);
   float totalW = 0.0;
 
-  // Pass 1: near ring (weight 0.50)
   {
     float lx = clamp(b.x - r1.x, 0.002, 0.998);
     float rx = clamp(b.z + r1.x, 0.002, 0.998);
@@ -121,7 +140,6 @@ vec3 multiPassDirectionalDelogo(vec2 uv, vec4 b, vec2 featherUv) {
     totalW += 0.50;
   }
 
-  // Pass 2: medium directional ring + diagonals (weight 0.32)
   {
     float lx = clamp(b.x - r2.x, 0.002, 0.998);
     float rx = clamp(b.z + r2.x, 0.002, 0.998);
@@ -137,7 +155,6 @@ vec3 multiPassDirectionalDelogo(vec2 uv, vec4 b, vec2 featherUv) {
     totalW += 0.32;
   }
 
-  // Pass 3: wide ambient feather ring (weight 0.18)
   {
     float lx = clamp(b.x - r3.x, 0.002, 0.998);
     float rx = clamp(b.z + r3.x, 0.002, 0.998);
@@ -157,7 +174,6 @@ vec3 sampleWithSurgicalDelogo(vec2 uv) {
   vec3 baseCol = texture(u_tex, uv).rgb;
   if (u_boxCount <= 0) return baseCol;
 
-  // Exact 8px feather padding around each active watermark box
   vec2 featherUv = max(u_texelSize * 8.0, vec2(0.004));
   vec3 col = baseCol;
 
@@ -168,7 +184,6 @@ vec3 sampleWithSurgicalDelogo(vec2 uv) {
     vec2 expMax = b.zw + featherUv;
 
     if (uv.x >= expMin.x && uv.x <= expMax.x && uv.y >= expMin.y && uv.y <= expMax.y) {
-      // Smooth 8px edge-color feather mask (1.0 inside core box, 0.0 at outer 8px boundary)
       float fx = smoothstep(expMin.x, b.x, uv.x) * (1.0 - smoothstep(b.z, expMax.x, uv.x));
       float fy = smoothstep(expMin.y, b.y, uv.y) * (1.0 - smoothstep(b.w, expMax.y, uv.y));
       float mask = clamp(fx * fy, 0.0, 1.0);
@@ -183,7 +198,6 @@ vec3 sampleWithSurgicalDelogo(vec2 uv) {
 }
 
 void main() {
-  // Subject-Safe Cropping: strictly apply safeCropInsets + subtle micro-zoom (1.02x -> 1.06x)
   vec2 safeCenter = u_safeMin + u_safeSize * 0.5;
   vec2 span = u_safeSize * u_aspectScale / u_zoom;
   vec2 sourceUv = safeCenter + (v_uv - 0.5) * span;
@@ -203,7 +217,138 @@ void main() {
 }
 `;
 
-interface GlPipeline {
+const SCENE_FRAGMENT_SHADER_SRC = `#version 300 es
+precision highp float;
+
+uniform sampler2D u_tex;
+uniform float u_time;
+uniform float u_duration;
+uniform float u_energy;
+uniform vec2 u_resolution;
+uniform vec3 u_accent;
+uniform int u_preset;     // 0=cinema_grid, 1=neon_motion_hud, 2=blender_3d_extrude, 3=orbital_nebula
+uniform int u_hasBg;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+// Signed distance to a rotated rounded box for crisp 3D isometric / motion tiles
+float sdRoundBox(vec2 p, vec2 b, float r) {
+  vec2 q = abs(p) - b + r;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+mat2 rot2(float a) {
+  float c = cos(a);
+  float s = sin(a);
+  return mat2(c, -s, s, c);
+}
+
+void main() {
+  float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+  vec2 p = (v_uv - vec2(0.5, 0.45));
+  p.x *= aspect;
+
+  // Base dark slate studio gradient
+  vec3 bgDeep = vec3(0.035, 0.055, 0.105);
+  vec3 bgMid  = vec3(0.065, 0.105, 0.195);
+  vec3 col = mix(bgMid, bgDeep, smoothstep(0.0, 0.85, length(p)));
+
+  if (u_hasBg == 1) {
+    // External GPU FLUX / TRELLIS / Relighting still rendered with smooth Ken Burns camera drift
+    float progress = clamp(u_time / max(u_duration, 1.0), 0.0, 1.0);
+    float kbZoom = 1.04 + 0.08 * progress;
+    vec2 pan = vec2(sin(u_time * 0.35) * 0.025, cos(u_time * 0.28) * 0.02);
+    vec2 bgUv = clamp((v_uv - 0.5) / kbZoom + 0.5 + pan, vec2(0.002), vec2(0.998));
+    vec3 imgCol = texture(u_tex, bgUv).rgb;
+    imgCol = (imgCol - 0.5) * 1.15 + 0.5;
+    col = mix(col, imgCol, 0.90);
+    // Subtle dark vignette for crisp captions & HUD contrast
+    col *= 1.0 - 0.30 * smoothstep(0.35, 0.95, length(v_uv - 0.5));
+  }
+
+  if (u_preset == 2) {
+    // 3D Blender Isometric Sculpted Blocks + Studio Rim Lighting
+    float spin = u_time * 0.45;
+    for (int i = 0; i < 4; i++) {
+      float fi = float(i);
+      vec2 offset = vec2(
+        sin(u_time * 0.55 + fi * 1.57) * 0.16,
+        cos(u_time * 0.42 + fi * 1.9) * 0.14 - 0.04
+      );
+      vec2 lp = rot2(spin + fi * 0.65) * (p - offset);
+      float d = sdRoundBox(lp, vec2(0.11 - fi * 0.015), 0.018);
+      float bodyMask = 1.0 - smoothstep(-0.004, 0.004, d);
+      float rimGlow = exp(-abs(d) * 32.0) * (0.45 + 0.45 * u_energy);
+      // 3D directional specular shading across surface normal approximation
+      float shade = clamp(0.45 + dot(normalize(lp + 0.0001), normalize(vec2(-0.6, -0.8))) * 0.55, 0.12, 1.0);
+      vec3 objCol = mix(vec3(0.08, 0.13, 0.24), u_accent, 0.35 + 0.35 * shade);
+      col = mix(col, objCol, bodyMask * (u_hasBg == 1 ? 0.32 : 0.88));
+      col += u_accent * rimGlow * (u_hasBg == 1 ? 0.35 : 0.72);
+    }
+    // 3D ground perspective grid
+    if (v_uv.y > 0.58) {
+      float gy = (v_uv.y - 0.56) * 2.4;
+      vec2 gp = vec2((v_uv.x - 0.5) / max(gy, 0.08), 1.0 / max(gy, 0.08) + u_time * 0.85);
+      vec2 grid = abs(fract(gp * 1.8) - 0.5);
+      float line = 1.0 - smoothstep(0.0, 0.045, min(grid.x, grid.y));
+      col += u_accent * line * 0.28 * gy;
+    }
+  } else if (u_preset == 1) {
+    // Neon Motion Graphics Vector HUD + Radar Rings
+    float pulse = 1.0 + 0.08 * u_energy;
+    for (int i = 1; i <= 3; i++) {
+      float radius = float(i) * 0.13 * pulse;
+      float ring = exp(-abs(length(p) - radius) * 65.0);
+      col += u_accent * ring * (u_hasBg == 1 ? 0.35 : 0.82);
+    }
+    vec2 rp = rot2(-u_time * 0.7) * p;
+    float crossHair = exp(-min(abs(rp.x), abs(rp.y)) * 120.0) * (1.0 - smoothstep(0.32, 0.48, length(p)));
+    col += vec3(0.85, 0.95, 1.0) * crossHair * (u_hasBg == 1 ? 0.22 : 0.55);
+
+    // Moving data bars in background
+    vec2 gridUv = fract(v_uv * vec2(12.0, 20.0));
+    float bar = step(0.88, gridUv.x) * step(0.15, sin(v_uv.y * 14.0 - u_time * 3.0));
+    col += u_accent * bar * 0.14;
+  } else if (u_preset == 3) {
+    // Orbital Nebula / Volumetric Science Documentary Backdrop
+    for (int i = 0; i < 5; i++) {
+      float fi = float(i);
+      vec2 orbPos = vec2(
+        sin(u_time * 0.38 + fi * 1.25) * 0.24,
+        cos(u_time * 0.29 + fi * 1.7) * 0.28
+      );
+      float dist = length(p - orbPos);
+      float glow = exp(-dist * (5.2 - fi * 0.4)) * (0.28 + 0.22 * u_energy);
+      vec3 tint = mix(u_accent, vec3(0.24, 0.35, 1.0), fi * 0.2);
+      col += tint * glow * (u_hasBg == 1 ? 0.45 : 0.95);
+    }
+  } else {
+    // Cinema Documentary Grid + Volumetric Light Sweep
+    vec2 grid = abs(fract(v_uv * vec2(9.0, 16.0) + vec2(0.0, u_time * 0.12)) - 0.5);
+    float gridLine = 1.0 - smoothstep(0.0, 0.032, min(grid.x, grid.y));
+    col += u_accent * gridLine * (u_hasBg == 1 ? 0.08 : 0.20);
+
+    float sweep = exp(-abs((v_uv.x + v_uv.y * 0.35) - fract(u_time * 0.22) * 1.5 + 0.2) * 8.0);
+    col += u_accent * sweep * (0.14 + 0.16 * u_energy);
+  }
+
+  // Subtle film grain to prevent compression banding on gradients
+  float grain = (hash21(v_uv * u_resolution + fract(u_time * 31.0)) - 0.5) * 0.025;
+  col += grain;
+
+  outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+`;
+
+interface GlVideoPipeline {
+  mode: 'video';
   canvas: OffscreenCanvas;
   gl: WebGL2RenderingContext;
   program: WebGLProgram;
@@ -217,6 +362,25 @@ interface GlPipeline {
   uBoxCount: WebGLUniformLocation | null;
   uBoxes: WebGLUniformLocation | null;
 }
+
+interface GlScenePipeline {
+  mode: 'scene';
+  canvas: OffscreenCanvas;
+  gl: WebGL2RenderingContext;
+  program: WebGLProgram;
+  vbo: WebGLBuffer | null;
+  texture: WebGLTexture;
+  hasBg: boolean;
+  uTime: WebGLUniformLocation | null;
+  uDuration: WebGLUniformLocation | null;
+  uEnergy: WebGLUniformLocation | null;
+  uResolution: WebGLUniformLocation | null;
+  uAccent: WebGLUniformLocation | null;
+  uPreset: WebGLUniformLocation | null;
+  uHasBg: WebGLUniformLocation | null;
+}
+
+type GlPipeline = GlVideoPipeline | GlScenePipeline;
 
 let glPipe: GlPipeline | null = null;
 let compositeCanvas: OffscreenCanvas | null = null;
@@ -235,6 +399,7 @@ let envFps = 30;
 let outWidth = 720;
 let outHeight = 1280;
 let outFps = 24;
+let outDuration = 18;
 let outLanguage: OutputLanguage = 'en';
 let safeInsets: SafeCropInsets = { top: 0, bottom: 0, left: 0, right: 0 };
 let delogoZones: NormalizedDelogoZone[] = [];
@@ -242,6 +407,31 @@ const activeBoxBuffer: Float32Array<ArrayBuffer> = new Float32Array(
   MAX_ACTIVE_BOXES * 4
 );
 let encoderError: Error | null = null;
+
+// Scene metadata state
+let scenePresetIndex = 0;
+let sceneAccentRgb: [number, number, number] = [0.24, 0.35, 1.0];
+let sceneAccentHex = '#3D5AFE';
+let sceneChapterTitle = '';
+let sceneCaptionCallout = '';
+let sceneStyleLabel = 'Documentary';
+
+function hexToRgb01(hex: string): [number, number, number] {
+  const clean = hex.replace('#', '').trim();
+  if (clean.length !== 6) return [0.24, 0.35, 1.0];
+  const r = parseInt(clean.slice(0, 2), 16) / 255;
+  const g = parseInt(clean.slice(2, 4), 16) / 255;
+  const b = parseInt(clean.slice(4, 6), 16) / 255;
+  if ([r, g, b].some((v) => !Number.isFinite(v))) return [0.24, 0.35, 1.0];
+  return [r, g, b];
+}
+
+function presetToInt(preset?: MotionShaderPreset): number {
+  if (preset === 'neon_motion_hud') return 1;
+  if (preset === 'blender_3d_extrude') return 2;
+  if (preset === 'orbital_nebula') return 3;
+  return 0;
+}
 
 function compileShader(
   gl: WebGL2RenderingContext,
@@ -260,7 +450,7 @@ function compileShader(
   return shader;
 }
 
-function initWebGl2(width: number, height: number): GlPipeline {
+function initBaseGlContext(width: number, height: number, fragmentSrc: string) {
   const canvas = new OffscreenCanvas(width, height);
   const gl = canvas.getContext('webgl2', {
     alpha: false,
@@ -275,7 +465,7 @@ function initWebGl2(width: number, height: number): GlPipeline {
   }
 
   const vs = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SRC);
-  const fs = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SRC);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSrc);
   const program = gl.createProgram();
   if (!program) throw new Error('WebGL2 createProgram failed');
   gl.attachShader(program, vs);
@@ -306,13 +496,15 @@ function initWebGl2(width: number, height: number): GlPipeline {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
   gl.viewport(0, 0, width, height);
+  return { canvas, gl, program, vbo, texture };
+}
 
+function initWebGl2Video(width: number, height: number): GlVideoPipeline {
+  const base = initBaseGlContext(width, height, VIDEO_FRAGMENT_SHADER_SRC);
+  const { gl, program } = base;
   return {
-    canvas,
-    gl,
-    program,
-    vbo,
-    texture,
+    mode: 'video',
+    ...base,
     uSafeMin: gl.getUniformLocation(program, 'u_safeMin'),
     uSafeSize: gl.getUniformLocation(program, 'u_safeSize'),
     uAspectScale: gl.getUniformLocation(program, 'u_aspectScale'),
@@ -320,6 +512,34 @@ function initWebGl2(width: number, height: number): GlPipeline {
     uTexelSize: gl.getUniformLocation(program, 'u_texelSize'),
     uBoxCount: gl.getUniformLocation(program, 'u_boxCount'),
     uBoxes: gl.getUniformLocation(program, 'u_boxes'),
+  };
+}
+
+function initWebGl2Scene(
+  width: number,
+  height: number,
+  sceneBgBitmap: ImageBitmap | null
+): GlScenePipeline {
+  const base = initBaseGlContext(width, height, SCENE_FRAGMENT_SHADER_SRC);
+  const { gl, program, texture } = base;
+  let hasBg = false;
+  if (sceneBgBitmap) {
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sceneBgBitmap);
+    sceneBgBitmap.close();
+    hasBg = true;
+  }
+  return {
+    mode: 'scene',
+    ...base,
+    hasBg,
+    uTime: gl.getUniformLocation(program, 'u_time'),
+    uDuration: gl.getUniformLocation(program, 'u_duration'),
+    uEnergy: gl.getUniformLocation(program, 'u_energy'),
+    uResolution: gl.getUniformLocation(program, 'u_resolution'),
+    uAccent: gl.getUniformLocation(program, 'u_accent'),
+    uPreset: gl.getUniformLocation(program, 'u_preset'),
+    uHasBg: gl.getUniformLocation(program, 'u_hasBg'),
   };
 }
 
@@ -451,11 +671,58 @@ function cleanupResources(): void {
   delogoZones = [];
 }
 
+function drawSceneHudOverlay(
+  ctx: OffscreenCanvasRenderingContext2D,
+  timeSec: number,
+  energy: number
+): void {
+  ctx.save();
+  const topY = Math.round(outHeight * 0.06);
+  const centerX = outWidth / 2;
+
+  // Top style pill
+  const pillText = `${sceneStyleLabel.toUpperCase()} · ${sceneChapterTitle.slice(0, 26)}`;
+  ctx.font = `800 ${Math.round(outWidth * 0.028)}px "Plus Jakarta Sans", sans-serif`;
+  const pillW = Math.min(outWidth * 0.86, ctx.measureText(pillText).width + 36);
+  const pillH = Math.round(outWidth * 0.068);
+  const pillX = centerX - pillW / 2;
+
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.84)';
+  ctx.strokeStyle = sceneAccentHex;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.roundRect(pillX, topY, pillW, pillH, pillH / 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(pillText, centerX, topY + pillH / 2);
+
+  // Kinetic center visual callout banner (fades cleanly on chapter entry)
+  if (sceneCaptionCallout) {
+    const entryAlpha = Math.min(1, timeSec / 0.45);
+    const scalePulse = 1.0 + 0.025 * energy;
+    ctx.globalAlpha = entryAlpha;
+    ctx.translate(centerX, outHeight * 0.21);
+    ctx.scale(scalePulse, scalePulse);
+    ctx.font = `900 ${Math.round(outWidth * 0.056)}px "Plus Jakarta Sans", sans-serif`;
+    ctx.lineWidth = Math.round(outWidth * 0.012);
+    ctx.strokeStyle = '#0F172A';
+    ctx.strokeText(sceneCaptionCallout.slice(0, 28), 0, 0);
+    ctx.fillStyle = sceneAccentHex;
+    ctx.fillText(sceneCaptionCallout.slice(0, 28), 0, 0);
+  }
+  ctx.restore();
+}
+
 async function handleInit(msg: InitMessage): Promise<void> {
   encoderError = null;
   outWidth = msg.width;
   outHeight = msg.height;
   outFps = msg.fps;
+  outDuration = msg.durationSec;
   outLanguage = msg.language;
   ampEnv = new Float32Array(msg.amplitudeEnvelope);
   mouthEnv = new Float32Array(msg.mouthOpenEnvelope);
@@ -493,7 +760,23 @@ async function handleInit(msg: InitMessage): Promise<void> {
     msg.bitrate
   );
 
-  glPipe = initWebGl2(outWidth, outHeight);
+  if (msg.renderMode === 'scene') {
+    scenePresetIndex = presetToInt(msg.shaderPreset);
+    sceneAccentHex = msg.accentHex || '#3D5AFE';
+    sceneAccentRgb = hexToRgb01(sceneAccentHex);
+    sceneChapterTitle = msg.chapterTitle || 'Chapter 1';
+    sceneCaptionCallout = msg.captionCallout || '';
+    sceneStyleLabel =
+      msg.sceneStyle === '3d_blender'
+        ? '3D Blender Studio'
+        : msg.sceneStyle === 'motion_graphics'
+        ? 'Motion Graphics'
+        : 'Documentary';
+    glPipe = initWebGl2Scene(outWidth, outHeight, msg.sceneBgBitmap ?? null);
+  } else {
+    glPipe = initWebGl2Video(outWidth, outHeight);
+  }
+
   compositeCanvas = new OffscreenCanvas(outWidth, outHeight);
   compositeCtx = compositeCanvas.getContext('2d');
   if (!compositeCtx) {
@@ -595,75 +878,19 @@ async function handleInit(msg: InitMessage): Promise<void> {
   });
 }
 
-async function handleFrame(msg: FrameMessage): Promise<void> {
-  const {
-    frameIndex,
-    timeSec,
-    sourceTimeSec,
-    bitmap,
-    sourceWidth,
-    sourceHeight,
-  } = msg;
-  try {
-    if (encoderError) throw encoderError;
-    if (!glPipe || !compositeCanvas || !compositeCtx || !videoEncoder) {
-      throw new Error('renderWorker not initialized.');
-    }
-
-    await waitForVideoEncoderDrain();
-
-    // 1) WebGL2 Surgical GPU Pass:
-    //    - Subject-safe crop using ONLY safeCropInsets (0.0..0.14)
-    //    - Gentle 1.00x -> 1.03x micro-drift
-    //    - Time-windowed multi-pass directional delogo with 8px feather padding
-    const { gl } = glPipe;
-    gl.bindTexture(gl.TEXTURE_2D, glPipe.texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
-
-    const safeMinX = safeInsets.left;
-    const safeMinY = safeInsets.top;
-    const safeSizeX = Math.max(0.7, 1.0 - safeInsets.left - safeInsets.right);
-    const safeSizeY = Math.max(0.7, 1.0 - safeInsets.top - safeInsets.bottom);
-
-    const effectiveSrcW = Math.max(1, sourceWidth * safeSizeX);
-    const effectiveSrcH = Math.max(1, sourceHeight * safeSizeY);
-    const safeAspect = Math.max(0.1, effectiveSrcW / effectiveSrcH);
-    const dstAspect = outWidth / outHeight;
-
-    let aspectScaleX = 1.0;
-    let aspectScaleY = 1.0;
-    if (safeAspect > dstAspect) {
-      aspectScaleX = dstAspect / safeAspect;
-    } else {
-      aspectScaleY = safeAspect / dstAspect;
-    }
-
-    // Subtle dynamic micro-zoom (1.02x -> 1.06x) inside subject-safe crop bounds
-    const microZoom = 1.02 + 0.04 * Math.abs(Math.sin(timeSec * 0.58));
-    const activeCount = packActiveBoxesForTimestamp(sourceTimeSec);
-
-    gl.uniform2f(glPipe.uSafeMin, safeMinX, safeMinY);
-    gl.uniform2f(glPipe.uSafeSize, safeSizeX, safeSizeY);
-    gl.uniform2f(glPipe.uAspectScale, aspectScaleX, aspectScaleY);
-    gl.uniform1f(glPipe.uZoom, microZoom);
-    gl.uniform2f(
-      glPipe.uTexelSize,
-      1.0 / Math.max(1, sourceWidth),
-      1.0 / Math.max(1, sourceHeight)
-    );
-    gl.uniform1i(glPipe.uBoxCount, activeCount);
-    gl.uniform4fv(glPipe.uBoxes, activeBoxBuffer);
-
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  } finally {
-    // Strictly close frame bitmap immediately to keep mobile RAM flat
-    bitmap.close();
-  }
-
+async function encodeAndEmitCompositeFrame(
+  frameIndex: number,
+  timeSec: number,
+  isSceneMode: boolean,
+  energy: number
+): Promise<void> {
   if (!glPipe || !compositeCanvas || !compositeCtx || !videoEncoder) return;
 
-  // 2) Composite GPU frame + Talking Character Pop-Ins + CapCut Kinetic Pop Captions
   compositeCtx.drawImage(glPipe.canvas, 0, 0);
+
+  if (isSceneMode) {
+    drawSceneHudOverlay(compositeCtx, timeSec, energy);
+  }
 
   if (portraitSource && popInSchedule) {
     drawTalkingCharacterOverlay({
@@ -688,7 +915,6 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
     canvasHeight: outHeight,
   });
 
-  // 3) Hardware H.264 encode strictly 1 VideoFrame and immediately call frame.close()
   const frameDurationUs = Math.round(1_000_000 / outFps);
   const timestampUs = frameIndex * frameDurationUs;
   const videoFrame = new VideoFrame(compositeCanvas, {
@@ -703,6 +929,119 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
   }
 
   self.postMessage({ type: 'frame_done', frameIndex });
+}
+
+async function handleFrame(msg: FrameMessage): Promise<void> {
+  const {
+    frameIndex,
+    timeSec,
+    sourceTimeSec,
+    bitmap,
+    sourceWidth,
+    sourceHeight,
+  } = msg;
+  try {
+    if (encoderError) throw encoderError;
+    if (
+      !glPipe ||
+      glPipe.mode !== 'video' ||
+      !compositeCanvas ||
+      !compositeCtx ||
+      !videoEncoder
+    ) {
+      throw new Error('renderWorker video pipeline not initialized.');
+    }
+
+    await waitForVideoEncoderDrain();
+
+    const { gl } = glPipe;
+    gl.bindTexture(gl.TEXTURE_2D, glPipe.texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+
+    const safeMinX = safeInsets.left;
+    const safeMinY = safeInsets.top;
+    const safeSizeX = Math.max(0.7, 1.0 - safeInsets.left - safeInsets.right);
+    const safeSizeY = Math.max(0.7, 1.0 - safeInsets.top - safeInsets.bottom);
+
+    const effectiveSrcW = Math.max(1, sourceWidth * safeSizeX);
+    const effectiveSrcH = Math.max(1, sourceHeight * safeSizeY);
+    const safeAspect = Math.max(0.1, effectiveSrcW / effectiveSrcH);
+    const dstAspect = outWidth / outHeight;
+
+    let aspectScaleX = 1.0;
+    let aspectScaleY = 1.0;
+    if (safeAspect > dstAspect) {
+      aspectScaleX = dstAspect / safeAspect;
+    } else {
+      aspectScaleY = safeAspect / dstAspect;
+    }
+
+    const microZoom = 1.02 + 0.04 * Math.abs(Math.sin(timeSec * 0.58));
+    const activeCount = packActiveBoxesForTimestamp(sourceTimeSec);
+
+    gl.uniform2f(glPipe.uSafeMin, safeMinX, safeMinY);
+    gl.uniform2f(glPipe.uSafeSize, safeSizeX, safeSizeY);
+    gl.uniform2f(glPipe.uAspectScale, aspectScaleX, aspectScaleY);
+    gl.uniform1f(glPipe.uZoom, microZoom);
+    gl.uniform2f(
+      glPipe.uTexelSize,
+      1.0 / Math.max(1, sourceWidth),
+      1.0 / Math.max(1, sourceHeight)
+    );
+    gl.uniform1i(glPipe.uBoxCount, activeCount);
+    gl.uniform4fv(glPipe.uBoxes, activeBoxBuffer);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  } finally {
+    bitmap.close();
+  }
+
+  await encodeAndEmitCompositeFrame(frameIndex, timeSec, false, 0);
+}
+
+async function handleRenderSceneFrame(
+  msg: RenderSceneFrameMessage
+): Promise<void> {
+  const { frameIndex, timeSec } = msg;
+  if (encoderError) throw encoderError;
+  if (
+    !glPipe ||
+    glPipe.mode !== 'scene' ||
+    !compositeCanvas ||
+    !compositeCtx ||
+    !videoEncoder
+  ) {
+    throw new Error('renderWorker scene pipeline not initialized.');
+  }
+
+  await waitForVideoEncoderDrain();
+
+  const envIdx = Math.min(
+    Math.max(0, Math.floor(timeSec * envFps)),
+    Math.max(0, ampEnv.length - 1)
+  );
+  const energy = ampEnv.length > 0 ? ampEnv[envIdx] : 0.25;
+
+  const { gl } = glPipe;
+  if (glPipe.hasBg) {
+    gl.bindTexture(gl.TEXTURE_2D, glPipe.texture);
+  }
+  gl.uniform1f(glPipe.uTime, timeSec);
+  gl.uniform1f(glPipe.uDuration, Math.max(1, outDuration));
+  gl.uniform1f(glPipe.uEnergy, energy);
+  gl.uniform2f(glPipe.uResolution, outWidth, outHeight);
+  gl.uniform3f(
+    glPipe.uAccent,
+    sceneAccentRgb[0],
+    sceneAccentRgb[1],
+    sceneAccentRgb[2]
+  );
+  gl.uniform1i(glPipe.uPreset, scenePresetIndex);
+  gl.uniform1i(glPipe.uHasBg, glPipe.hasBg ? 1 : 0);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  await encodeAndEmitCompositeFrame(frameIndex, timeSec, true, energy);
 }
 
 async function handleFinish(): Promise<void> {
@@ -727,6 +1066,8 @@ self.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
       await handleInit(msg);
     } else if (msg.type === 'frame') {
       await handleFrame(msg);
+    } else if (msg.type === 'render_scene_frame') {
+      await handleRenderSceneFrame(msg);
     } else if (msg.type === 'finish') {
       await handleFinish();
     } else if (msg.type === 'abort') {
