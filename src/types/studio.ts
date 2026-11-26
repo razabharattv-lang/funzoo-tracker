@@ -17,6 +17,72 @@ export type PipelineStepId =
   | 'step_4_voice_character'
   | 'step_5_gpu_mux';
 
+export type OfflineModelId =
+  | 'scene_logo_scanner'
+  | 'whisper_caption_aligner'
+  | 'mediapipe_face_rig'
+  | 'offline_script_generator';
+
+export interface OfflineModelStatus {
+  id: OfflineModelId;
+  label: string;
+  engine: string;
+  cached: boolean;
+  ready: boolean;
+  sizeKB: number;
+}
+
+export interface CacheStorageSummary {
+  cacheApiEntries: number;
+  indexedDbAssets: number;
+  cachedModelIds: OfflineModelId[];
+  totalCachedBytes: number;
+  lastSyncedAt: string;
+}
+
+export interface AlignedWordTiming {
+  word: string;
+  startSec: number;
+  endSec: number;
+  confidence: number;
+  isEmphasis: boolean;
+}
+
+export interface CharacterFaceLandmarks {
+  cropX: number;
+  cropY: number;
+  cropSize: number;
+  jawRatioY: number;
+  mouthCenterX: number;
+  mouthCenterY: number;
+  eyeLineY: number;
+  detectorEngine: string;
+}
+
+export interface CharacterRigFrameState {
+  mouthOpen: number;
+  jawDrop: number;
+  smileBoost: number;
+  blinkAmount: number;
+  headPitchRad: number;
+  headRollRad: number;
+  headBobPx: number;
+  browRaise: number;
+}
+
+export interface LocalSceneScanResult {
+  sceneCutTimestampsSec: number[];
+  highActionWindows: {
+    startSec: number;
+    endSec: number;
+    climaxSec: number;
+    motionScore: number;
+  }[];
+  detectedWatermarkZones: WatermarkZone[];
+  suggestedSafeCropInsets: SafeCropInsets;
+  hasOutroBumper: boolean;
+}
+
 export interface SavedCharacterAsset {
   id: string;
   name: string;
@@ -213,6 +279,7 @@ export interface YouTubeTrendVideo {
 export interface TrendMetadata {
   voiceover: string;
   beats: ScriptBeat[];
+  wordTimings?: AlignedWordTiming[];
   title: string;
   description: string;
   tags: string;

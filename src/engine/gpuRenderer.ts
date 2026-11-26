@@ -1,4 +1,5 @@
 import type {
+  CharacterFaceLandmarks,
   DocumentaryChapter,
   OutputLanguage,
   PreparedVisualClip,
@@ -6,7 +7,8 @@ import type {
   SourceMediaItem,
 } from '../types/studio';
 import type { ProcessedStudioAudio } from './audioEngine';
-import { loadPortraitBitmap } from './characterAnimator';
+import { loadPortraitBitmapWithOfflineRig } from './characterAnimator';
+import { cachedFetchResponse } from './cacheManager';
 
 export interface GpuRenderOptions {
   source: SourceMediaItem;
@@ -324,13 +326,19 @@ async function renderSinglePassWebCodecsWorker(
       : [{ startSec: clip.trimRange.startSec, endSec: clip.trimRange.endSec }];
 
   let portraitBitmap: ImageBitmap | null = null;
+  let portraitLandmarks: CharacterFaceLandmarks | null = null;
   let characterMode = 'disabled';
   if (characterEnabled && characterPortraitUrl) {
     try {
-      portraitBitmap = await loadPortraitBitmap(characterPortraitUrl);
-      characterMode = 'webaudio-reactive-popin';
+      const loaded = await loadPortraitBitmapWithOfflineRig(
+        characterPortraitUrl
+      );
+      portraitBitmap = loaded.bitmap;
+      portraitLandmarks = loaded.landmarks;
+      characterMode = `offline-phoneme-rig (${loaded.landmarks.detectorEngine})`;
     } catch {
       portraitBitmap = null;
+      portraitLandmarks = null;
       characterMode = 'disabled';
     }
   }
@@ -407,12 +415,14 @@ async function renderSinglePassWebCodecsWorker(
         bitrate: profile.bitrate,
         durationSec: lockedDurationSec,
         scriptText,
-        beats,
+        beats: audio.alignedBeats.length > 0 ? audio.alignedBeats : beats,
+        wordTimings: audio.wordTimings,
         language,
         safeCropInsets: clip.safeCropInsets,
         watermarkZones: clip.watermarkZones,
         climaxSecond: clip.climaxSec,
         portraitBitmap,
+        portraitLandmarks,
         pcmMono: pcmCopy,
         sampleRate: audio.sampleRate,
         amplitudeEnvelope: ampCopy,
@@ -639,13 +649,19 @@ async function renderSceneWebCodecsWorker(
   );
 
   let portraitBitmap: ImageBitmap | null = null;
+  let portraitLandmarks: CharacterFaceLandmarks | null = null;
   let characterMode = 'disabled';
   if (characterEnabled && characterPortraitUrl) {
     try {
-      portraitBitmap = await loadPortraitBitmap(characterPortraitUrl);
-      characterMode = 'webaudio-reactive-popin';
+      const loaded = await loadPortraitBitmapWithOfflineRig(
+        characterPortraitUrl
+      );
+      portraitBitmap = loaded.bitmap;
+      portraitLandmarks = loaded.landmarks;
+      characterMode = `offline-phoneme-rig (${loaded.landmarks.detectorEngine})`;
     } catch {
       portraitBitmap = null;
+      portraitLandmarks = null;
       characterMode = 'disabled';
     }
   }
@@ -653,7 +669,9 @@ async function renderSceneWebCodecsWorker(
   let sceneBgBitmap: ImageBitmap | null = null;
   if (chapter.externalVisualDataUrl) {
     try {
-      const resp = await fetch(chapter.externalVisualDataUrl, { signal });
+      const resp = await cachedFetchResponse(chapter.externalVisualDataUrl, {
+        signal,
+      });
       if (resp.ok) {
         sceneBgBitmap = await createImageBitmap(await resp.blob());
       }
@@ -704,12 +722,14 @@ async function renderSceneWebCodecsWorker(
         bitrate: profile.bitrate,
         durationSec: lockedDurationSec,
         scriptText,
-        beats,
+        beats: audio.alignedBeats.length > 0 ? audio.alignedBeats : beats,
+        wordTimings: audio.wordTimings,
         language,
         safeCropInsets: { top: 0, bottom: 0, left: 0, right: 0 },
         watermarkZones: [],
         climaxSecond: chapter.climaxSec,
         portraitBitmap,
+        portraitLandmarks,
         pcmMono: pcmCopy,
         sampleRate: audio.sampleRate,
         amplitudeEnvelope: ampCopy,

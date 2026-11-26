@@ -2,9 +2,8 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
-export default defineConfig(({ command }) => ({
-  // GitHub Pages serves this repository at https://razabharattv-lang.github.io/funzoo-tracker/
-  base: command === 'build' ? '/funzoo-tracker/' : '/',
+export default defineConfig({
+  base: process.env.GITHUB_PAGES === 'true' ? '/funzoo-tracker/' : '/',
   plugins: [react(), tailwindcss()],
   worker: {
     format: 'es',
@@ -24,4 +23,4 @@ export default defineConfig(({ command }) => ({
     outDir: 'dist',
     sourcemap: false,
   },
-}));
+});

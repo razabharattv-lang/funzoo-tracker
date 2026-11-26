@@ -12,6 +12,7 @@ import {
   requestExternalGpuVisual,
   runStep1PlannerJson,
 } from './modelRouter';
+import { generateOfflineDocumentaryOutline } from './offlineModels';
 import { formatRelSecondStamp } from './visualClipper';
 
 const STYLE_ACCENTS: Record<DocumentaryStyle, string[]> = {
@@ -223,13 +224,25 @@ Return ONLY valid JSON:
 (Produce 2 to 4 balanced chapters, each 14s to 35s long.)
 `.trim();
 
-  const planned = await runStep1PlannerJson({
-    nvidiaApiKey: config.nvidiaApiKey,
-    geminiApiKey: config.geminiApiKey,
-    systemPrompt,
-    userPrompt,
-    signal,
-  });
+  let planned: { parsed: Record<string, unknown>; modelUsed: string } | null =
+    null;
+  try {
+    planned = await runStep1PlannerJson({
+      nvidiaApiKey: config.nvidiaApiKey,
+      systemPrompt,
+      userPrompt,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    return generateOfflineDocumentaryOutline({
+      rawInput: trimmed,
+      inputKind,
+      style,
+      language,
+      customAngle,
+    });
+  }
 
   const rawChapters = Array.isArray(planned?.parsed?.chapters)
     ? (planned!.parsed.chapters as Record<string, unknown>[])

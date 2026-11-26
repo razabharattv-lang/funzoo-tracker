@@ -1,6 +1,6 @@
 import type { SavedCharacterAsset, StudioConfig } from '../types/studio';
 
-const CONFIG_STORAGE_KEY = 'explainer_studio_browser_config_v4';
+const CONFIG_STORAGE_KEY = 'explainer_studio_browser_config_v6';
 
 interface StoredStudioConfig {
   geminiApiKey?: string;
@@ -27,7 +27,9 @@ export function getBuildWiredDefaults(): {
     geminiApiKey: (import.meta.env.VITE_GEMINI_API_KEY ?? '').trim(),
     nvidiaApiKey: (import.meta.env.VITE_NVIDIA_API_KEY ?? '').trim(),
     youtubeApiKey: (import.meta.env.VITE_YOUTUBE_API_KEY ?? '').trim(),
-    cloudinaryCloudName: (import.meta.env.VITE_CLOUDINARY_CLOUD_NAME ?? '').trim(),
+    cloudinaryCloudName: (
+      import.meta.env.VITE_CLOUDINARY_CLOUD_NAME ?? ''
+    ).trim(),
     cloudinaryUploadPreset: (
       import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET ?? ''
     ).trim(),
@@ -40,7 +42,13 @@ export function getBuildWiredDefaults(): {
 
 export function isAutoWiredFromBuild(): boolean {
   const wired = getBuildWiredDefaults();
-  return Boolean(wired.geminiApiKey || wired.nvidiaApiKey);
+  return Boolean(
+    wired.geminiApiKey ||
+      wired.nvidiaApiKey ||
+      wired.youtubeApiKey ||
+      wired.cloudinaryCloudName ||
+      wired.externalGpuEndpoint
+  );
 }
 
 export function hasExternalGpuConfigured(config: StudioConfig): boolean {
@@ -55,8 +63,9 @@ export function loadStudioConfig(): StudioConfig {
   try {
     const raw =
       window.localStorage.getItem(CONFIG_STORAGE_KEY) ||
-      window.localStorage.getItem('explainer_studio_browser_config_v3') ||
-      window.localStorage.getItem('explainer_studio_config_v2');
+      window.localStorage.getItem('explainer_studio_browser_config_v5') ||
+      window.localStorage.getItem('explainer_studio_browser_config_v4') ||
+      window.localStorage.getItem('explainer_studio_browser_config_v3');
     if (raw) {
       const parsed = JSON.parse(raw) as unknown;
       if (parsed && typeof parsed === 'object') {
@@ -215,10 +224,6 @@ export function clearStudioKeysOnly(current: StudioConfig): StudioConfig {
   return saveStudioConfig(next);
 }
 
-export function getMissingConfigFields(config: StudioConfig): string[] {
-  const missing: string[] = [];
-  if (!config.geminiApiKey && !config.nvidiaApiKey) {
-    missing.push('Gemini or NVIDIA API Key');
-  }
-  return missing;
+export function getMissingConfigFields(_config: StudioConfig): string[] {
+  return [];
 }

@@ -1,4 +1,8 @@
 import type { SavedRenderRecord } from '../types/studio';
+import {
+  deleteRenderRecordFromIndexedDb,
+  saveRenderRecordToIndexedDb,
+} from '../engine/cacheManager';
 
 const STORAGE_KEY = 'explainer_studio_renders_v3';
 
@@ -32,6 +36,7 @@ export function saveRenderRecord(
   } catch {
     // ignore storage quota errors
   }
+  void saveRenderRecordToIndexedDb(record);
   return next;
 }
 
@@ -42,5 +47,6 @@ export function deleteRenderRecord(runTag: string): SavedRenderRecord[] {
   } catch {
     // ignore storage quota errors
   }
+  void deleteRenderRecordFromIndexedDb(runTag);
   return next;
 }

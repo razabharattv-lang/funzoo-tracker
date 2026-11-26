@@ -1,3 +1,10 @@
+import type { CharacterFaceLandmarks } from '../types/studio';
+import { cachedFetchResponse } from './cacheManager';
+import {
+  computeCharacterRigFrameState,
+  detectPortraitFaceLandmarksOffline,
+} from './offlineModels';
+
 export interface CharacterPopInSchedule {
   hookEndSec: number;
   climaxStartSec: number;
@@ -11,16 +18,40 @@ export interface PortraitSource {
   cropX: number;
   cropY: number;
   cropSize: number;
+  jawRatioY?: number;
+  eyeLineY?: number;
 }
 
 export function computeSquarePortraitCrop(
   width: number,
-  height: number
-): { cropX: number; cropY: number; cropSize: number } {
+  height: number,
+  landmarks?: CharacterFaceLandmarks | null
+): {
+  cropX: number;
+  cropY: number;
+  cropSize: number;
+  jawRatioY: number;
+  eyeLineY: number;
+} {
+  if (landmarks && landmarks.cropSize > 0) {
+    return {
+      cropX: landmarks.cropX,
+      cropY: landmarks.cropY,
+      cropSize: landmarks.cropSize,
+      jawRatioY: landmarks.jawRatioY,
+      eyeLineY: landmarks.eyeLineY,
+    };
+  }
   const cropSize = Math.max(1, Math.min(width, height));
   const cropX = Math.floor((width - cropSize) / 2);
   const cropY = Math.max(0, Math.floor((height - cropSize) * 0.22));
-  return { cropX, cropY, cropSize };
+  return {
+    cropX,
+    cropY,
+    cropSize,
+    jawRatioY: 0.58,
+    eyeLineY: 0.39,
+  };
 }
 
 export function buildCharacterPopInSchedule(
@@ -80,12 +111,26 @@ export function isCharacterActiveAtTime(
 export async function loadPortraitBitmap(
   portraitUrl: string
 ): Promise<ImageBitmap> {
-  const resp = await fetch(portraitUrl);
+  const resp = await cachedFetchResponse(portraitUrl);
   if (!resp.ok) {
     throw new Error('Could not fetch talking character portrait.');
   }
   const blob = await resp.blob();
   return createImageBitmap(blob);
+}
+
+export async function loadPortraitBitmapWithOfflineRig(
+  portraitUrl: string
+): Promise<{
+  bitmap: ImageBitmap;
+  landmarks: CharacterFaceLandmarks;
+}> {
+  const bitmap = await loadPortraitBitmap(portraitUrl);
+  const landmarks = await detectPortraitFaceLandmarksOffline(
+    bitmap,
+    portraitUrl.slice(-48)
+  );
+  return { bitmap, landmarks };
 }
 
 function drawRoundedRectPath(
@@ -110,7 +155,7 @@ function drawRoundedRectPath(
 }
 
 /**
- * Resolution-independent WebAudio-reactive Talking Character renderer.
+ * Resolution-independent WebAudio & Offline-Rig Talking Character renderer.
  * Works on both OffscreenCanvas (inside WebWorker) and DOM Canvas (720x1280 or 1080x1920).
  * Appears ONLY during Opening Hook (0–2.5s), Mid-Video Climax (1.5s), and Loop Outro (last 1.8s).
  */
@@ -146,7 +191,14 @@ export function drawTalkingCharacterOverlay(params: {
     Math.max(0, Math.floor(timeSec * envelopeFps))
   );
   const amp = amplitudeEnvelope[frameIdx] ?? 0;
-  const mouthOpen = mouthOpenEnvelope[frameIdx] ?? amp;
+  const mouthOpenRaw = mouthOpenEnvelope[frameIdx] ?? amp;
+
+  const rig = computeCharacterRigFrameState({
+    timeSec,
+    amplitude: amp,
+    mouthOpenRaw,
+    scaleFactor,
+  });
 
   const popProgress = Math.min(1, state.localT / 0.16);
   const springScale =
@@ -163,8 +215,8 @@ export function drawTalkingCharacterOverlay(params: {
   const radius = Math.round(30 * scaleFactor);
 
   const headZoom = 1.02 + amp * 0.045 + Math.sin(timeSec * 4.5) * 0.008;
-  const tiltRad = ((amp * 2.2 * Math.sin(timeSec * 8.5)) * Math.PI) / 180;
-  const bobY = -amp * 6 * scaleFactor;
+  const tiltRad = rig.headRollRad + rig.headPitchRad * 0.35;
+  const bobY = rig.headBobPx;
 
   ctx.save();
 
@@ -188,12 +240,13 @@ export function drawTalkingCharacterOverlay(params: {
     boxSize
   );
 
-  // Subtle phoneme-driven jaw/lower-face articulation
-  if (mouthOpen > 0.12) {
-    const jawSrcY = portrait.cropY + portrait.cropSize * 0.58;
-    const jawSrcH = portrait.cropSize * 0.24;
-    const jawDstY = -boxSize / 2 + boxSize * 0.58;
-    const stretchH = boxSize * 0.24 * (1 + mouthOpen * 0.12);
+  // Phoneme-driven jaw & lower-face articulation from offline face rig
+  const jawRatio = portrait.jawRatioY ?? 0.58;
+  if (rig.mouthOpen > 0.1) {
+    const jawSrcY = portrait.cropY + portrait.cropSize * jawRatio;
+    const jawSrcH = portrait.cropSize * 0.25;
+    const jawDstY = -boxSize / 2 + boxSize * jawRatio;
+    const stretchH = boxSize * 0.25 * (1 + rig.jawDrop);
     ctx.drawImage(
       portrait.source,
       portrait.cropX + portrait.cropSize * 0.22,
@@ -207,12 +260,33 @@ export function drawTalkingCharacterOverlay(params: {
     );
   }
 
+  // Subtle natural eye-blink eyelid sweep at calibrated eyeLineY
+  if (rig.blinkAmount > 0.15) {
+    const eyeRatio = portrait.eyeLineY ?? 0.39;
+    const eyeSrcY =
+      portrait.cropY + portrait.cropSize * Math.max(0.2, eyeRatio - 0.045);
+    const eyeSrcH = portrait.cropSize * 0.055;
+    const eyeDstY = -boxSize / 2 + boxSize * (eyeRatio - 0.03);
+    const blinkH = boxSize * 0.075 * rig.blinkAmount;
+    ctx.drawImage(
+      portrait.source,
+      portrait.cropX + portrait.cropSize * 0.22,
+      eyeSrcY,
+      portrait.cropSize * 0.56,
+      eyeSrcH,
+      -boxSize * 0.28,
+      eyeDstY,
+      boxSize * 0.56,
+      blinkH
+    );
+  }
+
   ctx.restore();
 
   // Flat Material active border (#FFAB00 amber speaking burst, #3D5AFE indigo resting)
   drawRoundedRectPath(ctx, boxX, boxY + bobY, boxSize, boxSize, radius);
   ctx.lineWidth = Math.max(4, Math.round(10 * scaleFactor));
-  ctx.strokeStyle = amp > 0.3 ? '#FFAB00' : '#3D5AFE';
+  ctx.strokeStyle = amp > 0.28 ? '#FFAB00' : '#3D5AFE';
   ctx.stroke();
 
   // Speaking equalizer bars

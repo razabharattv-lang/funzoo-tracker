@@ -6,17 +6,10 @@ import type {
 } from '../types/studio';
 
 /**
- * 24-Model Team Registry distributed across the 5-Step Production Pipeline:
- * - Step 1 (Fetch & Inspect): nemotron-3-ultra-550b-a55b, Step 5 Preview, kimi-k3.1-pro,
- *   nemotron-3.5-super-vl-120b-a12b, nemotron-3-nano-omni-30b-a3b-reasoning,
- *   cosmos3-nano-reasoner, nemotron-ocr-v1, nemotron-3.5-parse, gemini-3.8-flash
- * - Step 2 (Clean & Motion Grade): flux-3-image-klein, FLUX.1-schnell, TRELLIS, Relighting
- *   (external GPU worker if configured, else WebGL2 3D/Motion shader synthesizer)
- * - Step 3 (Script & US Trends): Mistral Large 4, glm-5-3-flash,
- *   nemotron-3.5-lightning-30b-a3b, riva-translate-4b-instruct-v2,
- *   nemotron-3.5-content-safety, gemini-3.8-flash
- * - Step 4 (Voice & Character): gemini-3.8-flash-tts, magpie-tts-zeroshot, Studio Voice,
- *   Background Noise Removal, LipSync, wan2.2-animate-2-14b, 3D Body Pose, eyecontact
+ * Multi-Model Studio Router:
+ * - Server-side Gemini endpoints (`/api/gemini/*`) execute all Gemini Vision, JSON planning,
+ *   TTS voiceover, and face-locked outfit editing safely on the backend server.
+ * - Optional NVIDIA NIM endpoints and optional External GPU endpoints run when configured.
  */
 export const MODEL_ROSTER = {
   step1Planning: [
@@ -61,21 +54,19 @@ export const MODEL_ROSTER = {
     '3D Body Pose',
     'eyecontact',
   ],
-  geminiPrimary: 'gemini-3.8-flash',
-  geminiFallback: 'gemini-3.5-flash',
 } as const;
 
 const NVIDIA_NIM_ENDPOINT =
   'https://integrate.api.nvidia.com/v1/chat/completions';
 const NIM_TIMEOUT_MS = 9_500;
-const GEMINI_TIMEOUT_MS = 12_000;
+const SERVER_GEMINI_TIMEOUT_MS = 35_000;
 const EXTERNAL_GPU_TIMEOUT_MS = 18_000;
 
 export async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   parentSignal?: AbortSignal,
-  timeoutMs = GEMINI_TIMEOUT_MS
+  timeoutMs = SERVER_GEMINI_TIMEOUT_MS
 ): Promise<Response> {
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
@@ -115,60 +106,198 @@ export function stripJsonFences(raw: string): string {
   return cleaned;
 }
 
-export async function callGeminiJsonOnce(params: {
+const DIRECT_GEMINI_JSON_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+] as const;
+
+async function callDirectGeminiJsonFallback(params: {
   apiKey: string;
-  parts: Record<string, unknown>[];
+  prompt: string;
+  systemInstruction?: string;
+  imageBase64Jpeg?: string;
   signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string } | null> {
-  const { apiKey, parts, signal } = params;
-  if (!apiKey) return null;
+}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
+  const { apiKey, prompt, systemInstruction, imageBase64Jpeg, signal } = params;
+  const trimmedKey = apiKey.trim();
+  if (!trimmedKey) {
+    throw new Error(
+      'Gemini API Key is missing. Open "Engine & Keys" at the top and paste your Gemini API Key (or configure VITE_GEMINI_API_KEY in GitHub Secrets).'
+    );
+  }
 
-  const modelsToTry = [MODEL_ROSTER.geminiPrimary, MODEL_ROSTER.geminiFallback];
-  const payload = JSON.stringify({
-    contents: [{ role: 'user', parts }],
-    generationConfig: { responseMimeType: 'application/json' },
-  });
-
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const model = modelsToTry[i];
+  let lastErrorMsg = '';
+  for (const model of DIRECT_GEMINI_JSON_MODELS) {
+    if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
     try {
+      const parts: Record<string, unknown>[] = [{ text: prompt }];
+      if (imageBase64Jpeg) {
+        parts.push({
+          inline_data: {
+            mime_type: 'image/jpeg',
+            data: imageBase64Jpeg,
+          },
+        });
+      }
+
       const resp = await fetchWithTimeout(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-          apiKey
+          trimmedKey
         )}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: payload,
+          body: JSON.stringify({
+            ...(systemInstruction
+              ? {
+                  system_instruction: {
+                    parts: [{ text: systemInstruction }],
+                  },
+                }
+              : {}),
+            contents: [{ role: 'user', parts }],
+            generationConfig: {
+              responseMimeType: 'application/json',
+              temperature: 0.45,
+            },
+          }),
         },
         signal,
-        GEMINI_TIMEOUT_MS
+        SERVER_GEMINI_TIMEOUT_MS
       );
 
+      const data = (await resp.json().catch(() => ({}))) as {
+        candidates?: {
+          content?: { parts?: { text?: string }[] };
+        }[];
+        error?: { message?: string; status?: string };
+      };
+
       if (!resp.ok) {
-        if (
-          i === 0 &&
-          (resp.status === 404 || resp.status >= 500 || resp.status === 429)
-        ) {
-          continue;
+        lastErrorMsg =
+          data.error?.message || `Gemini API ${model} returned HTTP ${resp.status}.`;
+        if (resp.status === 400 || resp.status === 401 || resp.status === 403) {
+          if (model === DIRECT_GEMINI_JSON_MODELS[DIRECT_GEMINI_JSON_MODELS.length - 1]) {
+            throw new Error(`Gemini API error: ${lastErrorMsg}`);
+          }
         }
-        return null;
+        continue;
       }
 
-      const data = (await resp.json()) as {
-        candidates?: { content?: { parts?: { text?: string }[] } }[];
-      };
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-      if (!text) continue;
-      return {
-        parsed: JSON.parse(stripJsonFences(text)) as Record<string, unknown>,
-        modelUsed: model,
-      };
+      const rawText =
+        data.candidates?.[0]?.content?.parts
+          ?.map((p) => p.text || '')
+          .join('\n')
+          .trim() ?? '';
+
+      if (!rawText) {
+        lastErrorMsg = `Gemini ${model} returned an empty response.`;
+        continue;
+      }
+
+      const parsed = JSON.parse(stripJsonFences(rawText)) as Record<
+        string,
+        unknown
+      >;
+      return { parsed, modelUsed: model };
     } catch (err) {
       if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+      lastErrorMsg = err instanceof Error ? err.message : String(err);
     }
   }
-  return null;
+
+  throw new Error(
+    lastErrorMsg ||
+      'Gemini video analysis failed. Please verify your Gemini API Key in Engine & Keys.'
+  );
+}
+
+export async function callServerGeminiJson(params: {
+  prompt: string;
+  systemInstruction?: string;
+  imageBase64Jpeg?: string;
+  geminiApiKey?: string;
+  signal?: AbortSignal;
+}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
+  const {
+    prompt,
+    systemInstruction,
+    imageBase64Jpeg,
+    geminiApiKey = '',
+    signal,
+  } = params;
+
+  const effectiveKey = (
+    geminiApiKey ||
+    (import.meta.env.VITE_GEMINI_API_KEY ?? '')
+  ).trim();
+
+  try {
+    const resp = await fetchWithTimeout(
+      '/api/gemini/json',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          ...(systemInstruction ? { systemInstruction } : {}),
+          ...(imageBase64Jpeg ? { imageBase64Jpeg } : {}),
+          ...(effectiveKey ? { apiKey: effectiveKey } : {}),
+        }),
+      },
+      signal,
+      SERVER_GEMINI_TIMEOUT_MS
+    );
+
+    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+    const isJson = contentType.includes('application/json');
+    const payload = isJson
+      ? ((await resp.json().catch(() => ({}))) as {
+          parsed?: Record<string, unknown>;
+          modelUsed?: string;
+          error?: string;
+        })
+      : {};
+
+    if (resp.ok && payload.parsed) {
+      return {
+        parsed: payload.parsed,
+        modelUsed: payload.modelUsed || 'gemini-2.5-flash',
+      };
+    }
+
+    // If hosted on static GitHub Pages (404/405/HTML response) or server lacks env key, try direct Gemini key if available
+    if (effectiveKey) {
+      return await callDirectGeminiJsonFallback({
+        apiKey: effectiveKey,
+        prompt,
+        systemInstruction,
+        imageBase64Jpeg,
+        signal,
+      });
+    }
+
+    throw new Error(
+      payload.error ||
+        `Gemini API Key is not configured (HTTP ${resp.status}). Open "Engine & Keys" at the top and paste your Gemini API Key.`
+    );
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    if (effectiveKey) {
+      return await callDirectGeminiJsonFallback({
+        apiKey: effectiveKey,
+        prompt,
+        systemInstruction,
+        imageBase64Jpeg,
+        signal,
+      });
+    }
+    throw err instanceof Error
+      ? err
+      : new Error(
+          'Gemini API request failed. Open "Engine & Keys" and enter a valid Gemini API Key.'
+        );
+  }
 }
 
 export async function callNvidiaNimJson(params: {
@@ -245,32 +374,45 @@ export async function callNvidiaNimJson(params: {
       return { parsed, modelUsed: model.label };
     } catch (err) {
       if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
-      // Network/CORS/JSON errors gracefully fall through to next candidate / Gemini 3.8
     }
   }
   return null;
 }
 
 /**
- * Step 1 Vision Router: tries specialized NIM VL/Reasoning candidate once,
- * then falls back reliably to Gemini 3.8 Flash (with 3.5 Flash fallback).
+ * Step 1 Vision Router: tries Gemini (gemini-2.5-flash -> gemini-2.0-flash) first for fast 6-frame contact sheet inspection,
+ * with fallback to NVIDIA NIM Vision if configured.
  */
 export async function runStep1VisionJson(params: {
+  geminiApiKey?: string;
   nvidiaApiKey: string;
-  geminiApiKey: string;
   systemPrompt: string;
   userPrompt: string;
   imageBase64Jpeg: string;
   signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string } | null> {
+}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
   const {
+    geminiApiKey = '',
     nvidiaApiKey,
-    geminiApiKey,
     systemPrompt,
     userPrompt,
     imageBase64Jpeg,
     signal,
   } = params;
+
+  let geminiError: unknown = null;
+  try {
+    return await callServerGeminiJson({
+      prompt: userPrompt,
+      systemInstruction: systemPrompt,
+      imageBase64Jpeg,
+      geminiApiKey,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    geminiError = err;
+  }
 
   if (nvidiaApiKey) {
     const nimRes = await callNvidiaNimJson({
@@ -279,40 +421,50 @@ export async function runStep1VisionJson(params: {
       userPrompt,
       imageBase64Jpeg,
       candidates: MODEL_ROSTER.step1Vision,
-      maxAttempts: 1,
+      maxAttempts: 2,
       signal,
     });
     if (nimRes) return nimRes;
   }
 
-  return callGeminiJsonOnce({
-    apiKey: geminiApiKey,
-    parts: [
-      { text: userPrompt },
-      {
-        inlineData: {
-          mimeType: 'image/jpeg',
-          data: imageBase64Jpeg,
-        },
-      },
-    ],
-    signal,
-  });
+  throw geminiError instanceof Error
+    ? geminiError
+    : new Error(
+        'Vision analysis failed: Please enter a valid Gemini API Key or NVIDIA NIM Key in "Engine & Keys".'
+      );
 }
 
 /**
  * Step 1 Chapter/Scene Planner Router:
- * Routes across nemotron-3-ultra-550b-a55b -> Step 5 Preview -> kimi-k3.1-pro -> nemotron-3.5-parse,
- * falling back cleanly to Gemini 3.8 Flash.
+ * Routes through Gemini (`gemini-2.5-flash` -> `gemini-2.0-flash`) or NVIDIA NIM planning models.
  */
 export async function runStep1PlannerJson(params: {
+  geminiApiKey?: string;
   nvidiaApiKey: string;
-  geminiApiKey: string;
   systemPrompt: string;
   userPrompt: string;
   signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string } | null> {
-  const { nvidiaApiKey, geminiApiKey, systemPrompt, userPrompt, signal } = params;
+}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
+  const {
+    geminiApiKey = '',
+    nvidiaApiKey,
+    systemPrompt,
+    userPrompt,
+    signal,
+  } = params;
+
+  let geminiError: unknown = null;
+  try {
+    return await callServerGeminiJson({
+      prompt: userPrompt,
+      systemInstruction: systemPrompt,
+      geminiApiKey,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    geminiError = err;
+  }
 
   if (nvidiaApiKey) {
     const nimRes = await callNvidiaNimJson({
@@ -326,18 +478,16 @@ export async function runStep1PlannerJson(params: {
     if (nimRes) return nimRes;
   }
 
-  return callGeminiJsonOnce({
-    apiKey: geminiApiKey,
-    parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }],
-    signal,
-  });
+  throw geminiError instanceof Error
+    ? geminiError
+    : new Error(
+        'Planner failed: Please enter a valid Gemini API Key or NVIDIA NIM Key in "Engine & Keys".'
+      );
 }
 
 /**
- * Step 3 Script & Translation & Safety Router:
- * Routes script refinement across Mistral Large 4 -> glm-5-3-flash -> nemotron-3.5-lightning-30b-a3b,
- * optional riva-translate-4b-instruct-v2 (Hindi), and nemotron-3.5-content-safety,
- * with Gemini 3.8 Flash fallback.
+ * Step 3 Script & Translation Router:
+ * Routes script generation through Gemini (`gemini-2.5-flash` -> `gemini-2.0-flash`) with fallback to NVIDIA NIM.
  */
 export async function runStep3ScriptJson(params: {
   config: StudioConfig;
@@ -345,12 +495,25 @@ export async function runStep3ScriptJson(params: {
   systemPrompt: string;
   userPrompt: string;
   signal?: AbortSignal;
-}): Promise<{ parsed: Record<string, unknown>; modelUsed: string } | null> {
+}): Promise<{ parsed: Record<string, unknown>; modelUsed: string }> {
   const { config, language, systemPrompt, userPrompt, signal } = params;
 
   let result: { parsed: Record<string, unknown>; modelUsed: string } | null = null;
+  let geminiError: unknown = null;
 
-  if (config.nvidiaApiKey) {
+  try {
+    result = await callServerGeminiJson({
+      prompt: userPrompt,
+      systemInstruction: systemPrompt,
+      geminiApiKey: config.geminiApiKey,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    geminiError = err;
+  }
+
+  if (!result && config.nvidiaApiKey) {
     result = await callNvidiaNimJson({
       nvidiaApiKey: config.nvidiaApiKey,
       systemPrompt,
@@ -362,16 +525,13 @@ export async function runStep3ScriptJson(params: {
   }
 
   if (!result) {
-    result = await callGeminiJsonOnce({
-      apiKey: config.geminiApiKey,
-      parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }],
-      signal,
-    });
+    throw geminiError instanceof Error
+      ? geminiError
+      : new Error(
+          'Script generation failed: Please configure your Gemini API Key in "Engine & Keys".'
+        );
   }
 
-  if (!result) return null;
-
-  // Optional Riva Translate pass when Hindi is requested and NIM key is configured
   if (
     language === 'hi' &&
     config.nvidiaApiKey &&
@@ -404,9 +564,6 @@ export async function runStep3ScriptJson(params: {
   return result;
 }
 
-/**
- * Optional External GPU Worker integration for Step 2 (flux-3-image-klein, FLUX.1-schnell, TRELLIS, Relighting)
- */
 export async function requestExternalGpuVisual(params: {
   config: StudioConfig;
   useExternalGpu: boolean;
@@ -472,9 +629,6 @@ export async function requestExternalGpuVisual(params: {
   }
 }
 
-/**
- * Optional External GPU Worker integration for Step 4 Voice (magpie-tts-zeroshot, Studio Voice, Background Noise Removal)
- */
 export async function requestExternalGpuVoice(params: {
   config: StudioConfig;
   useExternalGpu: boolean;
@@ -544,9 +698,6 @@ export async function requestExternalGpuVoice(params: {
   }
 }
 
-/**
- * Optional External GPU Worker integration for Step 4 Character (LipSync, wan2.2-animate-2-14b, 3D Body Pose, eyecontact)
- */
 export async function requestExternalGpuCharacterFrame(params: {
   config: StudioConfig;
   useExternalGpu: boolean;

@@ -1,6 +1,8 @@
 /// <reference lib="webworker" />
 import { ArrayBufferTarget, Muxer } from 'mp4-muxer';
 import type {
+  AlignedWordTiming,
+  CharacterFaceLandmarks,
   DocumentaryStyle,
   MotionShaderPreset,
   OutputLanguage,
@@ -31,11 +33,13 @@ interface InitMessage {
   durationSec: number;
   scriptText: string;
   beats: ScriptBeat[];
+  wordTimings?: AlignedWordTiming[];
   language: OutputLanguage;
   safeCropInsets: SafeCropInsets;
   watermarkZones: WatermarkZone[];
   climaxSecond: number;
   portraitBitmap: ImageBitmap | null;
+  portraitLandmarks?: CharacterFaceLandmarks | null;
   pcmMono: Float32Array;
   sampleRate: number;
   amplitudeEnvelope: Float32Array;
@@ -627,7 +631,8 @@ async function selectSupportedVideoConfig(
 }
 
 async function waitForVideoEncoderDrain(): Promise<void> {
-  while (videoEncoder && videoEncoder.encodeQueueSize > 3) {
+  // Low-heat phone guardrail: keep at most 2 frames queued in hardware encoder
+  while (videoEncoder && videoEncoder.encodeQueueSize > 2) {
     if (encoderError) throw encoderError;
     await new Promise((r) => setTimeout(r, 8));
   }
@@ -789,7 +794,8 @@ async function handleInit(msg: InitMessage): Promise<void> {
     portraitBitmapRef = msg.portraitBitmap;
     const crop = computeSquarePortraitCrop(
       msg.portraitBitmap.width,
-      msg.portraitBitmap.height
+      msg.portraitBitmap.height,
+      msg.portraitLandmarks
     );
     portraitSource = { source: msg.portraitBitmap, ...crop };
   } else {
@@ -805,7 +811,8 @@ async function handleInit(msg: InitMessage): Promise<void> {
     msg.scriptText,
     msg.durationSec,
     msg.language,
-    msg.beats
+    msg.beats,
+    msg.wordTimings
   );
 
   target = new ArrayBufferTarget();

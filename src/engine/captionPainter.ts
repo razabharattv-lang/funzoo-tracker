@@ -1,7 +1,12 @@
-import type { OutputLanguage, ScriptBeat } from '../types/studio';
+import type {
+  AlignedWordTiming,
+  OutputLanguage,
+  ScriptBeat,
+} from '../types/studio';
 
 export interface CaptionChunk {
   words: string[];
+  wordTimings?: AlignedWordTiming[];
   startSec: number;
   endSec: number;
   accentColor: string;
@@ -29,15 +34,35 @@ function splitTextToWordGroups(
 }
 
 /**
- * Builds kinetic CapCut-style caption chunks strictly synced to chronological
- * ScriptBeat timestamps when available (falling back to even distribution).
+ * Builds kinetic CapCut-style caption chunks synced to offline-aligned word timings
+ * (`AlignedWordTiming[]`) or chronological `ScriptBeat` timestamps.
  */
 export function buildCaptionChunks(
   scriptText: string,
   totalDurationSec: number,
   language: OutputLanguage,
-  beats?: ScriptBeat[]
+  beats?: ScriptBeat[],
+  wordTimings?: AlignedWordTiming[]
 ): CaptionChunk[] {
+  if (Array.isArray(wordTimings) && wordTimings.length > 0) {
+    const chunks: CaptionChunk[] = [];
+    for (let i = 0; i < wordTimings.length; i += 3) {
+      const slice = wordTimings.slice(i, i + 3);
+      if (slice.length === 0) continue;
+      const startSec = slice[0].startSec;
+      const endSec = slice[slice.length - 1].endSec;
+      const idx = chunks.length;
+      chunks.push({
+        words: slice.map((w) => w.word),
+        wordTimings: slice,
+        startSec,
+        endSec,
+        accentColor: idx % 2 === 0 ? '#FFAB00' : '#00E5FF',
+      });
+    }
+    if (chunks.length > 0) return chunks;
+  }
+
   if (Array.isArray(beats) && beats.length > 0) {
     const chunks: CaptionChunk[] = [];
     let colorIdx = 0;
@@ -130,9 +155,18 @@ export function drawCapCutPopCaption(params: {
   ctx.translate(centerX, centerY);
   ctx.scale(finalScale, finalScale);
 
+  // Highlight active word based on exact offline word timing if available
+  let activeWordIdx = active.words.length - 1;
+  if (active.wordTimings && active.wordTimings.length === active.words.length) {
+    const foundIdx = active.wordTimings.findIndex(
+      (wt) => timeSec >= wt.startSec - 0.02 && timeSec <= wt.endSec + 0.04
+    );
+    if (foundIdx !== -1) activeWordIdx = foundIdx;
+  }
+
   let cursorX = -totalW / 2;
   active.words.forEach((word, idx) => {
-    const isHighlight = idx === active.words.length - 1;
+    const isHighlight = idx === activeWordIdx;
     ctx.strokeText(word, cursorX, 0);
     ctx.fillStyle = isHighlight ? active.accentColor : '#FFFFFF';
     ctx.fillText(word, cursorX, 0);

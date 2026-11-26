@@ -40,6 +40,7 @@ jobs:
 
       - name: Build Production Bundle
         env:
+          GITHUB_PAGES: 'true'
           VITE_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           VITE_NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           VITE_YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}

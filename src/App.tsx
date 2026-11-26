@@ -48,8 +48,15 @@ import {
   renderDocumentarySceneMp4Gpu,
   renderProductionMp4Gpu,
 } from './engine/gpuRenderer';
+import {
+  PRE_EMBEDDED_MODEL_MANIFEST,
+  getStudioCacheSummary,
+} from './engine/cacheManager';
+import { warmPreEmbeddedOfflineModels } from './engine/offlineModels';
 import type {
+  CacheStorageSummary,
   DocumentaryOutline,
+  OfflineModelStatus,
   PipelineProgress,
   RenderedClipOutput,
   SavedCharacterAsset,
@@ -86,6 +93,27 @@ export default function App() {
   const [isConfigExpanded, setIsConfigExpanded] = useState(
     () => getMissingConfigFields(loadStudioConfig()).length > 0
   );
+  const [offlineModels, setOfflineModels] = useState<OfflineModelStatus[]>(
+    () => PRE_EMBEDDED_MODEL_MANIFEST
+  );
+  const [cacheSummary, setCacheSummary] = useState<CacheStorageSummary | null>(
+    null
+  );
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const models = await warmPreEmbeddedOfflineModels();
+      const summary = await getStudioCacheSummary();
+      if (active) {
+        setOfflineModels(models);
+        setCacheSummary(summary);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Compact Card 1 states (Explainer source OR Documentary chapter outline)
   const [sourceMedia, setSourceMedia] = useState<SourceMediaItem | null>(null);
@@ -396,11 +424,10 @@ export default function App() {
       let url = activeCharacterUrl;
       if (!controls.characterEnabled || !url) return '';
 
-      if (controls.outfitPrompt.trim() && studioConfig.geminiApiKey) {
+      if (controls.outfitPrompt.trim()) {
         url = await applyFaceLockedOutfitChange({
           portraitUrl: url,
           outfitPrompt: controls.outfitPrompt,
-          geminiApiKey: studioConfig.geminiApiKey,
           signal,
         });
       }
@@ -439,10 +466,10 @@ export default function App() {
         status: 'error',
         activeStep: 'step_1_inspect',
         statusDetail:
-          'Add your Gemini or NVIDIA API Key in Studio API Config above.',
+          'Add required integration keys in Studio Engine & Integrations above.',
         errorMessage: `Missing required config: ${missing.join(
           ', '
-        )}. Enter your key in the Studio API Config bar above.`,
+        )}. Enter your key in the Studio Engine & Integrations bar above.`,
       });
       return;
     }
@@ -591,9 +618,9 @@ export default function App() {
 
           const audio = await synthesizeCommandingVoiceover({
             scriptText: metadata.voiceover,
+            beats: metadata.beats,
             language: controls.language,
             voiceGender: controls.voiceGender,
-            geminiApiKey: studioConfig.geminiApiKey,
             config: studioConfig,
             useExternalGpu: controls.useExternalGpu,
             lockedVisualDurationSec: preparedChapter.targetDurationSec,
@@ -606,6 +633,15 @@ export default function App() {
             },
             signal,
           });
+
+          const alignedMetadata = {
+            ...metadata,
+            beats:
+              audio.alignedBeats.length > 0
+                ? audio.alignedBeats
+                : metadata.beats,
+            wordTimings: audio.wordTimings,
+          };
 
           // STEP 5: Hardware WebGL2 / WebCodecs Scene Mux
           const gpuStartPct = basePct + Math.round(spanPct * 0.54);
@@ -629,8 +665,8 @@ export default function App() {
           const rendered = await renderDocumentarySceneMp4Gpu({
             chapter: preparedChapter,
             audio,
-            scriptText: metadata.voiceover,
-            beats: metadata.beats,
+            scriptText: alignedMetadata.voiceover,
+            beats: alignedMetadata.beats,
             language: controls.language,
             characterEnabled: controls.characterEnabled,
             characterPortraitUrl: controls.characterEnabled
@@ -681,7 +717,7 @@ export default function App() {
             endCardTrimmedSec: 0,
             safeCropApplied: false,
             climaxSecond: preparedChapter.climaxSec,
-            metadata,
+            metadata: alignedMetadata,
           };
 
           finishedOutputs.push(clipOutput);
@@ -787,7 +823,6 @@ export default function App() {
         source: activeSource,
         customAngle: controls.customAngle,
         nvidiaApiKey: studioConfig.nvidiaApiKey,
-        geminiApiKey: studioConfig.geminiApiKey,
         onStatus: (msg) => {
           setProgress((prev) => ({
             ...prev,
@@ -861,7 +896,6 @@ export default function App() {
           language: controls.language,
           customAngle: controls.customAngle,
           nvidiaApiKey: studioConfig.nvidiaApiKey,
-          geminiApiKey: studioConfig.geminiApiKey,
           signal,
         });
 
@@ -905,9 +939,9 @@ export default function App() {
 
         const audio = await synthesizeCommandingVoiceover({
           scriptText: metadata.voiceover,
+          beats: metadata.beats,
           language: controls.language,
           voiceGender: controls.voiceGender,
-          geminiApiKey: studioConfig.geminiApiKey,
           config: studioConfig,
           useExternalGpu: controls.useExternalGpu,
           lockedVisualDurationSec: lockedClip.lockedVisualDurationSec,
@@ -920,6 +954,13 @@ export default function App() {
           },
           signal,
         });
+
+        const alignedMetadata = {
+          ...metadata,
+          beats:
+            audio.alignedBeats.length > 0 ? audio.alignedBeats : metadata.beats,
+          wordTimings: audio.wordTimings,
+        };
 
         // STEP 5: Single-Pass GPU Mux & Output Deck
         const gpuStartPct = clipBasePct + Math.round(clipSpanPct * 0.5);
@@ -945,8 +986,8 @@ export default function App() {
           source: activeSource,
           clip: lockedClip,
           audio,
-          scriptText: metadata.voiceover,
-          beats: metadata.beats,
+          scriptText: alignedMetadata.voiceover,
+          beats: alignedMetadata.beats,
           language: controls.language,
           characterEnabled: controls.characterEnabled,
           characterPortraitUrl: controls.characterEnabled
@@ -996,7 +1037,7 @@ export default function App() {
           endCardTrimmedSec: rendered.bumperTrimmedSec,
           safeCropApplied: rendered.safeCropApplied,
           climaxSecond: lockedClip.climaxSec,
-          metadata,
+          metadata: alignedMetadata,
         };
 
         finishedOutputs.push(clipOutput);
@@ -1106,6 +1147,8 @@ export default function App() {
         <StudioConfigBar
           config={studioConfig}
           isExpanded={isConfigExpanded}
+          offlineModels={offlineModels}
+          cacheSummary={cacheSummary}
           onToggleExpand={() => setIsConfigExpanded((open) => !open)}
           onSave={handleSaveConfig}
           onClearKeys={handleClearKeys}

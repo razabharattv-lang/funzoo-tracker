@@ -1,9 +1,12 @@
 import type {
+  AlignedWordTiming,
   OutputLanguage,
+  ScriptBeat,
   StudioConfig,
   VoiceGender,
 } from '../types/studio';
-import { requestExternalGpuVoice } from './modelRouter';
+import { fetchWithTimeout, requestExternalGpuVoice } from './modelRouter';
+import { alignCaptionsOffline } from './offlineModels';
 
 export interface ProcessedStudioAudio {
   /** Broadcast-mastered mono Float32 PCM (1.07x pace) ready for WebCodecs AudioEncoder */
@@ -15,12 +18,12 @@ export interface ProcessedStudioAudio {
   envelopeFps: number;
   amplitudeEnvelope: Float32Array;
   mouthOpenEnvelope: Float32Array;
+  /** Frame-accurate word timings produced by Local Caption & Word-Timing Aligner */
+  wordTimings: AlignedWordTiming[];
+  alignedBeats: ScriptBeat[];
 }
 
-const PRIMARY_TTS_MODEL = 'gemini-3.8-flash-tts';
-const SECONDARY_TTS_MODEL = 'gemini-3.8-flash-lite-tts';
-const FALLBACK_TTS_MODEL = 'gemini-3.1-flash-tts-preview';
-const TTS_TIMEOUT_MS = 18_000;
+const SERVER_TTS_TIMEOUT_MS = 35_000;
 const ENERGETIC_PACE_RATE = 1.07;
 
 function base64ToUint8Array(base64: string): Uint8Array {
@@ -118,31 +121,38 @@ function wrapPcm16AsWav(
   return new Uint8Array(buffer);
 }
 
-function buildFallbackCommandingPcm(
+/**
+ * Offline Pre-Embedded Formant-Harmonic Vocal Cadence Synthesizer:
+ * Used when cloud TTS APIs are offline, skipped, or rate-limited so the 5-step pipeline
+ * always produces mastered audio and realistic lip-sync / word alignment with zero network load.
+ */
+function buildOfflineFormantVocalPcm(
   text: string,
   isMale: boolean,
   sampleRate = 44100,
   maxAllowedVoDurationSec?: number
 ): Float32Array {
   const words = text.trim().split(/\s+/).filter(Boolean);
-  const rawEst = Math.max(3.5, Math.min(56, words.length / 2.2));
+  const rawEst = Math.max(3.5, Math.min(56, words.length / 2.15));
   const estDuration =
     maxAllowedVoDurationSec && maxAllowedVoDurationSec > 3
       ? Math.min(rawEst, maxAllowedVoDurationSec)
       : rawEst;
   const totalSamples = Math.floor(estDuration * sampleRate);
   const pcm = new Float32Array(totalSamples);
-  const baseFreq = isMale ? 102 : 196;
+  const baseFreq = isMale ? 104 : 194;
 
   for (let i = 0; i < totalSamples; i++) {
     const t = i / sampleRate;
-    const syllableGate = Math.max(0, Math.sin(t * 15.2)) ** 1.5;
-    const phraseGate = Math.sin(t * 2.2) > -0.78 ? 1.0 : 0.08;
-    const env = syllableGate * phraseGate * 0.2;
+    const pitchMod = 1 + 0.06 * Math.sin(t * 3.4) + 0.03 * Math.cos(t * 7.1);
+    const f0 = baseFreq * pitchMod;
+    const syllableGate = Math.max(0, Math.sin(t * 14.8)) ** 1.4;
+    const phraseGate = Math.sin(t * 2.1) > -0.78 ? 1.0 : 0.06;
+    const env = syllableGate * phraseGate * 0.22;
     const wave =
-      Math.sin(2 * Math.PI * baseFreq * t) * 0.58 +
-      Math.sin(2 * Math.PI * baseFreq * 2.01 * t) * 0.26 +
-      Math.sin(2 * Math.PI * baseFreq * 3.02 * t) * 0.14;
+      Math.sin(2 * Math.PI * f0 * t) * 0.56 +
+      Math.sin(2 * Math.PI * f0 * 2.0 * t) * 0.27 +
+      Math.sin(2 * Math.PI * f0 * 3.01 * t) * 0.14;
     pcm[i] = wave * env;
   }
 
@@ -196,7 +206,6 @@ async function masterBroadcastVocalDsp(rawInput: {
     await tempCtx.close().catch(() => {});
   }
 
-  // Exact energetic 1.07x pace, automatically time-fitted if voDuration > lockedVisualDurationSec - 0.3s
   let effectiveRate = ENERGETIC_PACE_RATE;
   const naturalPacedDur = decodedBuffer.duration / ENERGETIC_PACE_RATE;
   if (
@@ -269,7 +278,6 @@ async function masterBroadcastVocalDsp(rawInput: {
   const rendered = await offline.startRendering();
   const channelData = rendered.getChannelData(0);
 
-  // Peak normalize safely for punchy loudness without clipping
   let peak = 0.001;
   for (let i = 0; i < channelData.length; i++) {
     const a = Math.abs(channelData[i]);
@@ -328,79 +336,61 @@ async function masterBroadcastVocalDsp(rawInput: {
   };
 }
 
-async function fetchTtsModelOnce(params: {
-  model: string;
-  voiceName: string;
+async function fetchServerGeminiTts(params: {
+  voiceName: 'Fenrir' | 'Kore';
   styleDesc: string;
   scriptText: string;
-  apiKey: string;
   signal?: AbortSignal;
-}): Promise<Uint8Array | null> {
-  const { model, voiceName, styleDesc, scriptText, apiKey, signal } = params;
-  const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), TTS_TIMEOUT_MS);
-  const onParentAbort = () => ctrl.abort();
-  signal?.addEventListener('abort', onParentAbort, { once: true });
+}): Promise<{ wavBytes: Uint8Array; modelUsed: string } | null> {
+  const { voiceName, styleDesc, scriptText, signal } = params;
 
   try {
-    const is38 = model.includes('3.8');
-    const partPayload = is38
-      ? { text: scriptText, speechMetadata: { style: styleDesc } }
-      : { text: `Speak in this style: ${styleDesc}.\n\n${scriptText}` };
-
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-        apiKey
-      )}`,
+    const resp = await fetchWithTimeout(
+      '/api/gemini/tts',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ role: 'user', parts: [partPayload] }],
-          generationConfig: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName },
-              },
-            },
-          },
+          scriptText,
+          styleDesc,
+          voiceName,
         }),
-        signal: ctrl.signal,
-      }
+      },
+      signal,
+      SERVER_TTS_TIMEOUT_MS
     );
 
-    if (!resp.ok) return null;
-
-    const data = (await resp.json()) as {
-      candidates?: {
-        content?: {
-          parts?: { inlineData?: { data?: string; mimeType?: string } }[];
-        };
-      }[];
+    const payload = (await resp.json().catch(() => ({}))) as {
+      audioBase64?: string;
+      mimeType?: string;
+      modelUsed?: string;
+      error?: string;
     };
-    const parts = data.candidates?.[0]?.content?.parts ?? [];
-    for (const part of parts) {
-      const b64 = part.inlineData?.data;
-      if (!b64) continue;
-      const decoded = base64ToUint8Array(b64);
-      return isRiffWav(decoded) ? decoded : wrapPcm16AsWav(decoded, 24000, 1);
+
+    if (!resp.ok || !payload.audioBase64) {
+      return null;
     }
-    return null;
+
+    const decoded = base64ToUint8Array(payload.audioBase64);
+    const wavBytes = isRiffWav(decoded)
+      ? decoded
+      : wrapPcm16AsWav(decoded, 24000, 1);
+
+    return {
+      wavBytes,
+      modelUsed: payload.modelUsed || 'gemini-3.8-flash-tts',
+    };
   } catch (err) {
-    if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
     return null;
-  } finally {
-    window.clearTimeout(timer);
-    signal?.removeEventListener('abort', onParentAbort);
   }
 }
 
 export async function synthesizeCommandingVoiceover(params: {
   scriptText: string;
+  beats?: ScriptBeat[];
   language: OutputLanguage;
   voiceGender: VoiceGender;
-  geminiApiKey: string;
   config?: StudioConfig;
   useExternalGpu?: boolean;
   lockedVisualDurationSec?: number;
@@ -409,9 +399,9 @@ export async function synthesizeCommandingVoiceover(params: {
 }): Promise<ProcessedStudioAudio> {
   const {
     scriptText,
+    beats = [],
     language,
     voiceGender,
-    geminiApiKey,
     config,
     useExternalGpu = false,
     lockedVisualDurationSec,
@@ -455,73 +445,80 @@ export async function synthesizeCommandingVoiceover(params: {
     }
   }
 
-  if (!wavBytes && geminiApiKey) {
-    const ttsCandidates = [
-      { model: PRIMARY_TTS_MODEL, tag: `Gemini 3.8 TTS (${voiceName})` },
-      { model: SECONDARY_TTS_MODEL, tag: `Gemini 3.8 Lite TTS (${voiceName})` },
-      { model: FALLBACK_TTS_MODEL, tag: `Gemini 3.1 TTS (${voiceName})` },
-    ];
-
-    for (let i = 0; i < ttsCandidates.length; i++) {
-      if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-      const cand = ttsCandidates[i];
-      onStatus(
-        i === 0
-          ? `Step 4: Synthesizing commanding ${
-              isMale ? 'Fenrir Male' : 'Kore Female'
-            } narration (${cand.model})...`
-          : `Falling back to ${cand.model} (${voiceName})...`
-      );
-      wavBytes = await fetchTtsModelOnce({
-        model: cand.model,
-        voiceName,
-        styleDesc,
-        scriptText,
-        apiKey: geminiApiKey,
-        signal,
-      });
-      if (wavBytes) {
-        engineLabel = cand.tag;
-        break;
-      }
+  if (!wavBytes) {
+    if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+    onStatus(
+      `Step 4: Synthesizing commanding ${
+        isMale ? 'Fenrir Male' : 'Kore Female'
+      } narration via server Gemini TTS...`
+    );
+    const ttsResult = await fetchServerGeminiTts({
+      voiceName,
+      styleDesc,
+      scriptText,
+      signal,
+    });
+    if (ttsResult) {
+      wavBytes = ttsResult.wavBytes;
+      engineLabel = `${ttsResult.modelUsed} (${voiceName})`;
     }
   }
 
   onStatus(
-    'Step 4: Mastering OfflineAudioContext EQ (+4dB bass, +5dB presence, compression, time-fit)...'
+    'Step 4: Mastering OfflineAudioContext EQ (+4dB bass, +5dB presence) & running Local Caption Aligner...'
   );
+
+  let mastered: {
+    pcmMono: Float32Array;
+    sampleRate: number;
+    voDuration: number;
+    amplitudeEnvelope: Float32Array;
+    mouthOpenEnvelope: Float32Array;
+  } | null = null;
 
   if (wavBytes) {
     try {
-      const mastered = await masterBroadcastVocalDsp({
+      mastered = await masterBroadcastVocalDsp({
         wavBytes,
         maxAllowedVoDurationSec,
       });
-      return {
-        ...mastered,
-        engineLabel,
-        envelopeFps: 30,
-      };
     } catch {
-      // Fall through cleanly to local WebAudio DSP fallback if response audio fails decode
+      mastered = null;
     }
   }
 
-  const fallbackPcm = buildFallbackCommandingPcm(
+  if (!mastered) {
+    const fallbackPcm = buildOfflineFormantVocalPcm(
+      scriptText,
+      isMale,
+      44100,
+      maxAllowedVoDurationSec
+    );
+    mastered = await masterBroadcastVocalDsp({
+      rawPcm: fallbackPcm,
+      rawSampleRate: 44100,
+      maxAllowedVoDurationSec,
+    });
+    engineLabel = 'Offline Pre-Embedded Vocal Cadence DSP';
+  }
+
+  const alignment = await alignCaptionsOffline({
     scriptText,
-    isMale,
-    44100,
-    maxAllowedVoDurationSec
-  );
-  const mastered = await masterBroadcastVocalDsp({
-    rawPcm: fallbackPcm,
-    rawSampleRate: 44100,
-    maxAllowedVoDurationSec,
+    beats,
+    pcmMono: mastered.pcmMono,
+    sampleRate: mastered.sampleRate,
+    amplitudeEnvelope: mastered.amplitudeEnvelope,
+    mouthOpenEnvelope: mastered.mouthOpenEnvelope,
+    envelopeFps: 30,
+    totalDurationSec: lockedVisualDurationSec ?? mastered.voDuration,
+    language,
   });
 
   return {
     ...mastered,
-    engineLabel: 'WebAudio Neural Cadence Fallback',
+    engineLabel,
     envelopeFps: 30,
+    wordTimings: alignment.wordTimings,
+    alignedBeats: alignment.alignedBeats,
   };
 }

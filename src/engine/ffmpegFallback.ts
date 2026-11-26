@@ -1,5 +1,5 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { fetchFile } from '@ffmpeg/util';
 import type {
   DocumentaryChapter,
   OutputLanguage,
@@ -16,10 +16,11 @@ import {
   buildCharacterPopInSchedule,
   computeSquarePortraitCrop,
   drawTalkingCharacterOverlay,
-  loadPortraitBitmap,
+  loadPortraitBitmapWithOfflineRig,
   type PortraitSource,
 } from './characterAnimator';
 import { buildCaptionChunks, drawCapCutPopCaption } from './captionPainter';
+import { cachedFetchResponse } from './cacheManager';
 
 export interface FallbackRenderOptions {
   sourceVideoBlob: Blob;
@@ -68,18 +69,30 @@ const FFMPEG_CORE_BASES = [
   'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm',
 ];
 
+async function cachedToBlobUrl(url: string, mimeType: string): Promise<string> {
+  const resp = await cachedFetchResponse(url);
+  if (!resp.ok) {
+    throw new Error(`Failed loading ${url} (${resp.status})`);
+  }
+  const buf = await resp.arrayBuffer();
+  const blob = new Blob([buf], { type: mimeType });
+  return URL.createObjectURL(blob);
+}
+
 async function getLazyFFmpeg(onStatus: (msg: string) => void): Promise<FFmpeg> {
   if (sharedFFmpeg && ffmpegLoaded) return sharedFFmpeg;
   const ffmpeg = new FFmpeg();
   let lastErr = '';
   for (const baseURL of FFMPEG_CORE_BASES) {
     try {
-      onStatus('WebCodecs unavailable — lazy-loading FFmpeg.wasm fallback...');
-      const coreURL = await toBlobURL(
+      onStatus(
+        'WebCodecs unavailable — loading cached FFmpeg.wasm fallback...'
+      );
+      const coreURL = await cachedToBlobUrl(
         `${baseURL}/ffmpeg-core.js`,
         'text/javascript'
       );
-      const wasmURL = await toBlobURL(
+      const wasmURL = await cachedToBlobUrl(
         `${baseURL}/ffmpeg-core.wasm`,
         'application/wasm'
       );
@@ -168,13 +181,17 @@ export async function renderWithLazyFFmpegFallback(
 
   if (characterEnabled && characterPortraitUrl) {
     try {
-      portraitBitmap = await loadPortraitBitmap(characterPortraitUrl);
+      const loaded = await loadPortraitBitmapWithOfflineRig(
+        characterPortraitUrl
+      );
+      portraitBitmap = loaded.bitmap;
       const crop = computeSquarePortraitCrop(
         portraitBitmap.width,
-        portraitBitmap.height
+        portraitBitmap.height,
+        loaded.landmarks
       );
       portraitSource = { source: portraitBitmap, ...crop };
-      characterMode = 'webaudio-reactive-popin';
+      characterMode = `offline-phoneme-rig (${loaded.landmarks.detectorEngine})`;
     } catch {
       portraitBitmap = null;
     }
@@ -300,7 +317,8 @@ export async function renderWithLazyFFmpegFallback(
             scriptText,
             lockedDurationSec,
             language,
-            beats
+            audio.alignedBeats.length > 0 ? audio.alignedBeats : beats,
+            audio.wordTimings
           );
           const stream = canvas.captureStream(targetFps);
           const recorder = new MediaRecorder(stream, {
@@ -520,13 +538,17 @@ export async function renderDocumentarySceneFallback(opts: {
 
   if (characterEnabled && characterPortraitUrl) {
     try {
-      portraitBitmap = await loadPortraitBitmap(characterPortraitUrl);
+      const loaded = await loadPortraitBitmapWithOfflineRig(
+        characterPortraitUrl
+      );
+      portraitBitmap = loaded.bitmap;
       const crop = computeSquarePortraitCrop(
         portraitBitmap.width,
-        portraitBitmap.height
+        portraitBitmap.height,
+        loaded.landmarks
       );
       portraitSource = { source: portraitBitmap, ...crop };
-      characterMode = 'webaudio-reactive-popin';
+      characterMode = `offline-phoneme-rig (${loaded.landmarks.detectorEngine})`;
     } catch {
       portraitBitmap = null;
     }
@@ -576,7 +598,8 @@ export async function renderDocumentarySceneFallback(opts: {
       scriptText,
       lockedDurationSec,
       language,
-      beats
+      audio.alignedBeats.length > 0 ? audio.alignedBeats : beats,
+      audio.wordTimings
     );
     const stream = canvas.captureStream(targetFps);
     const recorder = new MediaRecorder(stream, {

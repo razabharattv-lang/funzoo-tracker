@@ -12,6 +12,7 @@ import {
   getUsableSourceDuration,
 } from './streamResolver';
 import { runStep1VisionJson } from './modelRouter';
+import { analyzeVideoTimelineLocally } from './offlineModels';
 
 export const MAX_SAFE_CROP_INSET = 0.14;
 export const MAX_AUTO_EDGE_CROP = 0.12;
@@ -448,16 +449,16 @@ async function seekVideoOnce(
 async function scanLongVideo18FramesOnce(params: {
   source: SourceMediaItem;
   customAngle: string;
+  geminiApiKey?: string;
   nvidiaApiKey: string;
-  geminiApiKey: string;
   onStatus?: (msg: string) => void;
   signal?: AbortSignal;
 }): Promise<{ segments: ViralSegment[]; inspectorModel: string }> {
   const {
     source,
     customAngle,
+    geminiApiKey = '',
     nvidiaApiKey,
-    geminiApiKey,
     onStatus,
     signal,
   } = params;
@@ -613,20 +614,56 @@ Rules:
   )}s.
 `.trim();
 
-  const res = await runStep1VisionJson({
-    nvidiaApiKey,
-    geminiApiKey,
-    systemPrompt:
-      'You are an expert computer-vision video clipper and watermark inspector. Output strictly valid JSON.',
-    userPrompt: prompt,
-    imageBase64Jpeg: base64Jpeg,
+  const localScan = await analyzeVideoTimelineLocally({
+    source,
+    sampleCount: 12,
     signal,
   });
 
+  let res: { parsed: Record<string, unknown>; modelUsed: string } | null = null;
+  try {
+    res = await runStep1VisionJson({
+      geminiApiKey,
+      nvidiaApiKey,
+      systemPrompt:
+        'You are an expert computer-vision video clipper and watermark inspector. Output strictly valid JSON.',
+      userPrompt: prompt,
+      imageBase64Jpeg: base64Jpeg,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    res = null;
+  }
+
   if (!res) {
+    const localSegments: ViralSegment[] =
+      localScan.highActionWindows.length >= 2
+        ? localScan.highActionWindows.map((win, idx) => ({
+            clipIndex: idx + 1,
+            startSec: win.startSec,
+            endSec: win.endSec,
+            climaxSec: win.climaxSec,
+            reason: `Segment #${idx + 1} (${Math.round(
+              win.endSec - win.startSec
+            )}s)`,
+            trimRange: { startSec: win.startSec, endSec: win.endSec },
+            safeCropInsets: { ...localScan.suggestedSafeCropInsets },
+            watermarkZones: localScan.detectedWatermarkZones.filter(
+              (z) => z.endSec > win.startSec && z.startSec < win.endSec
+            ),
+          }))
+        : fallbackSegments.map((seg) => ({
+            ...seg,
+            safeCropInsets: { ...localScan.suggestedSafeCropInsets },
+            watermarkZones: localScan.detectedWatermarkZones.filter(
+              (z) => z.endSec > seg.startSec && z.startSec < seg.endSec
+            ),
+          }));
+
     return {
-      segments: fallbackSegments,
-      inspectorModel: 'Timeline Heuristic Slicer',
+      segments: localSegments,
+      inspectorModel: 'Offline Embedded Scene & Logo Scanner',
     };
   }
 
@@ -764,9 +801,9 @@ Rules:
 
 /**
  * Stage 1B:
- * Builds a cleaned, cinema-graded (`contrast(1.22) saturate(1.36) brightness(1.03)`),
- * relative-second stamped 9-frame contact sheet (`00:01s` .. `00:{lockedVisualDurationSec}s`)
- * directly from the locked visual clip timeline so Stage 2 AI inspects exact finished frames.
+ * Extracts 6 evenly spaced frames from the locked visual clip timeline into a single
+ * compact, cinema-graded (`contrast(1.22) saturate(1.36) brightness(1.03)`),
+ * relative-second stamped 3x2 JPEG contact sheet (max 640px wide) for direct Gemini inspection.
  */
 async function buildCleanedStampedContactSheet(params: {
   video: HTMLVideoElement;
@@ -789,11 +826,11 @@ async function buildCleanedStampedContactSheet(params: {
     signal,
   } = params;
 
-  const sampleCount = 9; // 3x3 crisp contact sheet (<= 768px wide)
+  const sampleCount = 6; // 6 evenly spaced frames in a 3x2 grid (max 640px wide)
   const cols = 3;
-  const rows = 3;
+  const rows = 2;
   const pad = 4;
-  const tileW = 248; // 3 * 248 + 4 * 4 = 760px <= 768px
+  const tileW = 208; // 3 * 208 + 4 * 4 = 640px max width
 
   const cropLeft = Math.round(sourceWidth * safeCropInsets.left);
   const cropTop = Math.round(sourceHeight * safeCropInsets.top);
@@ -833,15 +870,13 @@ async function buildCleanedStampedContactSheet(params: {
 
   const stampedTimestampsSec: number[] = [];
   for (let i = 0; i < sampleCount; i++) {
-    const relSec =
-      i === sampleCount - 1
-        ? Math.max(0.5, lockedVisualDurationSec - 0.25)
-        : Number(
-            Math.max(
-              0.3,
-              ((i + 0.35) / sampleCount) * lockedVisualDurationSec
-            ).toFixed(2)
-          );
+    const frac = (i + 0.5) / sampleCount;
+    const relSec = Number(
+      Math.max(
+        0.2,
+        Math.min(lockedVisualDurationSec - 0.2, frac * lockedVisualDurationSec)
+      ).toFixed(2)
+    );
     stampedTimestampsSec.push(relSec);
   }
 
@@ -934,16 +969,16 @@ async function buildCleanedStampedContactSheet(params: {
 export async function inspectAndSliceSegmentsStep1(params: {
   source: SourceMediaItem;
   customAngle: string;
+  geminiApiKey?: string;
   nvidiaApiKey: string;
-  geminiApiKey: string;
   onStatus?: (msg: string) => void;
   signal?: AbortSignal;
 }): Promise<{ segments: ViralSegment[]; inspectorModel: string }> {
   const {
     source,
     customAngle,
+    geminiApiKey = '',
     nvidiaApiKey,
-    geminiApiKey,
     onStatus,
     signal,
   } = params;
@@ -952,12 +987,21 @@ export async function inspectAndSliceSegmentsStep1(params: {
     return scanLongVideo18FramesOnce({
       source,
       customAngle,
-      nvidiaApiKey,
       geminiApiKey,
+      nvidiaApiKey,
       onStatus,
       signal,
     });
   }
+
+  onStatus?.(
+    'Step 1: Scanning timeline for scene cuts, logos & outer bumpers...'
+  );
+  const localScan = await analyzeVideoTimelineLocally({
+    source,
+    sampleCount: 8,
+    signal,
+  });
 
   const { usableDurationSec, endCardTrimmedSec } =
     getUsableSourceDuration(source);
@@ -984,21 +1028,29 @@ export async function inspectAndSliceSegmentsStep1(params: {
         ]
       : [];
 
+  const mergedZones = [
+    ...bumperZones,
+    ...localScan.detectedWatermarkZones.filter(
+      (z) => z.action !== 'trim_bumper'
+    ),
+  ];
+
+  const cleanSourceLabel = (source.label || 'Uploaded Video')
+    .replace(/\.[a-z0-9]{2,4}$/i, '')
+    .trim();
+
   return {
-    inspectorModel: 'Smart Timeline Inspector',
+    inspectorModel: 'Local Scene, Bumper & Logo Scanner',
     segments: [
       {
         clipIndex: 1,
         startSec,
         endSec,
         climaxSec: Number(((endSec - startSec) * 0.52).toFixed(2)),
-        reason:
-          endCardTrimmedSec > 0
-            ? 'Trimmed Clean Short Action Timeline'
-            : 'Locked Short Action Timeline',
+        reason: cleanSourceLabel || `Short Clip (${Math.round(endSec - startSec)}s)`,
         trimRange: { startSec, endSec },
-        safeCropInsets: { ...ZERO_CROP_INSETS },
-        watermarkZones: bumperZones,
+        safeCropInsets: { ...localScan.suggestedSafeCropInsets },
+        watermarkZones: mergedZones,
       },
     ],
   };

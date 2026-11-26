@@ -16,16 +16,18 @@ import {
   sanitizeWatermarkZones,
 } from './visualClipper';
 import {
-  callGeminiJsonOnce,
+  callServerGeminiJson,
   fetchWithTimeout,
   runStep1VisionJson,
   runStep3ScriptJson,
 } from './modelRouter';
-
-const GEMINI_IMAGE_EDIT_PRIMARY = 'gemini-3.1-flash-lite-image';
-const GEMINI_IMAGE_EDIT_FALLBACK = 'gemini-2.5-flash-image';
+import {
+  generateOfflineExplainerScriptAndMetadata,
+  inspectClipOfflineFromContactSheet,
+} from './offlineModels';
 
 const API_TIMEOUT_MS = 12_000;
+const SERVER_EDIT_TIMEOUT_MS = 35_000;
 
 export interface Stage2ClipInspection {
   coreTopic: string;
@@ -221,7 +223,6 @@ export async function inspectLockedVisualClipOneCall(params: {
   language: OutputLanguage;
   customAngle: string;
   nvidiaApiKey?: string;
-  geminiApiKey: string;
   signal?: AbortSignal;
 }): Promise<Stage2ClipInspection> {
   const {
@@ -230,7 +231,6 @@ export async function inspectLockedVisualClipOneCall(params: {
     language,
     customAngle,
     nvidiaApiKey = '',
-    geminiApiKey,
     signal,
   } = params;
 
@@ -292,39 +292,49 @@ Return ONLY valid JSON:
 }
 `.trim();
 
-  const res =
-    source.mode === 'short'
-      ? await runStep1VisionJson({
-          nvidiaApiKey,
-          geminiApiKey,
-          systemPrompt:
-            'You are a viral US Shorts director and watermark inspector. Output strictly valid JSON.',
-          userPrompt: prompt,
-          imageBase64Jpeg: preparedClip.stampedContactSheetJpeg,
-          signal,
-        })
-      : await callGeminiJsonOnce({
-          apiKey: geminiApiKey,
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                mimeType: 'image/jpeg',
-                data: preparedClip.stampedContactSheetJpeg,
-              },
-            },
-          ],
-          signal,
-        });
+  let res: { parsed: Record<string, unknown>; modelUsed: string } | null = null;
+  try {
+    res =
+      source.mode === 'short'
+        ? await runStep1VisionJson({
+            nvidiaApiKey,
+            systemPrompt:
+              'You are a viral US Shorts director and watermark inspector. Output strictly valid JSON.',
+            userPrompt: prompt,
+            imageBase64Jpeg: preparedClip.stampedContactSheetJpeg,
+            signal,
+          })
+        : await callServerGeminiJson({
+            prompt,
+            systemInstruction:
+              'You are an elite viral short-form explainer director. Output strictly valid JSON.',
+            imageBase64Jpeg: preparedClip.stampedContactSheetJpeg,
+            signal,
+          });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    res = null;
+  }
 
   if (!res) {
-    const topic = customAngle.trim() || preparedClip.reason || 'Viral moment';
+    const offlineInspection = inspectClipOfflineFromContactSheet({
+      source,
+      preparedClip,
+      language,
+      customAngle,
+    });
+    const enforced = enforceStrictWordBudgetAndBeats({
+      rawBeats: offlineInspection.beats,
+      fallbackVoiceover: offlineInspection.beats.map((b) => b.text).join(' '),
+      lockedVisualDurationSec: dur,
+      language,
+    });
     return {
-      coreTopic: topic,
-      climaxSecond: preparedClip.climaxSec,
-      beats: buildFallbackBeats(topic, dur, language),
-      searchQueries: [topic, 'viral shorts explained'],
-      visionModel: 'Local Visual Sync Fallback',
+      coreTopic: offlineInspection.coreTopic,
+      climaxSecond: offlineInspection.climaxSecond,
+      beats: enforced.beats,
+      searchQueries: offlineInspection.searchQueries,
+      visionModel: offlineInspection.visionModel,
       updatedClip: preparedClip,
     };
   }
@@ -599,14 +609,21 @@ Return ONLY valid JSON:
 }
 `.trim();
 
-  const routed = await runStep3ScriptJson({
-    config,
-    language,
-    systemPrompt:
-      'You are an elite viral US YouTube Shorts suspense scriptwriter and SEO strategist. Output strictly valid JSON only.',
-    userPrompt: prompt,
-    signal,
-  });
+  let routed: { parsed: Record<string, unknown>; modelUsed: string } | null =
+    null;
+  try {
+    routed = await runStep3ScriptJson({
+      config,
+      language,
+      systemPrompt:
+        'You are an elite viral US YouTube Shorts suspense scriptwriter and SEO strategist. Output strictly valid JSON only.',
+      userPrompt: prompt,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    routed = null;
+  }
 
   const parsed = routed?.parsed ?? null;
   const scriptEngine = routed?.modelUsed || `${inspection.visionModel} Beat Sync`;
@@ -619,28 +636,13 @@ Return ONLY valid JSON:
       lockedVisualDurationSec: dur,
       language,
     });
-    const cleanTopic = inspection.coreTopic.slice(0, 42);
-    return {
-      voiceover: enforced.voiceover,
+    return generateOfflineExplainerScriptAndMetadata({
+      coreTopic: inspection.coreTopic,
       beats: enforced.beats,
-      title:
-        language === 'hi'
-          ? `${cleanTopic} का चौंकाने वाला सच!`
-          : `Nobody Noticed This About ${cleanTopic}!`,
-      description:
-        language === 'hi'
-          ? `${inspection.coreTopic} का पूरा सच और आखिरी ट्विस्ट।`
-          : `Watch closely until the final second of ${inspection.coreTopic}.`,
-      tags: `${inspection.coreTopic}, youtube shorts, viral explainer, hidden detail, suspense shorts, us trending, breakdown`,
-      hashtags:
-        language === 'hi'
-          ? '#shorts #viral #facts #hindi #explainer #trending #mystery'
-          : '#shorts #viral #explainer #trending #facts #storytime #fyp',
-      postingTime:
-        '6:30 PM EST / 5:00 AM IST — Peak US Evening & Early India Feed',
-      scriptEngine,
-      youtubeTrendsCount: trends.length,
-    };
+      lockedVisualDurationSec: dur,
+      language,
+      trends,
+    });
   }
 
   const enforced = enforceStrictWordBudgetAndBeats({
@@ -724,14 +726,21 @@ Return ONLY valid JSON:
 }
 `.trim();
 
-  const routed = await runStep3ScriptJson({
-    config,
-    language,
-    systemPrompt:
-      'You are a viral US YouTube Shorts documentary writer and SEO strategist. Output strictly valid JSON only.',
-    userPrompt: prompt,
-    signal,
-  });
+  let routed: { parsed: Record<string, unknown>; modelUsed: string } | null =
+    null;
+  try {
+    routed = await runStep3ScriptJson({
+      config,
+      language,
+      systemPrompt:
+        'You are a viral US YouTube Shorts documentary writer and SEO strategist. Output strictly valid JSON only.',
+      userPrompt: prompt,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
+    routed = null;
+  }
 
   const parsed = routed?.parsed ?? null;
   const scriptEngine = routed?.modelUsed || 'Documentary Beat Sync';
@@ -807,64 +816,38 @@ async function fetchImageAsBase64(
 export async function applyFaceLockedOutfitChange(params: {
   portraitUrl: string;
   outfitPrompt: string;
-  geminiApiKey: string;
   signal?: AbortSignal;
 }): Promise<string> {
-  const { portraitUrl, outfitPrompt, geminiApiKey, signal } = params;
-  if (!outfitPrompt.trim() || !geminiApiKey) return portraitUrl;
+  const { portraitUrl, outfitPrompt, signal } = params;
+  const trimmedPrompt = outfitPrompt.trim();
+  if (!trimmedPrompt) return portraitUrl;
 
   try {
     const { mimeType, base64 } = await fetchImageAsBase64(portraitUrl, signal);
     if (!base64) return portraitUrl;
 
-    const editPrompt =
-      `Keep the person's exact face, facial structure, eyes, nose, mouth, skin tone, hair, and identity 100% locked and identical to the reference photo. ` +
-      `Change ONLY their outfit/clothing to: ${outfitPrompt.trim()}. ` +
-      `Clean studio portrait lighting, crisp edges, front-facing head-and-shoulders framing.`;
+    const resp = await fetchWithTimeout(
+      '/api/gemini/edit-portrait',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageBase64: base64,
+          mimeType,
+          outfitPrompt: trimmedPrompt,
+        }),
+      },
+      signal,
+      SERVER_EDIT_TIMEOUT_MS
+    );
 
-    for (const imgModel of [
-      GEMINI_IMAGE_EDIT_PRIMARY,
-      GEMINI_IMAGE_EDIT_FALLBACK,
-    ]) {
-      const resp = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${imgModel}:generateContent?key=${encodeURIComponent(
-          geminiApiKey
-        )}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  { inlineData: { mimeType, data: base64 } },
-                  { text: editPrompt },
-                ],
-              },
-            ],
-          }),
-        },
-        signal,
-        API_TIMEOUT_MS
-      );
+    const payload = (await resp.json().catch(() => ({}))) as {
+      imageDataUrl?: string;
+      error?: string;
+    };
 
-      if (!resp.ok) continue;
-      const data = (await resp.json()) as {
-        candidates?: {
-          content?: {
-            parts?: { inlineData?: { mimeType?: string; data?: string } }[];
-          };
-        }[];
-      };
-      const parts = data.candidates?.[0]?.content?.parts ?? [];
-      for (const part of parts) {
-        if (part.inlineData?.data) {
-          return `data:${part.inlineData.mimeType || 'image/png'};base64,${
-            part.inlineData.data
-          }`;
-        }
-      }
+    if (resp.ok && payload.imageDataUrl) {
+      return payload.imageDataUrl;
     }
   } catch (err) {
     if ((err as Error).name === 'AbortError' && signal?.aborted) throw err;
