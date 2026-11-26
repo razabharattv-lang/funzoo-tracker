@@ -447,23 +447,32 @@ async function renderSinglePassWebCodecsWorker(
       if (continuousPlayActive) {
         mediaTime = await waitNextDecodedVideoFrame(video, signal);
 
-        // If playback reached the end of current usable interval (skipping any trim_bumper), jump ONCE to next
+        // If playback reached the end of current usable interval (skipping any trim_bumper), advance cleanly
         if (mediaTime >= currentInterval.endSec - 0.03 || video.ended) {
-          priorDurationSec += Math.max(
-            0.2,
-            currentInterval.endSec - currentInterval.startSec
-          );
-          intervalIdx = (intervalIdx + 1) % intervals.length;
-          currentInterval = intervals[intervalIdx];
-          video.pause();
-          await seekOnceForIntervalStart(video, currentInterval.startSec, signal);
-          video.playbackRate = profile.playbackRate;
-          await video.play().catch(() => {
-            continuousPlayActive = false;
-          });
-          mediaTime = currentInterval.startSec;
-          lastMediaTime = mediaTime;
-          stallTicks = 0;
+          const hasNextInterval = intervalIdx + 1 < intervals.length;
+          const remainingFrames = totalFrames - frameIndex;
+          if (hasNextInterval || remainingFrames > Math.ceil(profile.fps * 0.5)) {
+            priorDurationSec += Math.max(
+              0.2,
+              currentInterval.endSec - currentInterval.startSec
+            );
+            intervalIdx = (intervalIdx + 1) % intervals.length;
+            currentInterval = intervals[intervalIdx];
+            video.pause();
+            await seekOnceForIntervalStart(video, currentInterval.startSec, signal);
+            video.playbackRate = profile.playbackRate;
+            await video.play().catch(() => {
+              continuousPlayActive = false;
+            });
+            mediaTime = currentInterval.startSec;
+            lastMediaTime = mediaTime;
+            stallTicks = 0;
+          } else {
+            // Hold final clean frame for the remaining sub-0.5s tail so we never flash frame 0 at clip end
+            video.pause();
+            mediaTime = Math.min(mediaTime, currentInterval.endSec - 0.02);
+            priorDurationSec = Math.max(priorDurationSec, targetClipTimeSec);
+          }
         }
 
         // Detect stalled media clock and step gently without hanging

@@ -1,5 +1,5 @@
 {
   "name": "US Explainer Video Studio",
-  "description": "Private Flat Material React + Vite studio hosted on GitHub Pages and connected to Cloudinary and GitHub Actions for 7GB cloud AI US explainer video rendering and viral metadata generation.",
+  "description": "Flat Material React + Vite Video-First AI Production Studio running 100% in your browser on GitHub Pages with 18-keyframe long-video clipping, adaptive subject-safe cropping & GPU delogo, beat-synced Gemini 3.8 Vision + US YouTube trends + NVIDIA NIM scripts, time-fitted broadcast voiceover, and fast single-pass WebGL2/WebCodecs MP4 rendering.",
   "requestFramePermissions": []
 }
