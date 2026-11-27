@@ -194,16 +194,26 @@ export interface TrendMetadata {
   youtubeTrendsCount: number;
 }
 
-export type GeminiConnectionStatus = 'Connected' | 'Quota-Limit' | 'Fallback';
+export type GeminiConnectionStatus =
+  | 'Ready'
+  | 'Connected'
+  | 'Quota-Limit'
+  | 'Key-Missing'
+  | 'Fallback';
 export type NvidiaConnectionStatus =
+  | 'Ready'
   | 'Connected'
   | 'Static-Skip'
   | 'CORS-Blocked'
   | 'Key-Missing'
   | 'Quota-Limit'
   | 'Fallback';
-export type YoutubeConnectionStatus = 'Connected' | 'Fallback';
-export type VoiceConnectionStatus = 'Gemini-TTS' | 'Studio-Audio';
+export type YoutubeConnectionStatus =
+  | 'Ready'
+  | 'Connected'
+  | 'Key-Missing'
+  | 'Fallback';
+export type VoiceConnectionStatus = 'Ready' | 'Gemini-TTS' | 'Studio-Audio';
 
 export interface ConnectionStatusState {
   gemini: GeminiConnectionStatus;

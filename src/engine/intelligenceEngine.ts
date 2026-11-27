@@ -546,12 +546,22 @@ ${exampleBeatsJson}
     signal,
   });
 
+  if (aiResponse?.fallbackFromGemini) {
+    onConnectionPatch?.({ gemini: aiResponse.fallbackFromGemini });
+  }
+
   if (!aiResponse || !aiResponse.rawText.trim()) {
-    if (aiResponse?.provider === 'gemini') {
+    if (!aiResponse) {
+      onConnectionPatch?.({ gemini: 'Key-Missing', nvidia: 'Key-Missing' });
+    } else if (aiResponse.provider === 'gemini') {
       onConnectionPatch?.({
-        gemini: aiResponse.quotaExhausted ? 'Quota-Limit' : 'Fallback',
+        gemini: aiResponse.keyMissing
+          ? 'Key-Missing'
+          : aiResponse.quotaExhausted
+          ? 'Quota-Limit'
+          : 'Fallback',
       });
-    } else if (aiResponse?.provider === 'nvidia') {
+    } else if (aiResponse.provider === 'nvidia') {
       onConnectionPatch?.({
         nvidia: aiResponse.corsBlocked
           ? 'CORS-Blocked'
@@ -598,12 +608,26 @@ ${exampleBeatsJson}
 
   const parsed = extractJsonObject<AiTranslationSeoPayload>(aiResponse.rawText);
   if (!parsed || !parsed.voiceover || parsed.voiceover.trim().length < 8) {
+    if (aiResponse.provider === 'gemini') {
+      onConnectionPatch?.({ gemini: 'Fallback' });
+    } else if (aiResponse.provider === 'nvidia') {
+      onConnectionPatch?.({ nvidia: 'Fallback' });
+    }
+    let fallbackTrends = preloadedTrends;
+    if (allowYouTubeLookup && fallbackTrends.length === 0) {
+      const fallbackQuery =
+        extractReadableTopicFromLabel(sourceLabel, customAngle) ||
+        (language === 'hi' ? 'viral shorts explainer hindi' : 'viral shorts explained');
+      const ytRes = await fetchYouTubeTrendsFromApi(fallbackQuery, signal);
+      fallbackTrends = ytRes.items;
+      onConnectionPatch?.({ youtube: ytRes.connected ? 'Connected' : 'Fallback' });
+    }
     const offlineOut = generateOfflineDirectTranslationAndMetadata({
       clip,
       sourceLabel,
       language,
       customAngle,
-      trends: preloadedTrends,
+      trends: fallbackTrends,
       fallbackReason: `${aiResponse.modelUsed} returned non-JSON`,
     });
     const hookedOffline = enforcePunchyOpeningHook({
@@ -617,7 +641,7 @@ ${exampleBeatsJson}
       ...offlineOut,
       voiceover: hookedOffline.voiceover,
       beats: hookedOffline.beats,
-      fetchedTrends: preloadedTrends,
+      fetchedTrends: fallbackTrends,
     };
   }
 

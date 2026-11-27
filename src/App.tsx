@@ -66,9 +66,9 @@ const INITIAL_CONTROLS: StudioControlsState = {
 };
 
 const INITIAL_CONNECTION_STATUS: ConnectionStatusState = {
-  gemini: 'Fallback',
-  nvidia: 'Fallback',
-  youtube: 'Fallback',
+  gemini: 'Key-Missing',
+  nvidia: 'Key-Missing',
+  youtube: 'Key-Missing',
   voice: 'Studio-Audio',
   backendAvailable: false,
 };
@@ -414,6 +414,14 @@ export function App() {
     }
 
     try {
+      // Reset live connection badges to probed Ready/Key-Missing before execution begins
+      try {
+        const snapshot = await probeInitialConnectionStatus(false);
+        if (isActiveRun()) setConnectionStatus(snapshot);
+      } catch {
+        // Keep current status if health check unavailable
+      }
+
       // STEP 1: Fetch & Smart Clipping
       markStep('step_1_fetch_clip', 6, 'Step 1/5: Verifying source video and real duration...');
 

@@ -181,13 +181,15 @@ export async function probeStudioApiHealth(
   return cachedHealth;
 }
 
-export async function probeInitialConnectionStatus(): Promise<ConnectionStatusState> {
-  const health = await probeStudioApiHealth(true);
+export async function probeInitialConnectionStatus(
+  forceRefresh = true
+): Promise<ConnectionStatusState> {
+  const health = await probeStudioApiHealth(forceRefresh);
   return {
-    gemini: health.geminiConfigured ? 'Connected' : 'Fallback',
-    nvidia: health.nvidiaConfigured ? 'Connected' : 'Key-Missing',
-    youtube: health.youtubeConfigured ? 'Connected' : 'Fallback',
-    voice: health.geminiConfigured ? 'Gemini-TTS' : 'Studio-Audio',
+    gemini: health.geminiConfigured ? 'Ready' : 'Key-Missing',
+    nvidia: health.nvidiaConfigured ? 'Ready' : 'Key-Missing',
+    youtube: health.youtubeConfigured ? 'Ready' : 'Key-Missing',
+    voice: health.geminiConfigured ? 'Ready' : 'Studio-Audio',
     backendAvailable: health.backendAvailable,
   };
 }
@@ -233,6 +235,7 @@ export interface SingleClipAiResult {
   quotaExhausted?: boolean;
   corsBlocked?: boolean;
   keyMissing?: boolean;
+  fallbackFromGemini?: 'Quota-Limit' | 'Fallback';
   errorReason?: string;
 }
 
@@ -254,6 +257,7 @@ export async function runSingleClipAiRequest(params: {
 
   let targetModel: AiEnginePreference = preference;
   const allowCrossProviderFallback = preference === 'auto';
+  let fallbackFromGemini: 'Quota-Limit' | 'Fallback' | undefined;
   if (targetModel === 'auto') {
     if (health.geminiConfigured) {
       targetModel = 'gemini-3.8-flash';
@@ -312,11 +316,16 @@ export async function runSingleClipAiRequest(params: {
           usedStaticModel = 'gemini-3.1-flash-lite';
           resp = await callStaticGemini(usedStaticModel);
         }
+        if (resp.status === 404) {
+          usedStaticModel = 'gemini-2.5-flash';
+          resp = await callStaticGemini(usedStaticModel);
+        }
 
         if (!resp.ok) {
           const errText = await resp.text().catch(() => '');
           const quota = isQuotaOrRateLimitStatus(resp.status, errText);
           if (allowCrossProviderFallback && health.nvidiaConfigured) {
+            fallbackFromGemini = quota ? 'Quota-Limit' : 'Fallback';
             targetModel = imageBase64Jpeg
               ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
               : 'nvidia/nemotron-3.5-lightning-30b-a3b';
@@ -348,6 +357,7 @@ export async function runSingleClipAiRequest(params: {
       } catch (err) {
         if ((err as Error).name === 'AbortError') throw err;
         if (allowCrossProviderFallback && health.nvidiaConfigured) {
+          fallbackFromGemini = 'Fallback';
           targetModel = imageBase64Jpeg
             ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
             : 'nvidia/nemotron-3.5-lightning-30b-a3b';
@@ -377,7 +387,8 @@ export async function runSingleClipAiRequest(params: {
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
         const quota = isQuotaOrRateLimitStatus(resp.status, errText);
-        if (allowCrossProviderFallback && health.nvidiaConfigured && health.backendAvailable && !health.nvidiaStaticKeyOnly) {
+        if (allowCrossProviderFallback && health.nvidiaConfigured) {
+          fallbackFromGemini = quota ? 'Quota-Limit' : 'Fallback';
           targetModel = imageBase64Jpeg
             ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
             : 'nvidia/nemotron-3.5-lightning-30b-a3b';
@@ -408,7 +419,8 @@ export async function runSingleClipAiRequest(params: {
       }
     } catch (err) {
       if ((err as Error).name === 'AbortError') throw err;
-      if (allowCrossProviderFallback && health.nvidiaConfigured && health.backendAvailable && !health.nvidiaStaticKeyOnly) {
+      if (allowCrossProviderFallback && health.nvidiaConfigured) {
+        fallbackFromGemini = 'Fallback';
         targetModel = imageBase64Jpeg
           ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
           : 'nvidia/nemotron-3.5-lightning-30b-a3b';
@@ -447,6 +459,7 @@ export async function runSingleClipAiRequest(params: {
           provider: 'nvidia',
           quotaExhausted: quota,
           keyMissing: resp.status === 503,
+          fallbackFromGemini,
           errorReason:
             resp.status === 503
               ? 'NVIDIA_API_KEY missing on server'
@@ -464,6 +477,7 @@ export async function runSingleClipAiRequest(params: {
         rawText: data.parsed ? JSON.stringify(data.parsed) : '',
         modelUsed: data.modelUsed ?? targetModel,
         provider: 'nvidia',
+        fallbackFromGemini,
       };
     } catch (err) {
       if ((err as Error).name === 'AbortError') throw err;
@@ -471,6 +485,7 @@ export async function runSingleClipAiRequest(params: {
         rawText: '',
         modelUsed: targetModel,
         provider: 'nvidia',
+        fallbackFromGemini,
         errorReason: 'NVIDIA NIM proxy unreachable',
       };
     }
@@ -483,6 +498,7 @@ export async function runSingleClipAiRequest(params: {
       modelUsed: targetModel,
       provider: 'nvidia',
       keyMissing: true,
+      fallbackFromGemini,
       errorReason: 'NVIDIA API key missing',
     };
   }
@@ -530,6 +546,7 @@ export async function runSingleClipAiRequest(params: {
         modelUsed: targetModel,
         provider: 'nvidia',
         quotaExhausted: quota,
+        fallbackFromGemini,
         errorReason: quota ? 'NVIDIA NIM 429 quota limit' : `NVIDIA NIM HTTP ${resp.status}`,
       };
     }
@@ -541,6 +558,7 @@ export async function runSingleClipAiRequest(params: {
       rawText: data.choices?.[0]?.message?.content ?? '',
       modelUsed: targetModel,
       provider: 'nvidia',
+      fallbackFromGemini,
     };
   } catch (err) {
     if ((err as Error).name === 'AbortError') throw err;
@@ -549,6 +567,7 @@ export async function runSingleClipAiRequest(params: {
       modelUsed: targetModel,
       provider: 'nvidia',
       corsBlocked: true,
+      fallbackFromGemini,
       errorReason: 'NVIDIA NIM CORS blocked in static browser',
     };
   }

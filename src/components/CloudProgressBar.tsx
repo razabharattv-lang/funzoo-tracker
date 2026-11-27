@@ -32,7 +32,7 @@ function pillStyle(value: string): string {
   if (value === 'CORS-Blocked' || value === 'Quota-Limit') {
     return 'border-[#FF1744] bg-[#FFF1F3] text-[#B71C1C]';
   }
-  if (value === 'Studio-Audio') {
+  if (value === 'Studio-Audio' || value === 'Ready') {
     return 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]';
   }
   return 'border-[#CBD5E1] bg-[#F4F6F9] text-[#475569]';

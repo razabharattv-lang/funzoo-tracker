@@ -51,8 +51,8 @@ function normalizeNonOverlappingChunks(
   chunks: CaptionChunk[],
   totalDurationSec: number
 ): CaptionChunk[] {
-  // Keep closing 0.32s clear so captions never collide with the punchy outro finish
-  const maxDur = Math.max(0.5, totalDurationSec > 2.2 ? totalDurationSec - 0.32 : totalDurationSec);
+  // Keep closing 0.42s clear so captions never collide with the punchy outro finish
+  const maxDur = Math.max(0.5, totalDurationSec > 2.2 ? totalDurationSec - 0.42 : totalDurationSec);
   const valid = chunks
     .filter((c) => c.words.length > 0 && Number.isFinite(c.startSec) && Number.isFinite(c.endSec))
     .sort((a, b) => a.startSec - b.startSec);

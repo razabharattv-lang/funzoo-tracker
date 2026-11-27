@@ -768,6 +768,10 @@ export async function synthesizeCommandingVoiceover(params: {
           usedTtsModel = 'gemini-3.8-flash-lite-tts';
           resp = await requestStaticTts(usedTtsModel);
         }
+        if (resp.status === 404) {
+          usedTtsModel = 'gemini-2.5-flash-preview-tts';
+          resp = await requestStaticTts(usedTtsModel);
+        }
 
         if (resp.ok) {
           const data = (await resp.json()) as {
@@ -856,8 +860,12 @@ export async function synthesizeCommandingVoiceover(params: {
   }
 
   if (!masteredBuffer) {
+    voiceSource = 'Studio-Audio';
+    if (!voiceEngine) {
+      voiceEngine = 'Studio Cinema Audio (Gemini TTS Unavailable)';
+    }
     onStatus?.(
-      `Synthesizing clean cinema audio bed (${targetDurationSec.toFixed(1)}s)...`
+      `${voiceEngine} — generating embedded studio audio + SFX (${targetDurationSec.toFixed(1)}s)...`
     );
     masteredBuffer = createAudibleFallbackTrack(
       targetDurationSec,
@@ -865,10 +873,6 @@ export async function synthesizeCommandingVoiceover(params: {
       voiceGender,
       pacingBeats
     );
-    voiceSource = 'Studio-Audio';
-    if (!voiceEngine) {
-      voiceEngine = 'Studio Cinema Audio (Gemini TTS Unavailable)';
-    }
   }
 
   const pcmSamples = new Float32Array(masteredBuffer.getChannelData(0));

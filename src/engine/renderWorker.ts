@@ -565,7 +565,7 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
     );
 
     const activeZones = watermarkZones
-      .filter((z) => msg.timeSec >= z.startSec && msg.timeSec <= z.endSec)
+      .filter((z) => msg.timeSec >= z.startSec && msg.timeSec <= z.endSec + 0.05)
       .slice(0, 6);
 
     gl.uniform1i(gl.getUniformLocation(program, 'u_zoneCount'), activeZones.length);

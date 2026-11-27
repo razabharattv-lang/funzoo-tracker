@@ -668,7 +668,15 @@ async function renderSinglePassWebCodecsWorker(params: {
         throw new Error(formatVideoDecodeError(video, source.label, 'Step 5 WebCodecs'));
       }
 
-      const bitmap = await createImageBitmap(video);
+      let bitmap: ImageBitmap;
+      try {
+        bitmap = await createImageBitmap(video);
+      } catch {
+        const retrySec = Math.max(clip.trimRange.startSec, sourceTimeSec - 0.06);
+        await seekVideoPrecise(video, retrySec);
+        await waitForVideoFrameReady(video, 3000);
+        bitmap = await createImageBitmap(video);
+      }
       const pacing = evaluatePacingTransform(clip.pacingBeats, timeSec, durationSec);
       try {
         const ackPromise = nextWorkerReply(45_000);
@@ -725,6 +733,8 @@ async function renderSinglePassWebCodecsWorker(params: {
     if (!check.valid) {
       throw new Error(check.reason || 'WebCodecs MP4 failed playable video verification.');
     }
+
+    onProgress?.(100, `Clip ${clip.clipIndex}/${clip.totalClips} MP4 verified & ready.`);
 
     return {
       blob,
@@ -967,7 +977,7 @@ async function runSingleMediaRecorderAttempt(params: {
 
         // Seamless blended corner delogo patch via downsampled clean-neighbor upscale (fast & Safari-safe)
         for (const z of clip.watermarkZones) {
-          if (elapsedSec >= z.startSec && elapsedSec <= z.endSec) {
+          if (elapsedSec >= z.startSec && elapsedSec <= z.endSec + 0.05) {
             const zx = Math.round(z.box[0] * width);
             const zy = Math.round(z.box[1] * height);
             const zw = Math.max(12, Math.round((z.box[2] - z.box[0]) * width));
@@ -1260,16 +1270,26 @@ async function runSingleMediaRecorderAttempt(params: {
 
           if (now - lastDrawMs >= frameIntervalMs * 0.8) {
             lastDrawMs = now;
-            const maxSourceT = Math.max(
-              0,
-              (Number.isFinite(video.duration) && video.duration > 0
+            const rawDur =
+              Number.isFinite(video.duration) && video.duration > 0
                 ? video.duration
-                : clip.trimRange.endSec) - 0.04
+                : clip.trimRange.endSec;
+            // Clamp strictly inside trimRange.endSec so playback never leaks into trimmed outro logos
+            const maxSourceT = Math.max(
+              clip.trimRange.startSec,
+              Math.min(clip.trimRange.endSec, rawDur) - 0.04
             );
             const expectedSourceT = Math.min(
               clip.trimRange.startSec + renderedElapsedSec * PACE_FACTOR,
               maxSourceT
             );
+            if (video.currentTime >= maxSourceT && !video.paused) {
+              try {
+                video.pause();
+              } catch {
+                // ignore
+              }
+            }
             const driftSec = Math.abs(video.currentTime - expectedSourceT);
 
             // Keep off-screen source <video> cleanly synchronized across the full edited duration
@@ -1278,7 +1298,13 @@ async function runSingleMediaRecorderAttempt(params: {
               !seekingInFlight &&
               !video.seeking
             ) {
-              if (videoPlaying && video.paused && !video.ended && driftSec <= 0.35) {
+              if (
+                videoPlaying &&
+                video.paused &&
+                !video.ended &&
+                video.currentTime < maxSourceT - 0.05 &&
+                driftSec <= 0.35
+              ) {
                 video.play().catch(() => {});
               } else if (driftSec > 0.08) {
                 seekingInFlight = true;
@@ -1361,6 +1387,8 @@ async function runSingleMediaRecorderAttempt(params: {
         check.reason || `Recorded clip (${blob.size} bytes) was not playable.`
       );
     }
+
+    onProgress?.(100, `Clip ${clip.clipIndex}/${clip.totalClips} verified & ready.`);
 
     return {
       blob,

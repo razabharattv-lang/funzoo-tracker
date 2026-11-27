@@ -458,6 +458,7 @@ async function detectTrailingOutroSec(
       let sumLuma = 0;
       let sumSq = 0;
       let borderLumaSum = 0;
+      let borderLumaSq = 0;
       let borderCount = 0;
       let diffSum = 0;
       const n = cw * ch;
@@ -470,6 +471,7 @@ async function detectTrailingOutroSec(
           sumSq += l * l;
           if (x < 6 || x >= cw - 6 || y < 6 || y >= ch - 6) {
             borderLumaSum += l;
+            borderLumaSq += l * l;
             borderCount++;
           }
           if (prevPixels) {
@@ -483,15 +485,20 @@ async function detectTrailingOutroSec(
       const meanLuma = sumLuma / n;
       const stdLuma = Math.sqrt(Math.max(0, sumSq / n - meanLuma * meanLuma));
       const borderMean = borderLumaSum / Math.max(1, borderCount);
+      const borderStd = Math.sqrt(
+        Math.max(0, borderLumaSq / Math.max(1, borderCount) - borderMean * borderMean)
+      );
       const meanDiff = prevPixels ? diffSum / (n * 3) : 99;
 
-      // Dark/white TikTok/Reels/Shorts end-cards have dark or flat solid borders + low frame-to-frame motion
+      // Dark, white, colored-gradient, or static TikTok/Reels/Shorts end-cards have uniform borders or near-zero motion
       const isOutroCard =
         meanLuma < 24 ||
         meanLuma > 236 ||
         stdLuma < 11 ||
         (borderMean < 18 && stdLuma < 36) ||
-        (prevPixels !== null && meanDiff < 5.5 && (borderMean < 32 || borderMean > 224));
+        (borderStd < 15 && stdLuma < 42) ||
+        (prevPixels !== null && meanDiff < 3.4) ||
+        (prevPixels !== null && meanDiff < 5.5 && (borderMean < 32 || borderMean > 224 || borderStd < 22));
 
       if (isOutroCard) {
         trimFromEnd = Math.min(maxDetectTrim, off + 0.2);
