@@ -554,7 +554,7 @@ ${exampleBeatsJson}
     } else if (aiResponse?.provider === 'nvidia') {
       onConnectionPatch?.({
         nvidia: aiResponse.corsBlocked
-          ? 'Static-Skip'
+          ? 'CORS-Blocked'
           : aiResponse.keyMissing
           ? 'Key-Missing'
           : aiResponse.quotaExhausted

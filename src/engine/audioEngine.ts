@@ -621,36 +621,10 @@ export function createGuaranteedFallbackVoice(params: {
     pcmSamples,
     sampleRate: audioBuffer.sampleRate,
     durationSec: Number(alignedDurSec.toFixed(2)),
-    voiceEngine: `Cinema Audio Bed (${params.reason || 'Gemini TTS Unavailable'})`,
-    voiceSource: 'Browser-Speech',
+    voiceEngine: `Studio Cinema Audio (${params.reason || 'Gemini TTS Unavailable'})`,
+    voiceSource: 'Studio-Audio',
     wordTimings,
   };
-}
-
-/**
- * Browser robotic SpeechSynthesis is permanently disabled.
- * Audio relies exclusively on Gemini TTS (`Fenrir`/`Kore` + Studio Broadcast EQ)
- * and clean synthesized cinema audio-bed fallback when cloud TTS is unavailable.
- */
-export function pickBestBrowserSpeechVoice(
-  _language: OutputLanguage,
-  _voiceGender: VoiceGender
-): SpeechSynthesisVoice | null {
-  return null;
-}
-
-export function speakWithBrowserSpeech(_params: {
-  scriptText: string;
-  beats?: ScriptBeat[];
-  language: OutputLanguage;
-  voiceGender: VoiceGender;
-  targetDurationSec: number;
-}): boolean {
-  return false;
-}
-
-export function stopBrowserSpeech(): void {
-  // Intentionally disabled — browser SpeechSynthesis is never invoked.
 }
 
 /**
@@ -687,7 +661,7 @@ export async function synthesizeCommandingVoiceover(params: {
 
   let rawBuffer: AudioBuffer | null = null;
   let voiceEngine = '';
-  let voiceSource: VoiceConnectionStatus = 'Browser-Speech';
+  let voiceSource: VoiceConnectionStatus = 'Studio-Audio';
 
   const styleDesc =
     language === 'hi'
@@ -891,9 +865,9 @@ export async function synthesizeCommandingVoiceover(params: {
       voiceGender,
       pacingBeats
     );
-    voiceSource = 'Browser-Speech';
+    voiceSource = 'Studio-Audio';
     if (!voiceEngine) {
-      voiceEngine = 'Cinema Audio Bed (Gemini TTS Unavailable)';
+      voiceEngine = 'Studio Cinema Audio (Gemini TTS Unavailable)';
     }
   }
 

@@ -67,9 +67,9 @@ const INITIAL_CONTROLS: StudioControlsState = {
 
 const INITIAL_CONNECTION_STATUS: ConnectionStatusState = {
   gemini: 'Fallback',
-  nvidia: 'Static-Skip',
+  nvidia: 'Fallback',
   youtube: 'Fallback',
-  voice: 'Browser-Speech',
+  voice: 'Studio-Audio',
   backendAvailable: false,
 };
 
@@ -523,7 +523,7 @@ export function App() {
       }
       completedSteps.push('step_3_translate_seo');
 
-      // STEP 4: Commanding Voiceover (Gemini 3.8 Flash TTS or Real Browser Speech Voiceover)
+      // STEP 4: Commanding Voiceover (Gemini 3.8 Flash TTS + Studio Broadcast EQ & SFX)
       const voiceResults: Awaited<
         ReturnType<typeof synthesizeCommandingVoiceover>
       >[] = [];

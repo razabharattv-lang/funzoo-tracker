@@ -32,7 +32,7 @@ function pillStyle(value: string): string {
   if (value === 'CORS-Blocked' || value === 'Quota-Limit') {
     return 'border-[#FF1744] bg-[#FFF1F3] text-[#B71C1C]';
   }
-  if (value === 'Browser-Speech') {
+  if (value === 'Studio-Audio') {
     return 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]';
   }
   return 'border-[#CBD5E1] bg-[#F4F6F9] text-[#475569]';
@@ -60,14 +60,9 @@ export function CloudProgressBar({
       ? 'bg-[#00C853]'
       : 'bg-[#3D5AFE]';
 
-  const nvidiaDisplay =
-    connectionStatus.nvidia === 'CORS-Blocked'
-      ? 'Static-Skip'
-      : connectionStatus.nvidia;
-
   const statusPills = [
     { label: 'Gemini', value: connectionStatus.gemini },
-    { label: 'NVIDIA', value: nvidiaDisplay },
+    { label: 'NVIDIA', value: connectionStatus.nvidia },
     { label: 'YouTube', value: connectionStatus.youtube },
     { label: 'Voice', value: connectionStatus.voice },
   ];

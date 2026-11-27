@@ -31,7 +31,7 @@ function ensureTopCornerMasks(
   clipDur: number
 ): WatermarkZone[] {
   const dur = Number(Math.max(1, clipDur).toFixed(2));
-  const outroStart = Number(Math.max(0, dur - 1.4).toFixed(2));
+  const outroStart = Number(Math.max(0, dur - 1.8).toFixed(2));
   const defaults: WatermarkZone[] = [
     {
       id: 'wm_top_left_cover',
@@ -53,7 +53,7 @@ function ensureTopCornerMasks(
       id: 'wm_bottom_right_badge',
       startSec: 0,
       endSec: dur,
-      box: [0.66, 0.85, 1.0, 1.0],
+      box: [0.64, 0.85, 1.0, 1.0],
       action: 'gpu_delogo_patch',
       label: 'Bottom-right creator badge patch',
     },
@@ -61,7 +61,7 @@ function ensureTopCornerMasks(
       id: 'wm_outro_tail_badge',
       startSec: outroStart,
       endSec: dur,
-      box: [0.0, 0.84, 0.38, 1.0],
+      box: [0.0, 0.85, 0.38, 1.0],
       action: 'gpu_delogo_patch',
       label: 'Outro tail bottom-left badge patch',
     },
@@ -69,13 +69,21 @@ function ensureTopCornerMasks(
       id: 'wm_outro_top_tag',
       startSec: outroStart,
       endSec: dur,
-      box: [0.28, 0.0, 0.72, 0.1],
+      box: [0.24, 0.0, 0.76, 0.11],
       action: 'gpu_delogo_patch',
       label: 'Outro tail top creator tag patch',
     },
+    {
+      id: 'wm_outro_bottom_center_id',
+      startSec: outroStart,
+      endSec: dur,
+      box: [0.24, 0.88, 0.76, 1.0],
+      action: 'gpu_delogo_patch',
+      label: 'Outro tail bottom-center creator ID patch',
+    },
   ];
 
-  // Keep detected bottom-corner zones while always guaranteeing clean corner & outro-tail delogo patches
+  // Guarantee all 6 corner & outro-tail delogo zones fit inside the GPU shader's 6-zone array
   const extraNonTop = existing.filter((z) => {
     const cy = (z.box[1] + z.box[3]) / 2;
     return cy >= 0.5 && z.action === 'gpu_delogo_patch';
@@ -384,6 +392,129 @@ async function detectLeadingDeadAirSec(
   }
 }
 
+/**
+ * Probes the final 0.2s..3.0s tail of a clip to detect dark/solid/static social end-cards
+ * or creator-logo outro screens so they are cleanly trimmed without truncating real action.
+ */
+async function detectTrailingOutroSec(
+  source: SourceMediaItem,
+  totalDur: number
+): Promise<number> {
+  if (totalDur < 6 || typeof document === 'undefined') return 0;
+  const maxDetectTrim = totalDur >= 10 ? 2.65 : 1.75;
+  const offsetsFromEnd = [0.15, 0.55, 1.0, 1.5, 2.05, 2.55].filter((o) => o <= maxDetectTrim);
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.style.position = 'fixed';
+  video.style.left = '-9999px';
+  video.style.width = '2px';
+  video.style.height = '2px';
+  video.style.opacity = '0.001';
+  if (document.body) document.body.appendChild(video);
+  video.src = source.objectUrl;
+
+  try {
+    if (video.readyState < 2 || video.videoWidth <= 0) {
+      await new Promise<void>((resolve) => {
+        const timer = window.setTimeout(resolve, 4000);
+        const ready = () => {
+          if (video.readyState >= 2 && video.videoWidth > 0) {
+            window.clearTimeout(timer);
+            resolve();
+          }
+        };
+        video.onloadeddata = ready;
+        video.oncanplay = ready;
+        video.onerror = () => {
+          window.clearTimeout(timer);
+          resolve();
+        };
+        video.load();
+      });
+    }
+    if (video.readyState < 2 || video.videoWidth <= 0) return 0;
+
+    const cw = 48;
+    const ch = 48;
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return 0;
+
+    let trimFromEnd = 0;
+    let prevPixels: Uint8ClampedArray | null = null;
+    for (let i = 0; i < offsetsFromEnd.length; i++) {
+      const off = offsetsFromEnd[i];
+      const probeT = Math.max(0.5, totalDur - off);
+      await seekVideo(video, probeT);
+      if (video.readyState < 2 || video.videoWidth <= 0) break;
+      ctx.drawImage(video, 0, 0, cw, ch);
+      const data = ctx.getImageData(0, 0, cw, ch).data;
+
+      let sumLuma = 0;
+      let sumSq = 0;
+      let borderLumaSum = 0;
+      let borderCount = 0;
+      let diffSum = 0;
+      const n = cw * ch;
+
+      for (let y = 0; y < ch; y++) {
+        for (let x = 0; x < cw; x++) {
+          const p = (y * cw + x) * 4;
+          const l = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+          sumLuma += l;
+          sumSq += l * l;
+          if (x < 6 || x >= cw - 6 || y < 6 || y >= ch - 6) {
+            borderLumaSum += l;
+            borderCount++;
+          }
+          if (prevPixels) {
+            diffSum +=
+              Math.abs(data[p] - prevPixels[p]) +
+              Math.abs(data[p + 1] - prevPixels[p + 1]) +
+              Math.abs(data[p + 2] - prevPixels[p + 2]);
+          }
+        }
+      }
+      const meanLuma = sumLuma / n;
+      const stdLuma = Math.sqrt(Math.max(0, sumSq / n - meanLuma * meanLuma));
+      const borderMean = borderLumaSum / Math.max(1, borderCount);
+      const meanDiff = prevPixels ? diffSum / (n * 3) : 99;
+
+      // Dark/white TikTok/Reels/Shorts end-cards have dark or flat solid borders + low frame-to-frame motion
+      const isOutroCard =
+        meanLuma < 24 ||
+        meanLuma > 236 ||
+        stdLuma < 11 ||
+        (borderMean < 18 && stdLuma < 36) ||
+        (prevPixels !== null && meanDiff < 5.5 && (borderMean < 32 || borderMean > 224));
+
+      if (isOutroCard) {
+        trimFromEnd = Math.min(maxDetectTrim, off + 0.2);
+        prevPixels = new Uint8ClampedArray(data);
+      } else {
+        break;
+      }
+    }
+    return Number(trimFromEnd.toFixed(2));
+  } catch {
+    return 0;
+  } finally {
+    video.onloadeddata = null;
+    video.oncanplay = null;
+    video.onerror = null;
+    video.onseeked = null;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    if (video.parentNode) video.parentNode.removeChild(video);
+  }
+}
+
 async function buildStampedContactSheet(params: {
   source: SourceMediaItem;
   startSec: number;
@@ -547,17 +678,21 @@ export async function inspectAndSliceSegmentsStep1(params: {
   try {
     const scan = await analyzeVideoTimelineLocally(source, onProgress);
     const totalDur = Math.max(1, source.durationSec);
-    // Trim final ~1.2s–1.5s outro/owner-badge tail on short/social clips while preserving full action body
-    const outroTrim =
+    // Trim trailing outro/creator-logo end-card cleanly while preserving full main clip duration
+    const detectedOutroTail = await detectTrailingOutroSec(source, totalDur);
+    const baseOutroTrim =
       totalDur >= 6
         ? scan.hasOutroBumper || source.trimSocialEndCard
-          ? 1.5
+          ? 1.75
           : totalDur <= 45
-          ? 1.35
-          : 1.25
+          ? 1.55
+          : 1.45
         : totalDur >= 3.5
         ? Number(Math.min(1.0, totalDur * 0.18).toFixed(2))
         : 0;
+    const outroTrim = Number(
+      Math.min(totalDur >= 10 ? 2.65 : 1.8, Math.max(baseOutroTrim, detectedOutroTail)).toFixed(2)
+    );
     const usableEnd = Number(Math.max(2, totalDur - outroTrim).toFixed(2));
     const safeCrop = clampSafeCrop(scan.suggestedSafeCropInsets);
 

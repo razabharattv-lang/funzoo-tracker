@@ -618,7 +618,17 @@ async function renderSinglePassWebCodecsWorker(params: {
     await readyPromise;
 
     const PACE_FACTOR = 1.0;
-    const maxOffsetSec = Math.max(0.05, clip.lockedVisualDurationSec - 0.04);
+    const safeVideoDur =
+      Number.isFinite(video.duration) && video.duration > 0.2
+        ? video.duration
+        : clip.trimRange.endSec;
+    const maxOffsetSec = Math.max(
+      0.05,
+      Math.min(
+        clip.lockedVisualDurationSec - 0.04,
+        Math.max(0.05, safeVideoDur - clip.trimRange.startSec - 0.08)
+      )
+    );
 
     for (let i = 0; i < totalFrames; i++) {
       if (signal?.aborted) {
@@ -1009,13 +1019,14 @@ async function runSingleMediaRecorderAttempt(params: {
           }
         }
 
-        // Clean, punchy outro/end-card mask finish in the final 0.40s when bumper trimming is active
-        if (clip.bumperTrimmedSec > 0 && durationSec - elapsedSec < 0.4) {
+        // Clean, punchy outro/end-card mask finish in the closing window so no leftover creator logo flashes
+        const outroWindow = clip.bumperTrimmedSec > 0 ? 0.45 : 0.28;
+        if (durationSec - elapsedSec < outroWindow) {
           const outroProg = Math.max(
             0,
-            Math.min(1, (0.4 - (durationSec - elapsedSec)) / 0.4)
+            Math.min(1, (outroWindow - (durationSec - elapsedSec)) / outroWindow)
           );
-          const fadeAlpha = outroProg * outroProg * 0.96;
+          const fadeAlpha = outroProg * outroProg * (clip.bumperTrimmedSec > 0 ? 0.98 : 0.85);
           ctx.fillStyle = `rgba(7, 11, 22, ${fadeAlpha.toFixed(3)})`;
           ctx.fillRect(0, 0, width, height);
         }

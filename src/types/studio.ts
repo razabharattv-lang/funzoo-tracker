@@ -203,7 +203,7 @@ export type NvidiaConnectionStatus =
   | 'Quota-Limit'
   | 'Fallback';
 export type YoutubeConnectionStatus = 'Connected' | 'Fallback';
-export type VoiceConnectionStatus = 'Gemini-TTS' | 'Browser-Speech';
+export type VoiceConnectionStatus = 'Gemini-TTS' | 'Studio-Audio';
 
 export interface ConnectionStatusState {
   gemini: GeminiConnectionStatus;

@@ -185,15 +185,9 @@ export async function probeInitialConnectionStatus(): Promise<ConnectionStatusSt
   const health = await probeStudioApiHealth(true);
   return {
     gemini: health.geminiConfigured ? 'Connected' : 'Fallback',
-    nvidia: !health.backendAvailable
-      ? 'Static-Skip'
-      : !health.nvidiaConfigured
-      ? 'Key-Missing'
-      : !health.nvidiaStaticKeyOnly
-      ? 'Connected'
-      : 'Static-Skip',
+    nvidia: health.nvidiaConfigured ? 'Connected' : 'Key-Missing',
     youtube: health.youtubeConfigured ? 'Connected' : 'Fallback',
-    voice: health.geminiConfigured ? 'Gemini-TTS' : 'Browser-Speech',
+    voice: health.geminiConfigured ? 'Gemini-TTS' : 'Studio-Audio',
     backendAvailable: health.backendAvailable,
   };
 }
@@ -263,11 +257,7 @@ export async function runSingleClipAiRequest(params: {
   if (targetModel === 'auto') {
     if (health.geminiConfigured) {
       targetModel = 'gemini-3.8-flash';
-    } else if (
-      health.nvidiaConfigured &&
-      health.backendAvailable &&
-      !health.nvidiaStaticKeyOnly
-    ) {
+    } else if (health.nvidiaConfigured) {
       targetModel = imageBase64Jpeg
         ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
         : 'nvidia/nemotron-3.5-lightning-30b-a3b';
@@ -326,41 +316,53 @@ export async function runSingleClipAiRequest(params: {
         if (!resp.ok) {
           const errText = await resp.text().catch(() => '');
           const quota = isQuotaOrRateLimitStatus(resp.status, errText);
+          if (allowCrossProviderFallback && health.nvidiaConfigured) {
+            targetModel = imageBase64Jpeg
+              ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
+              : 'nvidia/nemotron-3.5-lightning-30b-a3b';
+          } else {
+            return {
+              rawText: '',
+              modelUsed: usedStaticModel,
+              provider: 'gemini',
+              quotaExhausted: quota,
+              errorReason: quota
+                ? 'Gemini 429 quota limit'
+                : `Gemini HTTP ${resp.status}`,
+            };
+          }
+        } else {
+          const data = (await resp.json()) as {
+            candidates?: { content?: { parts?: { text?: string }[] } }[];
+          };
+          const rawText =
+            data.candidates?.[0]?.content?.parts
+              ?.map((p) => p.text ?? '')
+              .join('') ?? '';
           return {
-            rawText: '',
+            rawText,
             modelUsed: usedStaticModel,
             provider: 'gemini',
-            quotaExhausted: quota,
-            errorReason: quota
-              ? 'Gemini 429 quota limit'
-              : `Gemini HTTP ${resp.status}`,
           };
         }
-
-        const data = (await resp.json()) as {
-          candidates?: { content?: { parts?: { text?: string }[] } }[];
-        };
-        const rawText =
-          data.candidates?.[0]?.content?.parts
-            ?.map((p) => p.text ?? '')
-            .join('') ?? '';
-        return {
-          rawText,
-          modelUsed: usedStaticModel,
-          provider: 'gemini',
-        };
       } catch (err) {
         if ((err as Error).name === 'AbortError') throw err;
-        return {
-          rawText: '',
-          modelUsed: 'gemini-4-hydrogen',
-          provider: 'gemini',
-          errorReason: 'Gemini network unreachable',
-        };
+        if (allowCrossProviderFallback && health.nvidiaConfigured) {
+          targetModel = imageBase64Jpeg
+            ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
+            : 'nvidia/nemotron-3.5-lightning-30b-a3b';
+        } else {
+          return {
+            rawText: '',
+            modelUsed: 'gemini-4-hydrogen',
+            provider: 'gemini',
+            errorReason: 'Gemini network unreachable',
+          };
+        }
       }
     }
 
-    try {
+    if (targetModel === 'gemini-3.8-flash') try {
       const resp = await fetch('/api/gemini/json', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

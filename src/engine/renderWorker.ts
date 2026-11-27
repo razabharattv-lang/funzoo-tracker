@@ -591,9 +591,13 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
     overlayCtx.shadowOffsetY = 0;
     overlayCtx.clearRect(0, 0, width, height);
     overlayCtx.drawImage(glCanvas, 0, 0, width, height);
-    if (bumperTrimmedSec > 0 && clipDurationSec - msg.timeSec < 0.4) {
-      const outroProg = Math.max(0, Math.min(1, (0.4 - (clipDurationSec - msg.timeSec)) / 0.4));
-      const fadeAlpha = outroProg * outroProg * 0.96;
+    const outroWindow = bumperTrimmedSec > 0 ? 0.45 : 0.28;
+    if (clipDurationSec - msg.timeSec < outroWindow) {
+      const outroProg = Math.max(
+        0,
+        Math.min(1, (outroWindow - (clipDurationSec - msg.timeSec)) / outroWindow)
+      );
+      const fadeAlpha = outroProg * outroProg * (bumperTrimmedSec > 0 ? 0.98 : 0.85);
       overlayCtx.fillStyle = `rgba(7, 11, 22, ${fadeAlpha.toFixed(3)})`;
       overlayCtx.fillRect(0, 0, width, height);
     }

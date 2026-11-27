@@ -13,10 +13,8 @@ import {
   Tag,
   Type,
   Volume2,
-  VolumeX,
 } from 'lucide-react';
 import { formatBytes, formatDuration } from '../lib/videoProbe';
-import { speakWithBrowserSpeech, stopBrowserSpeech } from '../engine/audioEngine';
 import type { RenderedClipOutput } from '../types/studio';
 
 interface OutputDeckCardProps {
@@ -32,8 +30,8 @@ export function OutputDeckCard({
 }: OutputDeckCardProps) {
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [browserSpeechSyncEnabled, setBrowserSpeechSyncEnabled] = useState(true);
   const [videoDecodeError, setVideoDecodeError] = useState<string | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const copyTimerRef = useRef<number | null>(null);
 
@@ -43,21 +41,18 @@ export function OutputDeckCard({
     activeClip &&
       (!activeClip.videoUrl || activeClip.fileSizeBytes <= 1024 || videoDecodeError)
   );
-  const isBrowserSpeechClip = activeClip?.voiceSource === 'Browser-Speech';
   const hasMultipleClips = clips.length > 1;
   const isLandscapeClip = Boolean(activeClip && activeClip.width > activeClip.height * 1.15);
 
   const selectClipIndex = (nextIdx: number) => {
     if (clips.length === 0) return;
     const bounded = (nextIdx + clips.length) % clips.length;
-    stopBrowserSpeech();
     setVideoDecodeError(null);
     setSelectedIdx(bounded);
   };
 
   useEffect(() => {
     return () => {
-      stopBrowserSpeech();
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
       }
@@ -113,20 +108,15 @@ export function OutputDeckCard({
     }
   };
 
-  const handleVideoPlay = () => {
-    if (!activeClip || !isBrowserSpeechClip || !browserSpeechSyncEnabled) return;
-    speakWithBrowserSpeech({
-      scriptText: activeClip.metadata.voiceover,
-      beats: activeClip.metadata.beats,
-      language: activeClip.language,
-      voiceGender: activeClip.voiceGender,
-      targetDurationSec: activeClip.durationSec,
-    });
-  };
-
-  const handleVideoStop = () => {
-    if (isBrowserSpeechClip) {
-      stopBrowserSpeech();
+  const handleReplayEmbeddedAudio = () => {
+    const el = videoRef.current;
+    if (!el) return;
+    try {
+      el.muted = false;
+      el.currentTime = 0;
+      void el.play().catch(() => {});
+    } catch {
+      // ignore autoplay restriction
     }
   };
 
@@ -321,14 +311,11 @@ export function OutputDeckCard({
                 }`}
               >
                 <video
+                  ref={videoRef}
                   key={activeClip.videoUrl}
                   src={activeClip.videoUrl}
                   controls
                   playsInline
-                  muted={isBrowserSpeechClip && browserSpeechSyncEnabled}
-                  onPlay={handleVideoPlay}
-                  onPause={handleVideoStop}
-                  onEnded={handleVideoStop}
                   onError={() =>
                     setVideoDecodeError(
                       'This browser could not decode the recorded video stream. Re-run or test on Chrome/Safari desktop.'
@@ -361,33 +348,6 @@ export function OutputDeckCard({
             </div>
 
             <div className="flex items-center gap-2 flex-wrap">
-              {isBrowserSpeechClip && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    stopBrowserSpeech();
-                    setBrowserSpeechSyncEnabled((prev) => !prev);
-                  }}
-                  className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border-2 text-xs font-extrabold transition-colors cursor-pointer whitespace-nowrap ${
-                    browserSpeechSyncEnabled
-                      ? 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]'
-                      : 'border-[#CBD5E1] bg-white text-[#475569]'
-                  }`}
-                >
-                  {browserSpeechSyncEnabled ? (
-                    <>
-                      <Volume2 className="w-3.5 h-3.5" strokeWidth={2.5} />
-                      <span>OS Speech Sync: ON</span>
-                    </>
-                  ) : (
-                    <>
-                      <VolumeX className="w-3.5 h-3.5" strokeWidth={2.5} />
-                      <span>Embedded Track</span>
-                    </>
-                  )}
-                </button>
-              )}
-
               <button
                 type="button"
                 disabled={isBrokenVideo}
@@ -409,16 +369,9 @@ export function OutputDeckCard({
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() =>
-                    speakWithBrowserSpeech({
-                      scriptText: activeClip.metadata.voiceover,
-                      beats: activeClip.metadata.beats,
-                      language: activeClip.language,
-                      voiceGender: activeClip.voiceGender,
-                      targetDurationSec: activeClip.durationSec,
-                    })
-                  }
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#3D5AFE] bg-white hover:bg-[#3D5AFE] text-[#3D5AFE] hover:text-white text-[11px] font-extrabold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  disabled={isBrokenVideo}
+                  onClick={handleReplayEmbeddedAudio}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#3D5AFE] bg-white hover:bg-[#3D5AFE] text-[#3D5AFE] hover:text-white text-[11px] font-extrabold transition-colors disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap shrink-0"
                 >
                   <Volume2 className="w-3.5 h-3.5" strokeWidth={2.5} />
                   <span>Listen Voice</span>
