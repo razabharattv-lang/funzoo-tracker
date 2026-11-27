@@ -36,6 +36,10 @@ interface FrameMessage {
   timestampUs: number;
   timeSec: number;
   timeFrac?: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
+  transitionPulse?: number;
   bitmap: ImageBitmap;
 }
 
@@ -63,26 +67,47 @@ uniform vec2 u_srcSize;
 uniform vec2 u_dstSize;
 uniform vec4 u_crop; // left, top, right, bottom
 uniform float u_timeFrac; // 0.0 -> 1.0 clip progress for subtle Ken-Burns motion
+uniform float u_zoom; // per-beat zoom accent (1.03 -> 1.14)
+uniform vec2 u_drift; // per-beat subtle center-safe pan shift
+uniform float u_pulse; // brief dramatic transition pulse (0.0 -> 0.18)
 uniform int u_zoneCount;
 uniform vec4 u_zones[6]; // x1, y1, x2, y2 in normalized frame coords
 
 vec3 gradeCinema(vec3 c, vec2 uv) {
-  // Crisp cinema color grading matching contrast(1.18) saturate(1.24) brightness(1.04)
-  c = clamp((c - 0.5) * 1.18 + 0.5 + 0.04, 0.0, 1.0);
+  // Rich clean shadow detail: gentle deep-shadow lift without washing out blacks
+  float rawLuma = dot(c, vec3(0.299, 0.587, 0.114));
+  float shadowLift = 0.014 * (1.0 - rawLuma) * (1.0 - rawLuma);
+  c = clamp(c + vec3(shadowLift), 0.0, 1.0);
+
+  // Balanced lighting: slight brightness lift + controlled brilliance midtone clarity
+  c = clamp(c + 0.036 * c * (1.0 - c) + vec3(0.020 + u_pulse * 0.035), 0.0, 1.0);
+  c = clamp((c - 0.5) * (1.12 + u_pulse * 0.22) + 0.5, 0.0, 1.0);
+
+  // Smooth highlight shoulder roll-off keeps bright skies, lamps, and lit faces crisp without blowing out
+  vec3 overHi = max(vec3(0.0), c - vec3(0.84));
+  c = min(c, vec3(0.84)) + overHi / (vec3(1.0) + overHi * 1.45);
+
+  // Natural skin-safe vibrance & saturation without harsh color shifts
   float luma = dot(c, vec3(0.299, 0.587, 0.114));
-  c = mix(vec3(luma), c, 1.24);
-  // Subtle cinematic split tone (clean deep shadows / warm punchy highlights)
-  vec3 shadowTint = vec3(-0.014, 0.009, 0.022) * (1.0 - luma);
-  vec3 highlightTint = vec3(0.022, 0.011, -0.008) * luma;
-  c = clamp(c + shadowTint + highlightTint, 0.0, 1.0);
-  // Balanced cinema vignette around outer borders for crisp center pop
-  float dist = distance(uv, vec2(0.5, 0.5));
-  float vig = 1.0 - smoothstep(0.46, 0.92, dist) * 0.24;
+  float maxC = max(c.r, max(c.g, c.b));
+  float minC = min(c.r, min(c.g, c.b));
+  float satEst = maxC - minC;
+  float skinMask = smoothstep(0.04, 0.16, c.r - c.b) * smoothstep(0.0, 0.10, c.r - c.g) * smoothstep(0.0, 0.08, c.g - c.b);
+  float satBoost = mix(1.14 + (1.0 - satEst) * 0.09, 1.06, skinMask) + u_pulse * 0.12;
+  c = clamp(mix(vec3(luma), c, satBoost), 0.0, 1.0);
+
+  // Ultra-subtle neutral cinema polish (clean shadows, natural daylight highlights — no heavy color cast)
+  vec3 neutralPolish = vec3(0.005, 0.003, -0.002) * luma + vec3(-0.004, 0.001, 0.006) * (1.0 - luma);
+  c = clamp(c + neutralPolish, 0.0, 1.0);
+
+  // Gentle balanced vignette for centered subject/face focus
+  float dist = distance(uv, vec2(0.5, 0.45));
+  float vig = 1.0 - smoothstep(0.48, 0.96, dist) * (0.18 + u_pulse * 0.24);
   return clamp(c * vig, 0.0, 1.0);
 }
 
 void main() {
-  // Full-bleed 9:16 vertical cover-fit inside safe crop + subtle smooth zoom motion (1.04x -> 1.10x)
+  // Full-bleed 9:16 vertical cover-fit keeping subject/face centered with natural headroom
   float cropW = max(0.2, 1.0 - u_crop.x - u_crop.z);
   float cropH = max(0.2, 1.0 - u_crop.y - u_crop.w);
   float effSrcW = u_srcSize.x * cropW;
@@ -97,14 +122,17 @@ void main() {
     uv.x = (uv.x - 0.5) * scale + 0.5;
   } else {
     float scale = srcAspect / dstAspect;
-    uv.y = (uv.y - 0.5) * scale + 0.5;
+    // Upper-center headroom bias (0.455) keeps faces centered well above lower captions
+    uv.y = (uv.y - 0.5) * scale + 0.455;
   }
 
-  // Smooth zoom push-in (1.04x -> 1.10x) + gentle center-safe motion drift
+  // Per-beat dynamic zoom & center-safe framing drift (clamped strictly to protect faces)
   float tSmooth = smoothstep(0.0, 1.0, clamp(u_timeFrac, 0.0, 1.0));
-  float zoom = 1.04 + 0.06 * tSmooth;
-  vec2 drift = vec2((tSmooth - 0.5) * 0.010, (tSmooth - 0.5) * 0.012);
-  uv = (uv - 0.5) / zoom + 0.5 + drift;
+  float zoom = (u_zoom > 0.5) ? clamp(u_zoom, 1.02, 1.14) : (1.04 + 0.06 * tSmooth);
+  vec2 drift = (u_zoom > 0.5)
+    ? clamp(u_drift, vec2(-0.010, -0.008), vec2(0.010, 0.006))
+    : vec2((tSmooth - 0.5) * 0.007, (tSmooth - 0.5) * 0.006);
+  uv = clamp((uv - vec2(0.5, 0.45)) / zoom + vec2(0.5, 0.45) + drift, vec2(0.002), vec2(0.998));
 
   vec2 srcUv = vec2(
     u_crop.x + uv.x * cropW,
@@ -135,13 +163,31 @@ void main() {
   vec2 clampedUv = clamp(srcUv, vec2(0.002), vec2(0.998));
   vec3 baseCol = texture(u_tex, clampedUv).rgb;
 
-  // Crisp unsharp-mask clarity pass for high-retention Reels/Shorts sharpness
-  vec3 blurNeighbors =
+  // 8-tap Gaussian neighborhood for combined subtle edge-preserving denoise + controlled clarity sharpening
+  vec3 cardBlur =
     (texture(u_tex, clamp(clampedUv + vec2(texel.x, 0.0), vec2(0.002), vec2(0.998))).rgb +
      texture(u_tex, clamp(clampedUv - vec2(texel.x, 0.0), vec2(0.002), vec2(0.998))).rgb +
      texture(u_tex, clamp(clampedUv + vec2(0.0, texel.y), vec2(0.002), vec2(0.998))).rgb +
-     texture(u_tex, clamp(clampedUv - vec2(0.0, texel.y), vec2(0.002), vec2(0.998))).rgb) * 0.25;
-  vec3 col = clamp(baseCol + (baseCol - blurNeighbors) * 0.68, 0.0, 1.0);
+     texture(u_tex, clamp(clampedUv - vec2(0.0, texel.y), vec2(0.002), vec2(0.998))).rgb) * 0.16;
+  vec3 diagBlur =
+    (texture(u_tex, clamp(clampedUv + vec2(texel.x, texel.y), vec2(0.002), vec2(0.998))).rgb +
+     texture(u_tex, clamp(clampedUv + vec2(-texel.x, texel.y), vec2(0.002), vec2(0.998))).rgb +
+     texture(u_tex, clamp(clampedUv + vec2(texel.x, -texel.y), vec2(0.002), vec2(0.998))).rgb +
+     texture(u_tex, clamp(clampedUv - vec2(texel.x, texel.y), vec2(0.002), vec2(0.998))).rgb) * 0.09;
+  vec3 blurNeighbors = cardBlur + diagBlur;
+  float baseLuma = dot(baseCol, vec3(0.299, 0.587, 0.114));
+  float lumaDetail = dot(baseCol - blurNeighbors, vec3(0.299, 0.587, 0.114));
+  float absDetail = abs(lumaDetail);
+
+  // 1) Subtle denoising on low-variance flat/shadow areas without blurring real edges
+  float denoiseBlend = (1.0 - smoothstep(0.012, 0.038, absDetail)) * (0.28 + 0.14 * (1.0 - baseLuma));
+  vec3 denoised = mix(baseCol, blurNeighbors, denoiseBlend);
+
+  // 2) Controlled non-harsh sharpening: noise-cored & midtone-weighted to avoid grainy shadows or halos
+  float sharpCore = smoothstep(0.016, 0.055, absDetail);
+  float midtoneWeight = smoothstep(0.06, 0.24, baseLuma) * smoothstep(0.98, 0.82, baseLuma);
+  float clampedDetail = clamp(lumaDetail * 0.68 * sharpCore * midtoneWeight, -0.10, 0.10);
+  vec3 col = clamp(denoised + vec3(clampedDetail), 0.0, 1.0);
 
   if (maskStrength > 0.01) {
     vec2 cleanCenterUv = clamp(srcUv + patchShift, vec2(0.005), vec2(0.995));
@@ -361,9 +407,18 @@ async function encodeAudioPcm(
       audioData.close();
     }
 
-    // Prevent audio queue pressure on low-RAM phones
+    // Prevent audio queue pressure on low-RAM phones & keep long 1-2+ min encodes responsive
+    let waitSteps = 0;
     while (audioEncoder.encodeQueueSize > 8) {
+      if (encoderError) throw encoderError;
       await new Promise((r) => setTimeout(r, 4));
+      waitSteps++;
+      if (waitSteps > 2500) {
+        throw new Error('AudioEncoder queue stalled during long-form AAC encoding.');
+      }
+    }
+    if ((offset / chunkSize) % 32 === 31) {
+      await new Promise((r) => setTimeout(r, 0));
     }
   }
 }
@@ -493,6 +548,21 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
       gl.getUniformLocation(program, 'u_timeFrac'),
       Math.max(0, Math.min(1, msg.timeFrac ?? 0))
     );
+    gl.uniform1f(
+      gl.getUniformLocation(program, 'u_zoom'),
+      typeof msg.zoom === 'number' && Number.isFinite(msg.zoom) ? msg.zoom : 0
+    );
+    gl.uniform2f(
+      gl.getUniformLocation(program, 'u_drift'),
+      typeof msg.panX === 'number' && Number.isFinite(msg.panX) ? msg.panX : 0,
+      typeof msg.panY === 'number' && Number.isFinite(msg.panY) ? msg.panY : 0
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(program, 'u_pulse'),
+      typeof msg.transitionPulse === 'number' && Number.isFinite(msg.transitionPulse)
+        ? Math.max(0, Math.min(0.2, msg.transitionPulse))
+        : 0
+    );
 
     const activeZones = watermarkZones
       .filter((z) => msg.timeSec >= z.startSec && msg.timeSec <= z.endSec)
@@ -521,14 +591,16 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
     overlayCtx.shadowOffsetY = 0;
     overlayCtx.clearRect(0, 0, width, height);
     overlayCtx.drawImage(glCanvas, 0, 0, width, height);
-    if (bumperTrimmedSec > 0 && clipDurationSec - msg.timeSec < 0.32) {
-      const fadeAlpha = Math.max(
-        0,
-        Math.min(0.88, (0.32 - (clipDurationSec - msg.timeSec)) / 0.32)
-      );
-      overlayCtx.fillStyle = `rgba(9, 14, 26, ${fadeAlpha.toFixed(3)})`;
+    if (bumperTrimmedSec > 0 && clipDurationSec - msg.timeSec < 0.4) {
+      const outroProg = Math.max(0, Math.min(1, (0.4 - (clipDurationSec - msg.timeSec)) / 0.4));
+      const fadeAlpha = outroProg * outroProg * 0.96;
+      overlayCtx.fillStyle = `rgba(7, 11, 22, ${fadeAlpha.toFixed(3)})`;
       overlayCtx.fillRect(0, 0, width, height);
     }
+    overlayCtx.save();
+    overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+    overlayCtx.globalAlpha = 1;
+    overlayCtx.globalCompositeOperation = 'source-over';
     drawCapCutPopCaption({
       ctx: overlayCtx,
       chunks: captionChunks,
@@ -537,6 +609,7 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
       canvasWidth: width,
       canvasHeight: height,
     });
+    overlayCtx.restore();
 
     const durationUs = Math.round(1_000_000 / fps);
     const videoFrame = new VideoFrame(overlayCanvas, {
@@ -553,6 +626,7 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
     }
 
     while (videoEncoder.encodeQueueSize > 2) {
+      if (encoderError) throw encoderError;
       await new Promise((r) => setTimeout(r, 4));
     }
 

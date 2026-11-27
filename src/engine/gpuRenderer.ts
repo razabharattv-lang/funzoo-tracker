@@ -2,6 +2,7 @@ import { buildCaptionChunks, drawCapCutPopCaption } from './captionPainter';
 import { PIPELINE_15_WORKER_MODELS } from './modelRouter';
 import type {
   OutputLanguage,
+  PacingBeat,
   PreparedVisualClip,
   SourceMediaItem,
   TrendMetadata,
@@ -48,6 +49,90 @@ function computeTargetDimensions(
 ): { width: number; height: number } {
   // Always frame into vertical 9:16 canvas for Shorts-style visual transformation
   return isMobile ? { width: 720, height: 1280 } : { width: 1080, height: 1920 };
+}
+
+function evaluatePacingTransform(
+  pacingBeats: PacingBeat[] | undefined,
+  elapsedSec: number,
+  durationSec: number
+): { zoom: number; panX: number; panY: number; transitionPulse: number } {
+  const safeDur = Math.max(0.1, durationSec);
+  const tFrac = Math.max(0, Math.min(1, elapsedSec / safeDur));
+  const smoothGlobal = tFrac * tFrac * (3 - 2 * tFrac);
+
+  if (!pacingBeats || pacingBeats.length === 0) {
+    return {
+      zoom: 1.04 + 0.06 * smoothGlobal,
+      panX: (smoothGlobal - 0.5) * 0.01,
+      panY: (smoothGlobal - 0.5) * 0.012,
+      transitionPulse: 0,
+    };
+  }
+
+  let activeIdx = pacingBeats.length - 1;
+  for (let i = 0; i < pacingBeats.length; i++) {
+    const b = pacingBeats[i];
+    if (elapsedSec >= b.startSec && (elapsedSec < b.endSec || i === pacingBeats.length - 1)) {
+      activeIdx = i;
+      break;
+    }
+  }
+  const active = pacingBeats[activeIdx];
+  const prevBeat = activeIdx > 0 ? pacingBeats[activeIdx - 1] : null;
+
+  const span = Math.max(0.25, active.endSec - active.startSec);
+  const localT = Math.max(0, Math.min(1, (elapsedSec - active.startSec) / span));
+  // Punchy ease-out for hook/twist beats; silky Hermite S-curve for steady explanation beats
+  const eased =
+    active.kind === 'hook_impact' || active.kind === 'twist_transition'
+      ? 1 - Math.pow(1 - localT, 3)
+      : localT * localT * (3 - 2 * localT);
+  const timeSinceStart = Math.max(0, elapsedSec - active.startSec);
+
+  // Subtle speech/beat-synced cut & zoom accents without clipping subject headroom
+  let cutAccent = 0;
+  if (active.kind === 'jump_trim_pause' && localT >= 0.45) {
+    cutAccent = 0.024;
+  } else if (active.kind === 'hook_impact' && timeSinceStart < 0.24) {
+    cutAccent = (1 - timeSinceStart / 0.24) * 0.026;
+  } else if (active.kind === 'twist_transition' && timeSinceStart < 0.22) {
+    cutAccent = (1 - timeSinceStart / 0.22) * 0.028;
+  } else if (active.kind === 'clean_cut' && timeSinceStart < 0.16) {
+    cutAccent = (1 - timeSinceStart / 0.16) * 0.016;
+  }
+
+  let zoom = active.zoomFrom + (active.zoomTo - active.zoomFrom) * eased + cutAccent;
+  let panX = active.panX * (eased * 2 - 1);
+  let panY = active.panY * (eased * 2 - 1);
+
+  // Smooth 0.18s visual continuity bridge across connected scenes (prevents framing teleport on beat boundaries)
+  if (prevBeat && timeSinceStart < 0.18 && active.kind !== 'jump_trim_pause') {
+    const blendRaw = timeSinceStart / 0.18;
+    const blend = blendRaw * blendRaw * (3 - 2 * blendRaw);
+    const prevEndZoom = prevBeat.zoomTo;
+    const prevEndPanX = prevBeat.panX;
+    const prevEndPanY = prevBeat.panY;
+    zoom = prevEndZoom + (zoom - prevEndZoom) * blend;
+    panX = prevEndPanX + (panX - prevEndPanX) * blend;
+    panY = prevEndPanY + (panY - prevEndPanY) * blend;
+  }
+
+  zoom = Math.max(1.03, Math.min(1.14, zoom));
+  panX = Math.max(-0.009, Math.min(0.009, panX));
+  panY = Math.max(-0.007, Math.min(0.006, panY));
+
+  const pulseWindow =
+    active.kind === 'twist_transition' ||
+    active.kind === 'hook_impact' ||
+    active.kind === 'payoff_reveal'
+      ? 0.2
+      : 0.11;
+  const transitionPulse =
+    active.transitionFlash > 0 && timeSinceStart < pulseWindow
+      ? active.transitionFlash * (1 - timeSinceStart / pulseWindow)
+      : 0;
+
+  return { zoom, panX, panY, transitionPulse };
 }
 
 function ensureAudiblePcmBuffer(
@@ -110,7 +195,7 @@ async function loadVideoElementForRender(
   video: HTMLVideoElement,
   sourceLabel: string,
   stage: string,
-  timeoutMs = 25000
+  timeoutMs = 45000
 ): Promise<void> {
   if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
     return;
@@ -232,7 +317,7 @@ async function seekVideoPrecise(
       video.onseeked = null;
       resolve();
     };
-    const timer = window.setTimeout(done, 2200);
+    const timer = window.setTimeout(done, 4500);
     video.onseeked = () => {
       window.clearTimeout(timer);
       done();
@@ -246,7 +331,7 @@ async function seekVideoPrecise(
   });
 
   if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
-    await waitForVideoFrameReady(video, 2000);
+    await waitForVideoFrameReady(video, 3500);
   }
 }
 
@@ -292,7 +377,7 @@ async function verifyPlayableVideoBlob(
         window.clearTimeout(timer);
         resolve(result);
       };
-      const timer = window.setTimeout(() => finish({ ok: true }), 3500);
+      const timer = window.setTimeout(() => finish({ ok: true }), 15000);
       probeVideo.onloadedmetadata = () => {
         const hasDims = probeVideo.videoWidth > 0 && probeVideo.videoHeight > 0;
         if (!hasDims) {
@@ -508,7 +593,8 @@ async function renderSinglePassWebCodecsWorker(params: {
       voice.sampleRate,
       durationSec
     );
-    const readyPromise = nextWorkerReply(40_000);
+    const initTimeoutMs = Math.max(60_000, Math.round(durationSec * 1500));
+    const readyPromise = nextWorkerReply(initTimeoutMs);
     worker.postMessage(
       {
         type: 'init',
@@ -539,6 +625,14 @@ async function renderSinglePassWebCodecsWorker(params: {
         throw new DOMException('Render cancelled', 'AbortError');
       }
 
+      if (typeof document !== 'undefined' && document.hidden) {
+        onProgress?.(
+          Math.min(96, Math.round(((i + 1) / totalFrames) * 95)),
+          `Paused in background (Clip ${clip.clipIndex}/${clip.totalClips}) — will resume automatically when tab returns...`
+        );
+        await waitUntilTabVisible(signal);
+      }
+
       const timeSec = i / fps;
       const timeFrac = totalFrames > 1 ? i / (totalFrames - 1) : 0;
       const sourceTimeSec =
@@ -552,13 +646,22 @@ async function renderSinglePassWebCodecsWorker(params: {
           );
           await waitUntilTabVisible(signal);
           await seekVideoPrecise(video, sourceTimeSec);
+        } else {
+          await waitForVideoFrameReady(video, 3500);
+          if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
+            await seekVideoPrecise(video, Math.max(0, sourceTimeSec - 0.04));
+            await waitForVideoFrameReady(video, 3000);
+          }
         }
-        await waitForVideoFrameReady(video, 2000);
+      }
+      if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
+        throw new Error(formatVideoDecodeError(video, source.label, 'Step 5 WebCodecs'));
       }
 
       const bitmap = await createImageBitmap(video);
+      const pacing = evaluatePacingTransform(clip.pacingBeats, timeSec, durationSec);
       try {
-        const ackPromise = nextWorkerReply(25_000);
+        const ackPromise = nextWorkerReply(45_000);
         worker.postMessage(
           {
             type: 'frame',
@@ -566,6 +669,10 @@ async function renderSinglePassWebCodecsWorker(params: {
             timestampUs: Math.round(timeSec * 1_000_000),
             timeSec,
             timeFrac,
+            zoom: pacing.zoom,
+            panX: pacing.panX,
+            panY: pacing.panY,
+            transitionPulse: pacing.transitionPulse,
             bitmap,
           },
           [bitmap]
@@ -590,7 +697,8 @@ async function renderSinglePassWebCodecsWorker(params: {
     }
 
     onProgress?.(98, `Finalizing MP4 container for Clip ${clip.clipIndex}/${clip.totalClips}...`);
-    const donePromise = nextWorkerReply(60_000);
+    const finishTimeoutMs = Math.max(120_000, Math.round(durationSec * 2500));
+    const donePromise = nextWorkerReply(finishTimeoutMs);
     worker.postMessage({ type: 'finish' });
     const doneMsg = await donePromise;
     const mp4Buffer = doneMsg.mp4Buffer as ArrayBuffer;
@@ -733,7 +841,8 @@ async function runSingleMediaRecorderAttempt(params: {
       drawSx = sx + Math.round((sw - drawSw) / 2);
     } else {
       drawSh = Math.round(sw / dstAspect);
-      drawSy = sy + Math.round((sh - drawSh) / 2);
+      // Upper-center headroom anchor (0.44) keeps faces centered well above lower captions
+      drawSy = sy + Math.round((sh - drawSh) * 0.44);
     }
 
     await seekVideoPrecise(video, clip.trimRange.startSec);
@@ -752,21 +861,21 @@ async function runSingleMediaRecorderAttempt(params: {
     // Precompute balanced cinematic radial vignette for crisp subject focus
     const vignetteGrad = ctx.createRadialGradient(
       width * 0.5,
-      height * 0.48,
-      Math.min(width, height) * 0.26,
+      height * 0.46,
+      Math.min(width, height) * 0.28,
       width * 0.5,
       height * 0.5,
-      Math.max(width, height) * 0.76
+      Math.max(width, height) * 0.78
     );
     vignetteGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
-    vignetteGrad.addColorStop(0.7, 'rgba(10, 18, 34, 0.12)');
-    vignetteGrad.addColorStop(1, 'rgba(6, 12, 24, 0.42)');
+    vignetteGrad.addColorStop(0.72, 'rgba(10, 16, 28, 0.09)');
+    vignetteGrad.addColorStop(1, 'rgba(6, 11, 22, 0.34)');
 
-    // Visible cinema split-tone wash (subtle shadows / warm highlights)
+    // Unified natural-skin brilliance & clean shadow wash (zero harsh color cast)
     const gradeWash = ctx.createLinearGradient(0, 0, 0, height);
-    gradeWash.addColorStop(0, 'rgba(14, 116, 144, 0.10)');
-    gradeWash.addColorStop(0.5, 'rgba(255, 195, 120, 0.08)');
-    gradeWash.addColorStop(1, 'rgba(12, 20, 38, 0.14)');
+    gradeWash.addColorStop(0, 'rgba(255, 250, 242, 0.045)');
+    gradeWash.addColorStop(0.5, 'rgba(255, 248, 238, 0.035)');
+    gradeWash.addColorStop(1, 'rgba(10, 16, 28, 0.09)');
 
     // Fast tiny scratch canvas for hardware-safe frosted corner delogo patching (<0.2ms/zone
     // instead of full-canvas CPU blur(16px) which throttles MediaRecorder to ~3fps / 2s clips)
@@ -790,24 +899,25 @@ async function runSingleMediaRecorderAttempt(params: {
           return;
         }
 
-        // Full-bleed 9:16 smooth zoom motion (1.04x -> 1.10x) + gentle center-safe drift
-        const tFrac = Math.max(0, Math.min(1, elapsedSec / Math.max(0.1, durationSec)));
-        const smoothT = tFrac * tFrac * (3 - 2 * tFrac);
-        const zoom = 1.04 + 0.06 * smoothT;
+        // Full-bleed 9:16 multi-beat pacing motion keeping subject/face centered with protected headroom
+        const pacing = evaluatePacingTransform(clip.pacingBeats, elapsedSec, durationSec);
+        const zoom = Math.min(1.14, pacing.zoom);
         const zoomSw = Math.max(16, Math.round(drawSw / zoom));
         const zoomSh = Math.max(16, Math.round(drawSh / zoom));
+        const panShiftX = Math.round(drawSw * Math.max(-0.01, Math.min(0.01, pacing.panX)));
+        const panShiftY = Math.round(drawSh * Math.max(-0.008, Math.min(0.006, pacing.panY)));
         const zoomSx = Math.max(
           0,
           Math.min(
             vw - zoomSw,
-            drawSx + Math.round((drawSw - zoomSw) * (0.48 + 0.04 * smoothT))
+            drawSx + Math.round((drawSw - zoomSw) * 0.5) + panShiftX
           )
         );
         const zoomSy = Math.max(
           0,
           Math.min(
             vh - zoomSh,
-            drawSy + Math.round((drawSh - zoomSh) * (0.48 + 0.04 * smoothT))
+            drawSy + Math.round((drawSh - zoomSh) * 0.45) + panShiftY
           )
         );
 
@@ -821,12 +931,16 @@ async function runSingleMediaRecorderAttempt(params: {
         ctx.shadowOffsetY = 0;
         ctx.clearRect(0, 0, width, height);
 
+        const dynContrast = (1.12 + pacing.transitionPulse * 0.28).toFixed(3);
+        const dynSaturate = (1.14 + pacing.transitionPulse * 0.14).toFixed(3);
+        const dynBright = (1.035 + pacing.transitionPulse * 0.045).toFixed(3);
+
         ctx.save();
-        ctx.filter = 'contrast(1.18) saturate(1.24) brightness(1.04)';
+        ctx.filter = `contrast(${dynContrast}) saturate(${dynSaturate}) brightness(${dynBright})`;
         ctx.drawImage(video, zoomSx, zoomSy, zoomSw, zoomSh, 0, 0, width, height);
         ctx.restore();
 
-        // Subtle cinema split-tone wash + balanced clarity vignette
+        // Unified natural-skin brilliance wash + balanced clarity vignette
         ctx.save();
         ctx.globalCompositeOperation = 'soft-light';
         ctx.fillStyle = gradeWash;
@@ -835,6 +949,11 @@ async function runSingleMediaRecorderAttempt(params: {
 
         ctx.fillStyle = vignetteGrad;
         ctx.fillRect(0, 0, width, height);
+
+        if (pacing.transitionPulse > 0.03) {
+          ctx.fillStyle = `rgba(255, 255, 255, ${(pacing.transitionPulse * 0.16).toFixed(3)})`;
+          ctx.fillRect(0, 0, width, height);
+        }
 
         // Seamless blended corner delogo patch via downsampled clean-neighbor upscale (fast & Safari-safe)
         for (const z of clip.watermarkZones) {
@@ -890,16 +1009,23 @@ async function runSingleMediaRecorderAttempt(params: {
           }
         }
 
-        // Clean outro/end-card mask fade in the final 0.32s when bumper trimming is active
-        if (clip.bumperTrimmedSec > 0 && durationSec - elapsedSec < 0.32) {
-          const fadeAlpha = Math.max(
+        // Clean, punchy outro/end-card mask finish in the final 0.40s when bumper trimming is active
+        if (clip.bumperTrimmedSec > 0 && durationSec - elapsedSec < 0.4) {
+          const outroProg = Math.max(
             0,
-            Math.min(0.88, (0.32 - (durationSec - elapsedSec)) / 0.32)
+            Math.min(1, (0.4 - (durationSec - elapsedSec)) / 0.4)
           );
-          ctx.fillStyle = `rgba(9, 14, 26, ${fadeAlpha.toFixed(3)})`;
+          const fadeAlpha = outroProg * outroProg * 0.96;
+          ctx.fillStyle = `rgba(7, 11, 22, ${fadeAlpha.toFixed(3)})`;
           ctx.fillRect(0, 0, width, height);
         }
 
+        // Paint strictly ONE crisp non-overlapping caption block with isolated canvas state
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.filter = 'none';
         drawCapCutPopCaption({
           ctx,
           chunks: captionChunks,
@@ -908,6 +1034,7 @@ async function runSingleMediaRecorderAttempt(params: {
           canvasWidth: width,
           canvasHeight: height,
         });
+        ctx.restore();
         drawnRealVideoFrames++;
       } catch {
         // Skip transient frame draw failure without breaking recording loop
@@ -994,8 +1121,9 @@ async function runSingleMediaRecorderAttempt(params: {
 
     const activeRecorder = recorder;
     let recorderFailedMsg: string | null = null;
+    const stopGuardMs = Math.max(15_000, Math.round(durationSec * 250));
     const stoppedPromise = new Promise<void>((resolve) => {
-      const stopGuard = window.setTimeout(resolve, 6000);
+      const stopGuard = window.setTimeout(resolve, stopGuardMs);
       activeRecorder.onstop = () => {
         window.clearTimeout(stopGuard);
         resolve();
@@ -1009,7 +1137,7 @@ async function runSingleMediaRecorderAttempt(params: {
       };
     });
 
-    activeRecorder.start(250);
+    activeRecorder.start(durationSec > 45 ? 500 : 250);
     if (audioSource) {
       try {
         audioSource.start();
@@ -1209,7 +1337,7 @@ async function runSingleMediaRecorderAttempt(params: {
       : 'video/webm';
     const blob = new Blob(chunks, { type: cleanMime });
 
-    const minExpectedFrames = Math.max(4, Math.floor(durationSec * 4));
+    const minExpectedFrames = Math.max(4, Math.floor(durationSec * 2));
     if (drawnRealVideoFrames < minExpectedFrames || blob.size <= 4096) {
       throw new Error(
         `MediaRecorder produced an incomplete output (${blob.size} bytes, ${drawnRealVideoFrames}/${minExpectedFrames} real video frames).`
@@ -1417,8 +1545,57 @@ function verifyClipSequenceTiming(params: {
     return { ...w, startSec, endSec };
   });
 
+  // Snap interior visual pacingBeats boundaries onto nearby speech/clause/beat starts (±0.75s)
+  // so cuts, zooms, and viral caption transitions land right on spoken hooks and reveals.
+  const clauseWordAnchors: number[] = [];
+  for (let i = 1; i < boundedWords.length; i++) {
+    const prevWord = boundedWords[i - 1].word;
+    if (/[.!?।,:;—-]$/.test(prevWord) || i % 4 === 0) {
+      clauseWordAnchors.push(boundedWords[i].startSec);
+    }
+  }
+  const speechAnchors = [
+    ...boundedBeats.map((b) => b.startSec),
+    ...clauseWordAnchors,
+  ].filter((t) => t > 0.55 && t < maxDur - 0.55);
+
+  const rawPacing = params.clip.pacingBeats ?? [];
+  const alignedPacing = rawPacing.map((p, idx) => {
+    if (idx === 0 || speechAnchors.length === 0) return { ...p };
+    let closest = p.startSec;
+    let bestDist = 0.75;
+    for (const anchor of speechAnchors) {
+      const d = Math.abs(anchor - p.startSec);
+      if (d < bestDist) {
+        bestDist = d;
+        closest = anchor;
+      }
+    }
+    return {
+      ...p,
+      startSec: Number(Math.max(0.4, Math.min(maxDur - 0.35, closest)).toFixed(2)),
+    };
+  });
+  for (let i = 0; i < alignedPacing.length; i++) {
+    if (i > 0 && alignedPacing[i].startSec < alignedPacing[i - 1].startSec + 0.35) {
+      alignedPacing[i].startSec = Number(
+        Math.min(maxDur - 0.25, alignedPacing[i - 1].startSec + 0.35).toFixed(2)
+      );
+    }
+    if (i > 0) {
+      alignedPacing[i - 1].endSec = alignedPacing[i].startSec;
+    }
+  }
+  if (alignedPacing.length > 0) {
+    alignedPacing[alignedPacing.length - 1].endSec = Number(maxDur.toFixed(2));
+  }
+
   return {
-    clip: { ...params.clip, watermarkZones: boundedZones },
+    clip: {
+      ...params.clip,
+      watermarkZones: boundedZones,
+      pacingBeats: alignedPacing.length > 0 ? alignedPacing : params.clip.pacingBeats,
+    },
     metadata: { ...params.metadata, beats: boundedBeats, wordTimings: boundedWords },
     voice: { ...params.voice, wordTimings: boundedWords },
   };
@@ -1440,6 +1617,15 @@ export async function renderProductionMp4Gpu(params: {
 }): Promise<RenderedVideoBlobResult> {
   const profile = detectDeviceRenderProfile();
   const { width, height } = computeTargetDimensions(params.source, profile.isMobile);
+  const clipDurSec = Math.max(1.5, params.clip.lockedVisualDurationSec);
+  const isLongForm = clipDurSec > 75;
+  const targetFps = isLongForm ? 24 : profile.fps;
+  const targetBitrate = isLongForm
+    ? profile.isMobile
+      ? 2_200_000
+      : 3_200_000
+    : profile.bitrate;
+
   params.onProgress?.(
     2,
     `Verifying clip sequence & caption timing (${PIPELINE_15_WORKER_MODELS.step5[0]} check)...`
@@ -1462,8 +1648,8 @@ export async function renderProductionMp4Gpu(params: {
         ...checkedParams,
         width,
         height,
-        fps: profile.fps,
-        bitrate: profile.bitrate,
+        fps: targetFps,
+        bitrate: targetBitrate,
       });
     } catch (err) {
       if ((err as Error).name === 'AbortError') throw err;
@@ -1478,7 +1664,7 @@ export async function renderProductionMp4Gpu(params: {
     ...checkedParams,
     width,
     height,
-    fps: profile.fps,
-    bitrate: profile.bitrate,
+    fps: targetFps,
+    bitrate: targetBitrate,
   });
 }

@@ -359,13 +359,18 @@ export function App() {
       step_4_voiceover: 'Step 4/5 (Voice)',
       step_5_mux_output: 'Step 5/5 (Output)',
     };
+    const isActiveRun = () =>
+      runSeq === pipelineRunSeqRef.current && !signal.aborted;
+    const safePatchConnection = (patch: Partial<ConnectionStatusState>) => {
+      if (isActiveRun()) patchConnectionStatus(patch);
+    };
     const markStep = (
       activeStep: PipelineStepId,
       percent: number,
       statusDetail: string,
       clipProgressLabel: string | null = null
     ) => {
-      if (runSeq !== pipelineRunSeqRef.current) return;
+      if (!isActiveRun()) return;
       currentStepLabel = stepLabels[activeStep];
       setProgress({
         status: 'running',
@@ -505,7 +510,7 @@ export function App() {
           signal,
           onStatus: (detail) =>
             markStep('step_3_translate_seo', stepPct, `Step 3/5: ${detail}`, clipLabel),
-          onConnectionPatch: patchConnectionStatus,
+          onConnectionPatch: safePatchConnection,
         });
         if (i === 0 && meta.fetchedTrends && meta.fetchedTrends.length > 0) {
           sharedNicheTrends = meta.fetchedTrends;
@@ -534,6 +539,7 @@ export function App() {
           voice = await synthesizeCommandingVoiceover({
             scriptText: meta.voiceover,
             beats: meta.beats,
+            pacingBeats: clip.pacingBeats,
             language: controls.language,
             voiceGender: controls.voiceGender,
             targetDurationSec: clip.lockedVisualDurationSec,
@@ -554,6 +560,7 @@ export function App() {
           voice = createGuaranteedFallbackVoice({
             scriptText: meta.voiceover,
             beats: meta.beats,
+            pacingBeats: clip.pacingBeats,
             language: controls.language,
             voiceGender: controls.voiceGender,
             targetDurationSec: clip.lockedVisualDurationSec,
@@ -561,7 +568,7 @@ export function App() {
           });
         }
 
-        patchConnectionStatus({ voice: voice.voiceSource });
+        safePatchConnection({ voice: voice.voiceSource });
         meta.wordTimings = voice.wordTimings;
         voiceResults.push(voice);
       }
@@ -573,7 +580,7 @@ export function App() {
 
       // STEP 5: Fast, Phone-Safe Mux & Output Deck
       for (let i = 0; i < preparedClips.length; i++) {
-        if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+        if (!isActiveRun()) throw new DOMException('Cancelled', 'AbortError');
         const clip = preparedClips[i];
         const meta = clipMetadataList[i];
         const voice = voiceResults[i];

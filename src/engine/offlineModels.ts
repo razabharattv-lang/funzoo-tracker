@@ -4,6 +4,8 @@ import type {
   LocalSceneScanResult,
   OfflineModelStatus,
   OutputLanguage,
+  PacingBeat,
+  PacingBeatKind,
   PreparedVisualClip,
   SafeCropInsets,
   ScriptBeat,
@@ -235,7 +237,7 @@ export async function analyzeVideoTimelineLocally(
       await new Promise<void>((resolve, reject) => {
         const timer = window.setTimeout(
           () => reject(new Error('Timed out while loading video frames for local inspection.')),
-          15000
+          45000
         );
         const onReady = () => {
           if (video.readyState >= 2 && video.videoWidth > 0) {
@@ -283,7 +285,7 @@ export async function analyzeVideoTimelineLocally(
     }
 
     const sampleCount =
-      duration <= 30 ? 12 : duration <= 120 ? 16 : duration <= 600 ? 22 : 28;
+      duration <= 30 ? 12 : duration <= 90 ? 18 : duration <= 180 ? 24 : 30;
     const timestamps: number[] = [];
     for (let i = 0; i < sampleCount; i++) {
       const frac = i / Math.max(1, sampleCount - 1);
@@ -302,7 +304,7 @@ export async function analyzeVideoTimelineLocally(
           video.onseeked = null;
           resolve();
         };
-        const timer = window.setTimeout(done, 900);
+        const timer = window.setTimeout(done, 2200);
         video.onseeked = () => {
           window.clearTimeout(timer);
           done();
@@ -461,70 +463,163 @@ export async function analyzeVideoTimelineLocally(
       ? { top: 0.02, bottom: 0.025, left: 0.015, right: 0.015 }
       : { top: 0, bottom: 0, left: 0, right: 0 };
 
-  // Trim leading dead-air / black fade-in if the very first frame is dark & static
+  // Trim leading dead-air / black-or-white fade-in if the very first frame is blank & static
   const firstFrame = motionScores[0];
   const secondFrame = motionScores[1];
+  const isBlankFirst = Boolean(firstFrame && (firstFrame.luma < 14 || firstFrame.luma > 242));
+  const isNormalSecond = Boolean(secondFrame && secondFrame.luma >= 24 && secondFrame.luma <= 232);
   const leadTrimSec =
-    duration >= 7 &&
-    firstFrame &&
-    secondFrame &&
-    firstFrame.luma < 14 &&
-    secondFrame.luma > 28
-      ? Math.min(1.0, Math.max(0.25, secondFrame.timeSec * 0.65))
+    duration >= 7 && isBlankFirst && isNormalSecond
+      ? Math.min(0.85, Math.max(0.22, secondFrame.timeSec * 0.65))
       : 0;
   const usableStart = Number(leadTrimSec.toFixed(2));
   const effectiveDuration = Math.max(1.5, duration - usableStart);
 
   const highActionWindows: LocalSceneScanResult['highActionWindows'] = [];
-  if (duration <= 45) {
-    const peak = motionScores.reduce(
-      (best, cur) => (cur.score > best.score ? cur : best),
-      motionScores[0] ?? { timeSec: duration * 0.45, score: 0.25, luma: 120 }
-    );
-    highActionWindows.push({
-      startSec: usableStart,
-      endSec: Number(duration.toFixed(2)),
-      climaxSec: Number(Math.max(usableStart, peak.timeSec).toFixed(2)),
-      motionScore: Number(peak.score.toFixed(3)),
-    });
-  } else {
-    // Longer videos: slice 2 strong clips (45-135s) or 3 strong 45-120s segments (>135s)
-    const targetClips = duration <= 135 ? 2 : 3;
-    const regionSpan = effectiveDuration / targetClips;
-    const targetClipLen =
-      duration <= 135
-        ? Math.min(65, Math.max(22, regionSpan * 0.9))
-        : Math.min(120, Math.max(45, regionSpan * 0.85));
+  // Preserve full intended duration for any video length (short clips AND 1-2+ minute explainers)
+  const peak = motionScores.reduce(
+    (best, cur) => (cur.score > best.score ? cur : best),
+    motionScores[0] ?? { timeSec: usableStart + effectiveDuration * 0.45, score: 0.25, luma: 120 }
+  );
+  highActionWindows.push({
+    startSec: usableStart,
+    endSec: Number(duration.toFixed(2)),
+    climaxSec: Number(Math.max(usableStart, peak.timeSec).toFixed(2)),
+    motionScore: Number(peak.score.toFixed(3)),
+  });
 
-    for (let c = 0; c < targetClips; c++) {
-      const regStart = usableStart + c * regionSpan;
-      const regEnd = usableStart + (c + 1) * regionSpan;
-      const candidates = motionScores.filter(
-        (m) => m.timeSec >= regStart && m.timeSec <= regEnd
-      );
-      const peak = candidates.reduce(
-        (best, cur) => (cur.score > best.score ? cur : best),
-        candidates[0] ?? {
-          timeSec: regStart + regionSpan * 0.5,
-          score: 0.25,
-          luma: 120,
-        }
-      );
+  // Build varied multi-beat visual pacing plan from real motion/scene changes (without shortening duration)
+  const relDuration = Math.max(1.5, duration - usableStart);
+  const hookEnd = Number(
+    Math.min(relDuration * 0.35, relDuration > 45 ? 3.0 : Math.max(1.8, relDuration * 0.2)).toFixed(2)
+  );
+  const payoffStart = Number(
+    Math.max(hookEnd + 0.8, relDuration - Math.min(9.5, Math.max(2.2, relDuration * 0.13))).toFixed(2)
+  );
+  const targetInteriorCuts =
+    relDuration <= 15
+      ? 2
+      : relDuration <= 45
+      ? 4
+      : Math.max(6, Math.min(18, Math.round(relDuration / 9.5)));
 
-      let startSec = Math.max(regStart, peak.timeSec - targetClipLen * 0.42);
-      let endSec = startSec + targetClipLen;
-      if (endSec > regEnd) {
-        endSec = regEnd;
-        startSec = Math.max(regStart, endSec - targetClipLen);
-      }
+  // Gather candidate cut anchors from real scene cuts and motion shifts
+  const relSceneCuts = sceneCutTimestampsSec
+    .map((t) => Number((t - usableStart).toFixed(2)))
+    .filter((t) => t > hookEnd + 1.5 && t < payoffStart - 1.5);
 
-      highActionWindows.push({
-        startSec: Number(startSec.toFixed(2)),
-        endSec: Number(endSec.toFixed(2)),
-        climaxSec: Number(peak.timeSec.toFixed(2)),
-        motionScore: Number(peak.score.toFixed(3)),
-      });
+  const anchors: number[] = [0, hookEnd];
+  const minGap = relDuration > 45 ? 5.0 : 2.2;
+  for (const cutT of relSceneCuts) {
+    if (cutT - anchors[anchors.length - 1] >= minGap && anchors.length < targetInteriorCuts + 1) {
+      anchors.push(cutT);
     }
+  }
+
+  // Fill any long stretch (>12s on long explainers or >6s on short clips) with balanced beat cuts
+  const maxSpan = relDuration > 45 ? 11.5 : 5.5;
+  anchors.push(payoffStart, Number(relDuration.toFixed(2)));
+  anchors.sort((a, b) => a - b);
+
+  const boundaries: number[] = [anchors[0]];
+  for (let i = 1; i < anchors.length; i++) {
+    const prev = boundaries[boundaries.length - 1];
+    const next = anchors[i];
+    if (next - prev < 0.8 && i < anchors.length - 1) continue;
+    if (next - prev > maxSpan && next < relDuration - 0.5) {
+      const steps = Math.ceil((next - prev) / maxSpan);
+      const stepLen = (next - prev) / steps;
+      for (let s = 1; s < steps; s++) {
+        boundaries.push(Number((prev + s * stepLen).toFixed(2)));
+      }
+    }
+    boundaries.push(Number(next.toFixed(2)));
+  }
+
+  const relClimax = Math.max(0, peak.timeSec - usableStart);
+  const pacingBeats: PacingBeat[] = [];
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    const bStart = boundaries[i];
+    const bEnd = boundaries[i + 1];
+    if (bEnd - bStart < 0.4) continue;
+    const midAbs = usableStart + (bStart + bEnd) * 0.5;
+    const localSamples = motionScores.filter(
+      (m) => m.timeSec >= usableStart + bStart - 1.5 && m.timeSec <= usableStart + bEnd + 1.5
+    );
+    const localMotion =
+      localSamples.length > 0
+        ? localSamples.reduce((acc, m) => acc + m.score, 0) / localSamples.length
+        : avgMotion;
+    const isNearSceneCut = relSceneCuts.some((ct) => Math.abs(ct - bStart) < 1.2);
+    const isClimaxBeat =
+      i > 0 &&
+      i < boundaries.length - 2 &&
+      relClimax >= bStart &&
+      relClimax <= bEnd;
+
+    let kind: PacingBeatKind;
+    let zoomFrom = 1.04;
+    let zoomTo = 1.09;
+    let panX = i % 2 === 0 ? 0.008 : -0.008;
+    let panY = i % 3 === 0 ? 0.006 : -0.005;
+    let transitionFlash = 0;
+
+    if (i === 0) {
+      kind = 'hook_impact';
+      zoomFrom = 1.09;
+      zoomTo = 1.045;
+      panX = 0;
+      panY = -0.005;
+      transitionFlash = 0.11;
+    } else if (i === boundaries.length - 2) {
+      kind = 'payoff_reveal';
+      zoomFrom = 1.055;
+      zoomTo = 1.115;
+      panX = 0;
+      panY = 0.004;
+      transitionFlash = 0.12;
+    } else if (isClimaxBeat || (relDuration > 45 && i === Math.floor((boundaries.length - 1) * 0.6))) {
+      kind = 'twist_transition';
+      zoomFrom = 1.05;
+      zoomTo = 1.125;
+      panX = i % 2 === 0 ? 0.008 : -0.008;
+      panY = -0.005;
+      transitionFlash = 0.13;
+    } else if (localMotion < 0.09) {
+      kind = 'jump_trim_pause';
+      zoomFrom = 1.075;
+      zoomTo = 1.11;
+      panX = i % 2 === 0 ? -0.008 : 0.008;
+      panY = 0.004;
+      transitionFlash = 0.05;
+    } else if (isNearSceneCut || i % 3 === 1) {
+      kind = 'clean_cut';
+      zoomFrom = 1.045;
+      zoomTo = 1.09;
+      panX = i % 2 === 0 ? 0.008 : -0.008;
+      panY = -0.004;
+      transitionFlash = 0.06;
+    } else {
+      kind = 'zoom_accent';
+      const pullOut = i % 2 === 0;
+      zoomFrom = pullOut ? 1.095 : 1.045;
+      zoomTo = pullOut ? 1.045 : 1.105;
+      panX = pullOut ? -0.007 : 0.007;
+      panY = 0.004;
+      transitionFlash = 0.04;
+    }
+
+    pacingBeats.push({
+      startSec: bStart,
+      endSec: bEnd,
+      kind,
+      zoomFrom,
+      zoomTo,
+      panX,
+      panY,
+      transitionFlash,
+      motionIntensity: Number(Math.min(1, Math.max(0.05, localMotion * 2.6 + (midAbs > 0 ? 0 : 0))).toFixed(3)),
+    });
   }
 
   return {
@@ -534,6 +629,7 @@ export async function analyzeVideoTimelineLocally(
     suggestedSafeCropInsets,
     hasOutroBumper,
     visualSummary,
+    pacingBeats,
   };
 }
 
@@ -649,8 +745,15 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
     sceneCuts * 5 +
     fallbackScriptRunCounter * 23;
 
-  // Combinatoric suspense/twist composer (Hook × Escalation × Twist × Payoff = 100+ unique stories)
-  const sentenceCount = dur <= 10 ? 2 : dur <= 22 ? 3 : 4;
+  // Combinatoric suspense/explainer composer scaling smoothly from short clips up to 1-2+ minute explainers
+  const sentenceCount =
+    dur <= 10
+      ? 2
+      : dur <= 22
+      ? 3
+      : dur <= 40
+      ? 4
+      : Math.max(5, Math.min(18, Math.round(dur / 10)));
   const pickFrom = (pool: string[], salt: number): string => {
     const idx = Math.abs(variantSeed + salt * 37 + fallbackScriptRunCounter * 11) % pool.length;
     return pool[idx];
@@ -685,9 +788,21 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
       `${cutCueHi} अचानक एक ऐसा ट्विस्ट आता है जिसे पहली बार में पकड़ पाना लगभग नामुमकिन है।`,
       `हर अगले फ्रेम में तनाव बढ़ता है, और ${climaxSecRounded} सेकंड पर असली राज़ से पर्दा उठ जाता है।`,
     ];
+    const hiExplainerDepth = [
+      `यहाँ सबसे बारीक बात यह है कि हर छोटा कदम आगे आने वाले बड़े बदलाव की नींव रख रहा है।`,
+      `अगर आप इस पल को ध्यान से देखें तो साफ समझ आता है कि समय और सटीकता यहाँ सबसे बड़ी भूमिका निभाते हैं।`,
+      `अब कहानी दूसरे चरण में प्रवेश करती है, जहाँ एक छोटी सी चूक भी पूरा परिणाम बदल सकती है।`,
+      `लेकिन रुकिए—यह अभी सिर्फ़ आधी तस्वीर है, क्योंकि असली चुनौती अब ठीक सामने आने वाली है।`,
+      `जैसे-जैसे दृश्य आगे बढ़ता है, पहले जो अंदाज़ा लगाया गया था वह पूरी तरह उल्टा साबित होने लगता है।`,
+      `यही कारण है कि दर्शक इस हिस्से को बार-बार रोककर देखते हैं ताकि कोई भी ज़रूरी संकेत छूट न जाए।`,
+      `अब हर सेकंड पहले से ज़्यादा निर्णायक हो जाता है और पूरा ध्यान सीधे अगले कदम पर टिक जाता है।`,
+      `इस मोड़ पर आकर पूरी प्रक्रिया की असली वजह एकदम शीशे की तरह साफ हो जाती है।`,
+      `तनाव अपने चरम पर पहुँच चुका है, और अब वही पल आ रहा है जिसका सबको इंतज़ार था।`,
+      `आखिरी हिस्से में सारी कड़ियाँ आपस में जुड़ती हैं और पूरा रहस्य सामने खुलकर आ जाता है।`,
+    ];
     const hiTwists = [
       `जिस नतीजे की उम्मीद थी वह बिल्कुल नहीं हुआ, बल्कि आखिरी पल में पूरा सीन ही पलट गया।`,
-      `यही वह चौंकाने वाला ट्विस्ट है जिसकी वजह से लोग इस ${roundedDur} सेकंड की क्लिप को दोबारा देख रहे हैं।`,
+      `यही वह चौंकाने वाला ट्विस्ट है जिसकी वजह से लोग इस ${roundedDur} सेकंड के वीडियो को दोबारा देख रहे हैं।`,
       `आखिरी सेकंड तक पहुँचते ही पूरा सस्पेंस खत्म होता है और असली कमाल साफ दिखाई देता है।`,
       `नज़दीकी वर्टिकल एंगल की वजह से वह अनदेखा ट्विस्ट आखिरी पल में बिल्कुल साफ उभर कर सामने आता है।`,
     ];
@@ -698,13 +813,28 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
     ];
 
     const vIdx = pickNonRepeatingVariant(variantSeed, hiHooks.length);
-    const fullStory = [
-      hiHooks[vIdx],
-      pickFrom(hiEscalations, vIdx + 2),
-      pickFrom(hiTwists, vIdx + 5),
-      pickFrom(hiClosers, vIdx + 7),
-    ];
-    chosenLines = fullStory.slice(0, sentenceCount);
+    if (sentenceCount <= 4) {
+      const fullStory = [
+        hiHooks[vIdx],
+        pickFrom(hiEscalations, vIdx + 2),
+        pickFrom(hiTwists, vIdx + 5),
+        pickFrom(hiClosers, vIdx + 7),
+      ];
+      chosenLines = fullStory.slice(0, sentenceCount);
+    } else {
+      const midCount = Math.max(1, sentenceCount - 4);
+      const midLines: string[] = [];
+      for (let m = 0; m < midCount; m++) {
+        midLines.push(hiExplainerDepth[(vIdx + m) % hiExplainerDepth.length]);
+      }
+      chosenLines = [
+        hiHooks[vIdx],
+        pickFrom(hiEscalations, vIdx + 2),
+        ...midLines,
+        pickFrom(hiTwists, vIdx + 5),
+        pickFrom(hiClosers, vIdx + 7),
+      ];
+    }
 
     const hiTitles = readableTopic
       ? [
@@ -748,6 +878,18 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
       `Just when you think you've figured out the outcome, ${climaxSecRounded} seconds hits and changes the whole story.`,
       `Tension builds frame by frame until ${cutCueEn} exposes the sudden twist right in front of the lens.`,
     ];
+    const enExplainerDepth = [
+      `What most viewers miss here is how every small move quietly sets up the bigger shift ahead.`,
+      `Watch the timing closely, because precision in this exact stretch decides how the entire moment plays out.`,
+      `Now the stakes climb fast, and a single hesitation would completely break the rhythm you are seeing.`,
+      `Wait—do not look away yet, because what happens in the next phase flips the early assumption upside down.`,
+      `Look how the pressure builds step by step while the real objective stays hidden right in plain sight.`,
+      `This is the stretch that makes viewers rewind twice just to catch the subtle clue before the reveal.`,
+      `Every frame tightens the tension as the sequence moves closer to its make-or-break turning point.`,
+      `Once you see how these pieces lock together, the entire strategy behind the scene suddenly makes total sense.`,
+      `With the climax right around the corner, the momentum shifts into overdrive and leaves zero room for error.`,
+      `In the final stretch, every earlier detail pays off at once and brings the whole story into crystal focus.`,
+    ];
     const enTwists = [
       `The payoff lands out of nowhere, turning a ${roundedDur}-second moment into an instant replay.`,
       `That single twist flips the whole ${formatWord} sequence and explains why viewers keep watching twice.`,
@@ -756,18 +898,33 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
     ];
     const enClosers = [
       `Did you call that twist before ${climaxSecRounded} seconds, or did it catch you off guard?`,
-      `Follow for more gripping ${roundedDur}-second twists that hit harder every time.`,
-      `Save this clip and send it to someone who never sees the ending coming.`,
+      `Follow for more gripping ${roundedDur}-second stories that hit harder every time.`,
+      `Save this video and send it to someone who never sees the ending coming.`,
     ];
 
     const vIdx = pickNonRepeatingVariant(variantSeed, enHooks.length);
-    const fullStory = [
-      enHooks[vIdx],
-      pickFrom(enEscalations, vIdx + 3),
-      pickFrom(enTwists, vIdx + 6),
-      pickFrom(enClosers, vIdx + 9),
-    ];
-    chosenLines = fullStory.slice(0, sentenceCount);
+    if (sentenceCount <= 4) {
+      const fullStory = [
+        enHooks[vIdx],
+        pickFrom(enEscalations, vIdx + 3),
+        pickFrom(enTwists, vIdx + 6),
+        pickFrom(enClosers, vIdx + 9),
+      ];
+      chosenLines = fullStory.slice(0, sentenceCount);
+    } else {
+      const midCount = Math.max(1, sentenceCount - 4);
+      const midLines: string[] = [];
+      for (let m = 0; m < midCount; m++) {
+        midLines.push(enExplainerDepth[(vIdx + m) % enExplainerDepth.length]);
+      }
+      chosenLines = [
+        enHooks[vIdx],
+        pickFrom(enEscalations, vIdx + 3),
+        ...midLines,
+        pickFrom(enTwists, vIdx + 6),
+        pickFrom(enClosers, vIdx + 9),
+      ];
+    }
 
     const enTitles = readableTopic
       ? [
@@ -786,19 +943,45 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
     titleVariant = enTitles[(vIdx + fallbackScriptRunCounter) % enTitles.length];
   }
 
-  // Distribute beat timings proportionally to word length inside safeSpeechEnd
-  const wordCounts = chosenLines.map((l) => l.split(/\s+/).filter(Boolean).length);
-  const totalWords = wordCounts.reduce((a, b) => a + b, 0) || 1;
-  let cursor = 0.05;
-  const beats: ScriptBeat[] = chosenLines.map((text, idx) => {
-    const share = (wordCounts[idx] / totalWords) * (safeSpeechEnd - 0.1);
-    const startSec = Number(cursor.toFixed(2));
-    const endSec = Number(
-      (idx === chosenLines.length - 1 ? safeSpeechEnd : Math.min(safeSpeechEnd, cursor + share)).toFixed(2)
-    );
-    cursor = endSec;
-    return { startSec, endSec, text };
-  });
+  // Align offline script beat timings monotonically to pacingBeats (zero overlap even when lines > beats)
+  const pacing = clip.pacingBeats ?? [];
+  let beats: ScriptBeat[];
+  if (pacing.length >= 2 && chosenLines.length >= 2) {
+    const lineCount = chosenLines.length;
+    const rawStarts: number[] = chosenLines.map((_, idx) => {
+      if (idx === 0) return 0.05;
+      const pos = (idx / lineCount) * pacing.length;
+      const baseIdx = Math.min(pacing.length - 1, Math.floor(pos));
+      const frac = pos - baseIdx;
+      const b = pacing[baseIdx];
+      return Math.min(safeSpeechEnd - 0.25, b.startSec + frac * Math.max(0.2, b.endSec - b.startSec));
+    });
+    beats = [];
+    let prevEnd = 0.05;
+    for (let idx = 0; idx < lineCount; idx++) {
+      const startSec = Number(
+        (idx === 0 ? 0.05 : Math.max(prevEnd, Math.min(safeSpeechEnd - 0.2, rawStarts[idx]))).toFixed(2)
+      );
+      const nextTarget =
+        idx === lineCount - 1 ? safeSpeechEnd : Math.max(startSec + 0.35, rawStarts[idx + 1]);
+      const endSec = Number(Math.max(startSec + 0.2, Math.min(safeSpeechEnd, nextTarget)).toFixed(2));
+      beats.push({ startSec, endSec, text: chosenLines[idx] });
+      prevEnd = endSec;
+    }
+  } else {
+    const wordCounts = chosenLines.map((l) => l.split(/\s+/).filter(Boolean).length);
+    const totalWords = wordCounts.reduce((a, b) => a + b, 0) || 1;
+    let cursor = 0.05;
+    beats = chosenLines.map((text, idx) => {
+      const share = (wordCounts[idx] / totalWords) * (safeSpeechEnd - 0.1);
+      const startSec = Number(cursor.toFixed(2));
+      const endSec = Number(
+        (idx === chosenLines.length - 1 ? safeSpeechEnd : Math.min(safeSpeechEnd, cursor + share)).toFixed(2)
+      );
+      cursor = endSec;
+      return { startSec, endSec, text };
+    });
+  }
 
   const voiceover = beats.map((b) => b.text).join(' ');
   const displayTitleSubject = readableTopic || titleVariant;

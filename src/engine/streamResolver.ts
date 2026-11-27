@@ -172,37 +172,16 @@ export function buildDefaultViralSegments(source: SourceMediaItem): ViralSegment
   const duration = Math.max(1, source.durationSec);
   const defaultCrop = { top: 0, bottom: 0, left: 0, right: 0 };
 
-  if (duration <= 65) {
-    return [
-      {
-        clipIndex: 1,
-        startSec: 0,
-        endSec: Number(duration.toFixed(2)),
-        climaxSec: Number((duration * 0.45).toFixed(2)),
-        reason: 'Full source video preserved without artificial duration cap',
-        trimRange: { startSec: 0, endSec: Number(duration.toFixed(2)) },
-        safeCropInsets: defaultCrop,
-        watermarkZones: [],
-      },
-    ];
-  }
-
-  const clipCount = 3;
-  const span = duration / clipCount;
-  const targetLen = Math.min(58, Math.max(30, span * 0.7));
-
-  return Array.from({ length: clipCount }, (_, i) => {
-    const startSec = Number((i * span).toFixed(2));
-    const endSec = Number(Math.min(duration, startSec + targetLen).toFixed(2));
-    return {
-      clipIndex: i + 1,
-      startSec,
-      endSec,
-      climaxSec: Number((startSec + (endSec - startSec) * 0.45).toFixed(2)),
-      reason: `Highlight segment ${i + 1} of ${clipCount} from long-form video`,
-      trimRange: { startSec, endSec },
+  return [
+    {
+      clipIndex: 1,
+      startSec: 0,
+      endSec: Number(duration.toFixed(2)),
+      climaxSec: Number((duration * 0.45).toFixed(2)),
+      reason: 'Full source video preserved without artificial duration cap',
+      trimRange: { startSec: 0, endSec: Number(duration.toFixed(2)) },
       safeCropInsets: defaultCrop,
       watermarkZones: [],
-    };
-  });
+    },
+  ];
 }

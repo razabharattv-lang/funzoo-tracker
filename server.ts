@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI } from '@google/genai';
+import { pickNormalizedEnvKey } from './src/lib/env';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,8 +45,15 @@ const NVIDIA_NIM_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 let cachedKey = '';
 let cachedClient: GoogleGenAI | null = null;
 
+function getGeminiApiKey(): string {
+  return pickNormalizedEnvKey(
+    process.env.GEMINI_API_KEY,
+    process.env.VITE_GEMINI_API_KEY
+  );
+}
+
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = (process.env.GEMINI_API_KEY ?? '').trim();
+  const apiKey = getGeminiApiKey();
   if (!apiKey) {
     const err = new Error(
       'GEMINI_API_KEY is not configured on the server.'
@@ -68,19 +76,17 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 function getNvidiaApiKey(): string {
-  return (
-    process.env.NVIDIA_API_KEY ||
-    process.env.VITE_NVIDIA_API_KEY ||
-    ''
-  ).trim();
+  return pickNormalizedEnvKey(
+    process.env.NVIDIA_API_KEY,
+    process.env.VITE_NVIDIA_API_KEY
+  );
 }
 
 function getYoutubeApiKey(): string {
-  return (
-    process.env.YOUTUBE_API_KEY ||
-    process.env.VITE_YOUTUBE_API_KEY ||
-    ''
-  ).trim();
+  return pickNormalizedEnvKey(
+    process.env.YOUTUBE_API_KEY,
+    process.env.VITE_YOUTUBE_API_KEY
+  );
 }
 
 function extractErrorInfo(err: unknown): { status: number; message: string } {
@@ -124,7 +130,7 @@ async function startServer(): Promise<void> {
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({
       ok: true,
-      geminiConfigured: Boolean((process.env.GEMINI_API_KEY ?? '').trim()),
+      geminiConfigured: Boolean(getGeminiApiKey()),
       nvidiaConfigured: Boolean(getNvidiaApiKey()),
       youtubeConfigured: Boolean(getYoutubeApiKey()),
     });
@@ -348,7 +354,7 @@ async function startServer(): Promise<void> {
           : userPrompt;
 
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 14_000);
+      const timer = setTimeout(() => controller.abort(), 35_000);
 
       try {
         const resp = await fetch(NVIDIA_NIM_URL, {
@@ -368,7 +374,7 @@ async function startServer(): Promise<void> {
             ],
             temperature: 0.35,
             top_p: 0.9,
-            max_tokens: 1400,
+            max_tokens: 3200,
             response_format: { type: 'json_object' },
           }),
           signal: controller.signal,

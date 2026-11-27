@@ -51,20 +51,21 @@ function normalizeNonOverlappingChunks(
   chunks: CaptionChunk[],
   totalDurationSec: number
 ): CaptionChunk[] {
-  const maxDur = Math.max(0.5, totalDurationSec);
+  // Keep closing 0.32s clear so captions never collide with the punchy outro finish
+  const maxDur = Math.max(0.5, totalDurationSec > 2.2 ? totalDurationSec - 0.32 : totalDurationSec);
   const valid = chunks
     .filter((c) => c.words.length > 0 && Number.isFinite(c.startSec) && Number.isFinite(c.endSec))
     .sort((a, b) => a.startSec - b.startSec);
 
   const normalized: CaptionChunk[] = [];
   for (let i = 0; i < valid.length; i++) {
-    const prevEnd = normalized.length > 0 ? normalized[normalized.length - 1].endSec : 0;
+    const prevEnd = normalized.length > 0 ? normalized[normalized.length - 1].endSec + 0.025 : 0;
     const startSec = Math.max(prevEnd, Math.min(maxDur - 0.08, valid[i].startSec));
     const nextRawStart = i + 1 < valid.length ? valid[i + 1].startSec : maxDur;
     const rawEnd = Math.max(startSec + 0.08, Math.min(maxDur, valid[i].endSec));
     const endSec =
       i + 1 < valid.length
-        ? Math.max(startSec + 0.06, Math.min(rawEnd, Math.max(startSec + 0.06, nextRawStart - 0.01)))
+        ? Math.max(startSec + 0.06, Math.min(rawEnd, Math.max(startSec + 0.06, nextRawStart - 0.025)))
         : Math.min(maxDur, rawEnd);
 
     normalized.push({
@@ -185,13 +186,20 @@ export function drawCapCutPopCaption(params: {
   if (!active || active.words.length === 0) return;
 
   const scaleFactor = canvasWidth / 1080;
+  const chunkDur = Math.max(0.08, active.endSec - active.startSec);
   const localT = Math.max(0, timeSec - active.startSec);
-  const popScale =
-    localT < 0.07
-      ? 0.86 + (localT / 0.07) * 0.22
-      : localT < 0.14
-      ? 1.08 - ((localT - 0.07) / 0.07) * 0.08
-      : 1.0;
+  const remainT = Math.max(0, active.endSec - timeSec);
+
+  // Smooth spring-like pop entrance + gentle micro slide-up + clean exit fade (zero harsh snap)
+  const enterDur = Math.min(0.12, chunkDur * 0.4);
+  const enterU = Math.min(1, localT / Math.max(0.04, enterDur));
+  const easeOutBack = 1 + 1.55 * Math.pow(enterU - 1, 3) + 0.55 * Math.pow(enterU - 1, 2);
+  const popScale = 0.88 + 0.12 * easeOutBack;
+  const slideOffsetY = Math.round((1 - Math.min(1, enterU * 1.15)) * 12 * scaleFactor);
+  const enterAlpha = Math.min(1, localT / 0.045);
+  const exitAlpha = remainT < 0.045 && chunkDur > 0.16 ? Math.max(0, remainT / 0.045) : 1;
+  const captionAlpha = Math.max(0, Math.min(1, enterAlpha * exitAlpha));
+  if (captionAlpha <= 0.02) return;
 
   const fontSize = Math.round((language === 'hi' ? 68 : 76) * scaleFactor);
   const fontFamily =
@@ -200,12 +208,12 @@ export function drawCapCutPopCaption(params: {
       : '"Plus Jakarta Sans", "Inter", system-ui, sans-serif';
 
   ctx.save();
+  ctx.globalAlpha = captionAlpha;
+  ctx.globalCompositeOperation = 'source-over';
   ctx.font = `900 ${fontSize}px ${fontFamily}`;
   ctx.textBaseline = 'middle';
   ctx.lineJoin = 'round';
   ctx.miterLimit = 2;
-  ctx.lineWidth = Math.max(7, Math.round(16 * scaleFactor));
-  ctx.strokeStyle = '#050814';
 
   const spacing = Math.round(28 * scaleFactor);
   const widths = active.words.map((w) => ctx.measureText(w).width);
@@ -213,29 +221,33 @@ export function drawCapCutPopCaption(params: {
     widths.reduce((acc, w) => acc + w, 0) +
     spacing * Math.max(0, active.words.length - 1);
 
-  // Clean lower-safe anchor (78% height): clears main subject AND bottom video player controls
+  // Strict lower-safe zone (81.5% height): keeps centered subject/face clear and stays above bottom player UI
   const centerX = canvasWidth / 2;
-  const centerY = Math.round(canvasHeight * 0.78);
+  const centerY = Math.round(canvasHeight * 0.815) + slideOffsetY;
 
-  const safeHorizontalMargin = Math.round(128 * scaleFactor);
-  const maxAllowedW = Math.max(120, canvasWidth - safeHorizontalMargin);
-  const fitScale = totalW > maxAllowedW ? maxAllowedW / totalW : 1.0;
+  const padX = Math.round(34 * scaleFactor);
+  const padY = Math.round(20 * scaleFactor);
+  const boxW = totalW + padX * 2;
+  const boxH = fontSize + padY * 2;
+  const boxR = Math.round(24 * scaleFactor);
+
+  const safeHorizontalMargin = Math.round(140 * scaleFactor);
+  const maxAllowedW = Math.max(140, canvasWidth - safeHorizontalMargin);
+  const fitScale = boxW > maxAllowedW ? maxAllowedW / boxW : 1.0;
   const finalScale = popScale * fitScale;
 
   ctx.translate(centerX, centerY);
   ctx.scale(finalScale, finalScale);
 
-  // Sleek dark high-contrast backing pill with subtle crisp rim so captions pop over bright/moving frames
-  const padX = Math.round(30 * scaleFactor);
-  const padY = Math.round(18 * scaleFactor);
-  const boxW = totalW + padX * 2;
-  const boxH = fontSize + padY * 2;
-  const boxR = Math.round(22 * scaleFactor);
+  // High-contrast dark backing pill with deep drop shadow & crisp subtle rim
   ctx.save();
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
-  ctx.shadowBlur = Math.round(18 * scaleFactor);
-  ctx.shadowOffsetY = Math.round(6 * scaleFactor);
-  ctx.fillStyle = 'rgba(6, 10, 22, 0.76)';
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.72)';
+  ctx.shadowBlur = Math.round(26 * scaleFactor);
+  ctx.shadowOffsetY = Math.round(8 * scaleFactor);
+  const pillGrad = ctx.createLinearGradient(0, -boxH / 2, 0, boxH / 2);
+  pillGrad.addColorStop(0, 'rgba(6, 10, 22, 0.84)');
+  pillGrad.addColorStop(1, 'rgba(10, 16, 32, 0.90)');
+  ctx.fillStyle = pillGrad;
   ctx.beginPath();
   if (typeof ctx.roundRect === 'function') {
     ctx.roundRect(-boxW / 2, -boxH / 2, boxW, boxH, boxR);
@@ -246,7 +258,7 @@ export function drawCapCutPopCaption(params: {
   ctx.restore();
 
   ctx.save();
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.24)';
   ctx.lineWidth = Math.max(1.5, Math.round(2.5 * scaleFactor));
   ctx.beginPath();
   if (typeof ctx.roundRect === 'function') {
@@ -257,22 +269,30 @@ export function drawCapCutPopCaption(params: {
   ctx.stroke();
   ctx.restore();
 
-  // Determine currently spoken word for viral pop emphasis (strictly single active word)
+  // Determine strictly ONE currently spoken word + its local pop progress
   let activeWordIdx = active.words.length - 1;
+  let activeWordLocalT = localT;
   if (active.wordTimings && active.wordTimings.length === active.words.length) {
     const foundIdx = active.wordTimings.findIndex(
       (wt, idx) =>
         timeSec >= wt.startSec &&
         (idx === active.wordTimings!.length - 1 ? timeSec <= wt.endSec : timeSec < wt.endSec)
     );
-    if (foundIdx !== -1) activeWordIdx = foundIdx;
+    if (foundIdx !== -1) {
+      activeWordIdx = foundIdx;
+      activeWordLocalT = Math.max(0, timeSec - active.wordTimings[foundIdx].startSec);
+    }
   } else if (active.words.length > 1) {
-    const frac = Math.max(
-      0,
-      Math.min(0.999, (timeSec - active.startSec) / Math.max(0.1, active.endSec - active.startSec))
-    );
+    const wordSpan = Math.max(0.08, chunkDur / active.words.length);
+    const frac = Math.max(0, Math.min(0.999, localT / chunkDur));
     activeWordIdx = Math.floor(frac * active.words.length);
+    activeWordLocalT = Math.max(0, localT - activeWordIdx * wordSpan);
   }
+
+  const wordPopU = Math.min(1, activeWordLocalT / 0.085);
+  const activeWordScale =
+    1.045 + Math.sin(wordPopU * Math.PI) * 0.045;
+  const activeWordLiftY = -Math.round(2.5 * scaleFactor);
 
   let cursorX = -totalW / 2;
   active.words.forEach((word, idx) => {
@@ -281,14 +301,25 @@ export function drawCapCutPopCaption(params: {
     const wordCenterX = cursorX + wordW / 2;
 
     ctx.save();
-    ctx.translate(wordCenterX, 0);
+    ctx.translate(wordCenterX, isHighlight ? activeWordLiftY : 0);
     if (isHighlight) {
-      ctx.scale(1.05, 1.05);
-      ctx.shadowColor = 'rgba(0, 0, 0, 0.85)';
+      ctx.scale(activeWordScale, activeWordScale);
+      // Subtle controlled viral accent glow behind active word before crisp stroke & fill
+      ctx.save();
+      ctx.shadowColor = active.accentColor;
+      ctx.shadowBlur = Math.round(18 * scaleFactor);
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 0;
+      ctx.fillStyle = active.accentColor;
+      ctx.globalAlpha = captionAlpha * 0.45;
+      ctx.fillText(word, -wordW / 2, 0);
+      ctx.restore();
+
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.88)';
       ctx.shadowBlur = Math.round(14 * scaleFactor);
       ctx.shadowOffsetY = Math.round(5 * scaleFactor);
     } else {
-      ctx.shadowColor = 'rgba(0, 0, 0, 0.72)';
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.76)';
       ctx.shadowBlur = Math.round(10 * scaleFactor);
       ctx.shadowOffsetY = Math.round(4 * scaleFactor);
     }

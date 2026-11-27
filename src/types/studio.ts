@@ -45,6 +45,26 @@ export interface AlignedWordTiming {
   isEmphasis: boolean;
 }
 
+export type PacingBeatKind =
+  | 'hook_impact'
+  | 'clean_cut'
+  | 'jump_trim_pause'
+  | 'zoom_accent'
+  | 'twist_transition'
+  | 'payoff_reveal';
+
+export interface PacingBeat {
+  startSec: number;
+  endSec: number;
+  kind: PacingBeatKind;
+  zoomFrom: number;
+  zoomTo: number;
+  panX: number;
+  panY: number;
+  transitionFlash: number;
+  motionIntensity: number;
+}
+
 export interface LocalSceneScanResult {
   sceneCutTimestampsSec: number[];
   highActionWindows: {
@@ -57,6 +77,7 @@ export interface LocalSceneScanResult {
   suggestedSafeCropInsets: SafeCropInsets;
   hasOutroBumper: boolean;
   visualSummary?: ClipVisualSummary;
+  pacingBeats?: PacingBeat[];
 }
 
 export interface StudioControlsState {
@@ -124,6 +145,8 @@ export interface ViralSegment {
   safeCropInsets: SafeCropInsets;
   watermarkZones: WatermarkZone[];
   visualSummary?: ClipVisualSummary;
+  sceneCutTimestampsSec?: number[];
+  pacingBeats?: PacingBeat[];
 }
 
 export interface PreparedVisualClip {
@@ -145,6 +168,8 @@ export interface PreparedVisualClip {
   stampedTimestampsSec: number[];
   inspectorModel: string;
   visualSummary?: ClipVisualSummary;
+  sceneCutTimestampsSec?: number[];
+  pacingBeats?: PacingBeat[];
 }
 
 export interface YouTubeTrendVideo {

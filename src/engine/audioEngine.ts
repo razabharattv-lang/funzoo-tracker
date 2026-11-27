@@ -7,6 +7,7 @@ import { getBuildRuntimeEnv } from '../lib/env';
 import type {
   AlignedWordTiming,
   OutputLanguage,
+  PacingBeat,
   ScriptBeat,
   VoiceConnectionStatus,
   VoiceGender,
@@ -109,12 +110,13 @@ function mixProceduralCreatorSfx(
   samples: Float32Array,
   sampleRate: number,
   beats: ScriptBeat[],
-  targetDurationSec: number
+  targetDurationSec: number,
+  pacingBeats?: PacingBeat[]
 ): void {
   const len = samples.length;
   if (len < 128) return;
 
-  // 1) Opening hook sub-hit (0.04s -> 0.30s): warm exponential bass drop
+  // 1) Opening hook impact sub-hit (0.04s -> 0.30s): warm exponential bass drop
   const hookStart = Math.floor(0.04 * sampleRate);
   const hookDurSamples = Math.floor(0.26 * sampleRate);
   let phase = 0;
@@ -129,35 +131,73 @@ function mixProceduralCreatorSfx(
     samples[hookStart + i] += hit;
   }
 
-  // 2) Beat-transition cut whooshes + pop accents at interior scene/twist cuts
-  const cutTimes = beats
-    .map((b) => b.startSec)
-    .filter((t) => t > 0.9 && t < Math.max(1.2, targetDurationSec - 0.55));
-  const lastCutIdx = cutTimes.length - 1;
+  // 2) Beat-aligned SFX cues from timeline pacingBeats (preferred) or script beats
+  type SfxCue = { timeSec: number; style: 'whoosh' | 'pop' | 'twist' | 'payoff' };
+  const rawCues: SfxCue[] =
+    pacingBeats && pacingBeats.length >= 2
+      ? pacingBeats
+          .filter((b) => b.startSec > 0.9 && b.startSec < Math.max(1.2, targetDurationSec - 0.55))
+          .map((b) => ({
+            timeSec: b.startSec,
+            style:
+              b.kind === 'payoff_reveal'
+                ? 'payoff'
+                : b.kind === 'twist_transition'
+                ? 'twist'
+                : b.kind === 'zoom_accent'
+                ? 'pop'
+                : 'whoosh',
+          }))
+      : beats
+          .map((b) => b.startSec)
+          .filter((t) => t > 0.9 && t < Math.max(1.2, targetDurationSec - 0.55))
+          .map((t, idx, arr) => ({
+            timeSec: t,
+            style: idx === arr.length - 1 ? 'payoff' : 'whoosh',
+          }));
 
-  cutTimes.forEach((cutSec, idx) => {
-    const isPayoff = idx === lastCutIdx;
-    // Short filtered rising whoosh leading into the beat cut (0.20s)
-    const whooshLen = Math.floor(0.2 * sampleRate);
-    const whooshStart = Math.max(0, Math.floor((cutSec - 0.12) * sampleRate));
-    let wPhase1 = 0;
-    let wPhase2 = 0;
-    for (let i = 0; i < whooshLen && whooshStart + i < len; i++) {
-      const u = i / whooshLen;
-      const env = Math.sin(Math.PI * u) * Math.sin(Math.PI * u);
-      const f1 = 180 + 520 * u * u;
-      const f2 = 340 + 880 * u;
-      wPhase1 += (2 * Math.PI * f1) / sampleRate;
-      wPhase2 += (2 * Math.PI * f2) / sampleRate;
-      const whoosh = (Math.sin(wPhase1) * 0.55 + Math.sin(wPhase2) * 0.35) * env * 0.055;
-      samples[whooshStart + i] += whoosh;
+  const minGapSec = targetDurationSec > 45 ? 3.2 : 1.4;
+  const cues: SfxCue[] = [];
+  for (let i = 0; i < rawCues.length; i++) {
+    const cue = rawCues[i];
+    const isPriority = cue.style === 'twist' || cue.style === 'payoff';
+    if (
+      cues.length === 0 ||
+      cue.timeSec - cues[cues.length - 1].timeSec >= minGapSec ||
+      isPriority
+    ) {
+      cues.push(cue);
+    }
+  }
+
+  cues.forEach((cue) => {
+    const isPayoff = cue.style === 'payoff';
+    const isTwist = cue.style === 'twist';
+
+    // Subtle rising cut whoosh on scene cuts, jump-trims, twists, and payoff
+    if (cue.style === 'whoosh' || isTwist || isPayoff) {
+      const whooshLen = Math.floor((isTwist ? 0.24 : 0.2) * sampleRate);
+      const whooshStart = Math.max(0, Math.floor((cue.timeSec - 0.12) * sampleRate));
+      const whooshGain = isTwist ? 0.068 : 0.055;
+      let wPhase1 = 0;
+      let wPhase2 = 0;
+      for (let i = 0; i < whooshLen && whooshStart + i < len; i++) {
+        const u = i / whooshLen;
+        const env = Math.sin(Math.PI * u) * Math.sin(Math.PI * u);
+        const f1 = 180 + 520 * u * u;
+        const f2 = 340 + 880 * u;
+        wPhase1 += (2 * Math.PI * f1) / sampleRate;
+        wPhase2 += (2 * Math.PI * f2) / sampleRate;
+        const whoosh = (Math.sin(wPhase1) * 0.55 + Math.sin(wPhase2) * 0.35) * env * whooshGain;
+        samples[whooshStart + i] += whoosh;
+      }
     }
 
-    // Crisp subtle pop accent right on the cut / payoff reveal (0.14s)
-    const popStart = Math.floor(cutSec * sampleRate);
+    // Crisp subtle pop accent on zoom accents, twists, cuts, and final payoff reveal
+    const popStart = Math.floor(cue.timeSec * sampleRate);
     const popLen = Math.floor(0.14 * sampleRate);
-    const popFreq = isPayoff ? 240 : 196;
-    const popGain = isPayoff ? 0.09 : 0.065;
+    const popFreq = isPayoff ? 248 : isTwist ? 224 : 196;
+    const popGain = isPayoff ? 0.092 : isTwist ? 0.08 : cue.style === 'pop' ? 0.072 : 0.058;
     for (let i = 0; i < popLen && popStart + i < len; i++) {
       const t = i / sampleRate;
       const env = Math.min(1, t / 0.008) * Math.exp(-t * 20);
@@ -168,7 +208,88 @@ function mixProceduralCreatorSfx(
         popGain;
       samples[popStart + i] += pop;
     }
+
+    // Subtle secondary sub-impact on mid-video twist_transition
+    if (isTwist) {
+      const subLen = Math.floor(0.2 * sampleRate);
+      let sPhase = 0;
+      for (let i = 0; i < subLen && popStart + i < len; i++) {
+        const t = i / sampleRate;
+        const freq = 86 * Math.exp(-(i / subLen) * 0.8) + 40;
+        sPhase += (2 * Math.PI * freq) / sampleRate;
+        const env = Math.min(1, t / 0.01) * Math.exp(-t * 13);
+        samples[popStart + i] += Math.sin(sPhase) * env * 0.095;
+      }
+    }
   });
+}
+
+/**
+ * Trims interior dead-air pauses (>0.36s silence) down to a crisp 0.14s natural breath
+ * with a smooth 12ms crossfade so narration flows tightly without clicks or lost words.
+ */
+function tightenDeadAirPauses(
+  samples: Float32Array,
+  sampleRate: number
+): Float32Array<ArrayBuffer> {
+  const winLen = Math.max(64, Math.floor(sampleRate * 0.02));
+  const maxPauseWindows = Math.max(1, Math.round(0.36 / 0.02));
+  const keepPauseWindows = Math.max(1, Math.round(0.14 / 0.02));
+  const xfadeSamples = Math.min(Math.floor(sampleRate * 0.012), Math.floor(winLen * 0.6));
+  const totalWindows = Math.ceil(samples.length / winLen);
+  if (totalWindows <= maxPauseWindows + 2) {
+    const copy = new Float32Array(new ArrayBuffer(samples.length * 4));
+    copy.set(samples);
+    return copy;
+  }
+
+  const isSilent = new Uint8Array(totalWindows);
+  for (let w = 0; w < totalWindows; w++) {
+    const s0 = w * winLen;
+    const s1 = Math.min(samples.length, s0 + winLen);
+    let sumSq = 0;
+    for (let i = s0; i < s1; i++) {
+      const v = samples[i];
+      sumSq += v * v;
+    }
+    const rms = Math.sqrt(sumSq / Math.max(1, s1 - s0));
+    isSilent[w] = rms < 0.0055 ? 1 : 0;
+  }
+
+  const keptRanges: [number, number][] = [];
+  let w = 0;
+  while (w < totalWindows) {
+    if (isSilent[w] === 0) {
+      const startW = w;
+      while (w < totalWindows && isSilent[w] === 0) w++;
+      keptRanges.push([startW * winLen, Math.min(samples.length, w * winLen)]);
+    } else {
+      const startW = w;
+      while (w < totalWindows && isSilent[w] === 1) w++;
+      const runLen = w - startW;
+      const keepW = runLen > maxPauseWindows ? keepPauseWindows : runLen;
+      keptRanges.push([startW * winLen, Math.min(samples.length, (startW + keepW) * winLen)]);
+    }
+  }
+
+  const totalOut = keptRanges.reduce((acc, [a, b]) => acc + Math.max(0, b - a), 0);
+  const out = new Float32Array(new ArrayBuffer(Math.max(1, totalOut) * 4));
+  let offset = 0;
+  for (let r = 0; r < keptRanges.length; r++) {
+    const [a, b] = keptRanges[r];
+    const sliceLen = b - a;
+    if (sliceLen <= 0) continue;
+    out.set(samples.subarray(a, b), offset);
+    if (r > 0 && offset > 0) {
+      const fade = Math.min(xfadeSamples, sliceLen, offset);
+      for (let f = 0; f < fade; f++) {
+        const gain = f / Math.max(1, fade);
+        out[offset + f] *= gain;
+      }
+    }
+    offset += sliceLen;
+  }
+  return out;
 }
 
 async function masterAndFitVoiceover(params: {
@@ -176,11 +297,12 @@ async function masterAndFitVoiceover(params: {
   targetDurationSec: number;
   voiceGender: VoiceGender;
   beats: ScriptBeat[];
+  pacingBeats?: PacingBeat[];
 }): Promise<AudioBuffer> {
-  const { rawBuffer, targetDurationSec, voiceGender, beats } = params;
+  const { rawBuffer, targetDurationSec, voiceGender, beats, pacingBeats } = params;
   const outSampleRate = 48000;
   const safeTargetDur = Math.max(1.5, targetDurationSec);
-  const speechBudgetSec = Math.max(1.2, safeTargetDur - 0.2);
+  const speechBudgetSec = Math.max(1.2, safeTargetDur - 0.28);
 
   const rawCh = rawBuffer.getChannelData(0);
   let firstActive = 0;
@@ -199,20 +321,29 @@ async function masterAndFitVoiceover(params: {
     }
   }
 
-  const trimmedLen = Math.max(1, lastActive - firstActive + 1);
+  const trimmedSlice = rawCh.subarray(firstActive, lastActive + 1);
+  const tightenedSamples = tightenDeadAirPauses(trimmedSlice, rawBuffer.sampleRate);
+  const trimmedLen = Math.max(1, tightenedSamples.length);
   const trimmedDurSec = trimmedLen / rawBuffer.sampleRate;
 
-  // Keep brisk, punchy viral creator pacing (~1.12x–1.22x effective tempo) synced cleanly
-  // to the trimmed clip duration so delivery hits hard without clipping words or losing clarity.
+  // Keep brisk, punchy creator pacing (~1.12x–1.22x normally) synced cleanly to any clip duration
+  // (short OR 1-2+ minute explainers): gently speeds up to 1.32x only if needed to prevent cutting
+  // off the closing payoff, and eases down to 1.04x on long-form explainers if speech is shorter.
   const fitRate = trimmedDurSec / speechBudgetSec;
-  const playbackRate = Math.max(1.12, Math.min(1.22, Math.max(1.15, fitRate)));
+  const minRate = safeTargetDur > 45 && fitRate < 1.12 ? 1.04 : 1.12;
+  const maxRate = fitRate > 1.22 ? Math.min(1.32, fitRate) : 1.22;
+  const desiredRate =
+    safeTargetDur > 45 && fitRate < 1.14
+      ? Math.max(minRate, fitRate)
+      : Math.max(1.15, fitRate);
+  const playbackRate = Math.max(minRate, Math.min(maxRate, desiredRate));
 
   // Lock mastered buffer length strictly to the edited clip duration (exact 1:1 visual sync)
   const totalOutSamples = Math.ceil(safeTargetDur * outSampleRate);
 
   const offlineCtx = new OfflineAudioContext(1, totalOutSamples, outSampleRate);
   const trimmedBuf = offlineCtx.createBuffer(1, trimmedLen, rawBuffer.sampleRate);
-  trimmedBuf.copyToChannel(rawCh.subarray(firstActive, lastActive + 1), 0);
+  trimmedBuf.copyToChannel(tightenedSamples, 0);
 
   const src = offlineCtx.createBufferSource();
   src.buffer = trimmedBuf;
@@ -275,8 +406,8 @@ async function masterAndFitVoiceover(params: {
   const rendered = await offlineCtx.startRendering();
 
   const data = rendered.getChannelData(0);
-  // Layer subtle procedural creator SFX (hook hit, beat cut whoosh, payoff pop) beneath voiceover
-  mixProceduralCreatorSfx(data, outSampleRate, beats, safeTargetDur);
+  // Layer subtle procedural creator SFX (hook hit, beat cut whoosh, pop accents) aligned to timeline beats
+  mixProceduralCreatorSfx(data, outSampleRate, beats, safeTargetDur, pacingBeats);
 
   let peak = 0;
   for (let i = 0; i < data.length; i++) {
@@ -308,7 +439,8 @@ async function masterAndFitVoiceover(params: {
 function createAudibleFallbackTrack(
   targetDurationSec: number,
   beats: ScriptBeat[],
-  voiceGender: VoiceGender
+  voiceGender: VoiceGender,
+  pacingBeats?: PacingBeat[]
 ): AudioBuffer {
   const sampleRate = 48000;
   const safeTargetDur = Math.max(1.5, targetDurationSec);
@@ -323,7 +455,12 @@ function createAudibleFallbackTrack(
   const rootHz = voiceGender === 'female' ? 146.83 : 110.0; // D3 / A2 warm cinema root
   const fifthHz = rootHz * 1.498;
   const fadeSamples = Math.min(Math.floor(sampleRate * 0.14), Math.floor(totalSamples / 4));
-  const beatStarts = beats.length > 0 ? beats.map((b) => b.startSec) : [0, safeTargetDur * 0.45];
+  const beatStarts =
+    pacingBeats && pacingBeats.length > 0
+      ? pacingBeats.map((b) => b.startSec)
+      : beats.length > 0
+      ? beats.map((b) => b.startSec)
+      : [0, safeTargetDur * 0.45];
 
   for (let i = 0; i < totalSamples; i++) {
     const t = i / sampleRate;
@@ -351,8 +488,8 @@ function createAudibleFallbackTrack(
     ch[i] = Math.max(-0.45, Math.min(0.45, sample));
   }
 
-  // Add subtle hook sub-hit, cut whooshes, and payoff pop accents to the fallback bed too
-  mixProceduralCreatorSfx(ch, sampleRate, beats, safeTargetDur);
+  // Add subtle hook sub-hit, cut whooshes, and payoff pop accents aligned to timeline pacing beats
+  mixProceduralCreatorSfx(ch, sampleRate, beats, safeTargetDur, pacingBeats);
   for (let i = 0; i < totalSamples; i++) {
     ch[i] = Math.max(-0.65, Math.min(0.65, ch[i]));
   }
@@ -363,7 +500,7 @@ function createAudibleFallbackTrack(
 function fetchWithTimeout(
   url: string,
   init: RequestInit,
-  timeoutMs = 35000
+  timeoutMs = 60000
 ): Promise<Response> {
   const controller = new AbortController();
   const parentSignal = init.signal;
@@ -377,9 +514,87 @@ function fetchWithTimeout(
   });
 }
 
+function splitScriptIntoTtsChapters(
+  scriptText: string,
+  maxWordsPerChunk = 85
+): string[] {
+  const clean = scriptText.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  const totalWords = clean.split(/\s+/).length;
+  if (totalWords <= maxWordsPerChunk + 15) return [clean];
+
+  const sentences = clean
+    .split(/(?<=[.!?।])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (sentences.length <= 1) return [clean];
+
+  const chunks: string[] = [];
+  let current = '';
+  let currentWords = 0;
+
+  for (const sentence of sentences) {
+    const sWords = sentence.split(/\s+/).filter(Boolean).length;
+    if (current && currentWords + sWords > maxWordsPerChunk) {
+      chunks.push(current.trim());
+      current = sentence;
+      currentWords = sWords;
+    } else {
+      current = current ? `${current} ${sentence}` : sentence;
+      currentWords += sWords;
+    }
+  }
+  if (current.trim()) {
+    chunks.push(current.trim());
+  }
+  return chunks.length > 0 ? chunks : [clean];
+}
+
+function concatAudioBuffers(
+  buffers: AudioBuffer[],
+  pauseSec = 0.14
+): AudioBuffer {
+  if (buffers.length === 1) return buffers[0];
+  const targetRate = buffers[0].sampleRate || 24000;
+  const pauseSamples = Math.max(0, Math.round(pauseSec * targetRate));
+
+  const resampledParts: Float32Array[] = buffers.map((buf) => {
+    const src = buf.getChannelData(0);
+    if (buf.sampleRate === targetRate) return src;
+    const ratio = buf.sampleRate / targetRate;
+    const outLen = Math.max(1, Math.round(src.length / ratio));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      out[i] = src[Math.min(src.length - 1, Math.floor(i * ratio))];
+    }
+    return out;
+  });
+
+  const totalSamples =
+    resampledParts.reduce((acc, p) => acc + p.length, 0) +
+    pauseSamples * Math.max(0, resampledParts.length - 1);
+
+  const combined = new AudioBuffer({
+    length: Math.max(1, totalSamples),
+    numberOfChannels: 1,
+    sampleRate: targetRate,
+  });
+  const dst = combined.getChannelData(0);
+  let cursor = 0;
+  resampledParts.forEach((part, idx) => {
+    dst.set(part, cursor);
+    cursor += part.length;
+    if (idx < resampledParts.length - 1) {
+      cursor += pauseSamples;
+    }
+  });
+  return combined;
+}
+
 export function createGuaranteedFallbackVoice(params: {
   scriptText: string;
   beats: ScriptBeat[];
+  pacingBeats?: PacingBeat[];
   language: OutputLanguage;
   voiceGender: VoiceGender;
   targetDurationSec: number;
@@ -389,7 +604,8 @@ export function createGuaranteedFallbackVoice(params: {
   const audioBuffer = createAudibleFallbackTrack(
     alignedDurSec,
     params.beats,
-    params.voiceGender
+    params.voiceGender,
+    params.pacingBeats
   );
   const pcmSamples = new Float32Array(audioBuffer.getChannelData(0));
   const wordTimings = alignCaptionsOffline({
@@ -447,6 +663,7 @@ export function stopBrowserSpeech(): void {
 export async function synthesizeCommandingVoiceover(params: {
   scriptText: string;
   beats: ScriptBeat[];
+  pacingBeats?: PacingBeat[];
   language: OutputLanguage;
   voiceGender: VoiceGender;
   targetDurationSec: number;
@@ -456,6 +673,7 @@ export async function synthesizeCommandingVoiceover(params: {
   const {
     scriptText,
     beats,
+    pacingBeats,
     language,
     voiceGender,
     targetDurationSec,
@@ -481,11 +699,15 @@ export async function synthesizeCommandingVoiceover(params: {
       : 'Bold, confident, fast-paced, emotional, suspenseful adult American male viral Shorts & Reels creator (age 32-44). Deep authoritative baritone; slam the opening 2 seconds with urgent suspense, keep brisk punchy pacing with emotional vocal dynamics on every twist and reveal. Never slow, dull, flat, robotic, or childish.';
 
   if (health.geminiConfigured) {
-    onStatus?.(
-      `Synthesizing powerful natural ${voiceGender === 'female' ? 'Female (Kore)' : 'Male (Fenrir)'} voiceover via Gemini 3.8 Flash TTS...`
-    );
+    const voiceLabel = voiceGender === 'female' ? 'Female (Kore)' : 'Male (Fenrir)';
+    const ttsChapters = splitScriptIntoTtsChapters(scriptText, 85);
+    const chapterBuffers: AudioBuffer[] = [];
+    let lastTtsModel = 'gemini-3.8-flash-tts';
+    let lastFailReason = '';
 
-    try {
+    const synthesizeSingleGeminiChapter = async (
+      chapterText: string
+    ): Promise<{ buffer: AudioBuffer; modelUsed: string } | null> => {
       if (health.backendAvailable) {
         const resp = await fetchWithTimeout(
           '/api/gemini/tts',
@@ -494,12 +716,12 @@ export async function synthesizeCommandingVoiceover(params: {
             headers: { 'Content-Type': 'application/json' },
             signal,
             body: JSON.stringify({
-              scriptText,
+              scriptText: chapterText,
               styleDesc,
               voiceName,
             }),
           },
-          35000
+          60000
         );
 
         if (resp.ok) {
@@ -509,21 +731,26 @@ export async function synthesizeCommandingVoiceover(params: {
             modelUsed?: string;
           };
           if (data.audioBase64) {
-            rawBuffer = await decodeTtsAudioToBuffer({
+            const decoded = await decodeTtsAudioToBuffer({
               audioBase64: data.audioBase64,
               mimeType: data.mimeType || 'audio/wav',
             });
-            voiceEngine = `${data.modelUsed || 'gemini-3.8-flash-tts'} (${voiceName}) + Studio EQ`;
-            voiceSource = 'Gemini-TTS';
+            return {
+              buffer: decoded,
+              modelUsed: data.modelUsed || 'gemini-3.8-flash-tts',
+            };
           }
         } else {
-          voiceEngine =
+          lastFailReason =
             resp.status === 429
               ? 'Cinema Audio Bed (Gemini TTS Quota Fallback)'
               : `Cinema Audio Bed (Gemini TTS HTTP ${resp.status})`;
         }
-      } else if (staticEnv.geminiApiKey) {
-        // Static GitHub Pages direct Gemini TTS call (1 call, bounded timeout, zero 429 retries)
+        return null;
+      }
+
+      if (staticEnv.geminiApiKey) {
+        // Static GitHub Pages direct Gemini TTS call (bounded timeout, zero 429 retries)
         const requestStaticTts = (modelId: string) =>
           fetchWithTimeout(
             `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
@@ -543,7 +770,7 @@ export async function synthesizeCommandingVoiceover(params: {
                           language === 'hi' ? 'Hindi' : 'American English'
                         } adult ${
                           voiceGender === 'female' ? 'female' : 'male'
-                        } creator (brisk energetic tempo, never slow or flat): ${scriptText}`,
+                        } creator (brisk energetic tempo, never slow or flat): ${chapterText}`,
                       },
                     ],
                   },
@@ -558,7 +785,7 @@ export async function synthesizeCommandingVoiceover(params: {
                 },
               }),
             },
-            35000
+            60000
           );
 
         let usedTtsModel = 'gemini-3.8-flash-tts';
@@ -580,19 +807,52 @@ export async function synthesizeCommandingVoiceover(params: {
             (p) => p.inlineData?.data
           );
           if (audioPart?.inlineData?.data) {
-            rawBuffer = await decodeTtsAudioToBuffer({
+            const decoded = await decodeTtsAudioToBuffer({
               audioBase64: audioPart.inlineData.data,
               mimeType: audioPart.inlineData.mimeType || 'audio/wav',
             });
-            voiceEngine = `${usedTtsModel} (${voiceName}) + Studio EQ`;
-            voiceSource = 'Gemini-TTS';
+            return { buffer: decoded, modelUsed: usedTtsModel };
           }
         } else {
-          voiceEngine =
+          lastFailReason =
             resp.status === 429
               ? 'Cinema Audio Bed (Gemini TTS Quota Fallback)'
               : `Cinema Audio Bed (Gemini TTS HTTP ${resp.status})`;
         }
+      }
+      return null;
+    };
+
+    try {
+      for (let idx = 0; idx < ttsChapters.length; idx++) {
+        if (signal?.aborted) {
+          throw new DOMException('TTS cancelled', 'AbortError');
+        }
+        onStatus?.(
+          ttsChapters.length > 1
+            ? `Synthesizing part ${idx + 1}/${ttsChapters.length} of ${voiceLabel} voiceover via Gemini 3.8 Flash TTS...`
+            : `Synthesizing powerful natural ${voiceLabel} voiceover via Gemini 3.8 Flash TTS...`
+        );
+        const chapterResult = await synthesizeSingleGeminiChapter(ttsChapters[idx]);
+        if (!chapterResult) {
+          // Stop on first rate-limit/error so we never hammer quota on long scripts
+          break;
+        }
+        chapterBuffers.push(chapterResult.buffer);
+        lastTtsModel = chapterResult.modelUsed;
+      }
+
+      if (chapterBuffers.length === ttsChapters.length && chapterBuffers.length > 0) {
+        rawBuffer = concatAudioBuffers(chapterBuffers, 0.14);
+        voiceEngine = `${lastTtsModel} (${voiceName}) + Studio EQ`;
+        voiceSource = 'Gemini-TTS';
+      } else if (chapterBuffers.length > 0) {
+        // Keep whatever chapters succeeded rather than dropping to empty audio
+        rawBuffer = concatAudioBuffers(chapterBuffers, 0.14);
+        voiceEngine = `${lastTtsModel} (${voiceName}) + Studio EQ`;
+        voiceSource = 'Gemini-TTS';
+      } else if (lastFailReason) {
+        voiceEngine = lastFailReason;
       }
     } catch (err) {
       if (signal?.aborted) throw err;
@@ -614,6 +874,7 @@ export async function synthesizeCommandingVoiceover(params: {
         targetDurationSec,
         voiceGender,
         beats,
+        pacingBeats,
       });
     } catch {
       masteredBuffer = rawBuffer;
@@ -624,7 +885,12 @@ export async function synthesizeCommandingVoiceover(params: {
     onStatus?.(
       `Synthesizing clean cinema audio bed (${targetDurationSec.toFixed(1)}s)...`
     );
-    masteredBuffer = createAudibleFallbackTrack(targetDurationSec, beats, voiceGender);
+    masteredBuffer = createAudibleFallbackTrack(
+      targetDurationSec,
+      beats,
+      voiceGender,
+      pacingBeats
+    );
     voiceSource = 'Browser-Speech';
     if (!voiceEngine) {
       voiceEngine = 'Cinema Audio Bed (Gemini TTS Unavailable)';

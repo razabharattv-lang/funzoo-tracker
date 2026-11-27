@@ -2,6 +2,8 @@ import { analyzeVideoTimelineLocally } from './offlineModels';
 import { PIPELINE_15_WORKER_MODELS } from './modelRouter';
 import { buildDefaultViralSegments } from './streamResolver';
 import type {
+  PacingBeat,
+  PacingBeatKind,
   PreparedVisualClip,
   SafeCropInsets,
   SourceMediaItem,
@@ -29,7 +31,7 @@ function ensureTopCornerMasks(
   clipDur: number
 ): WatermarkZone[] {
   const dur = Number(Math.max(1, clipDur).toFixed(2));
-  const outroStart = Number(Math.max(0, dur - 0.8).toFixed(2));
+  const outroStart = Number(Math.max(0, dur - 1.4).toFixed(2));
   const defaults: WatermarkZone[] = [
     {
       id: 'wm_top_left_cover',
@@ -51,7 +53,7 @@ function ensureTopCornerMasks(
       id: 'wm_bottom_right_badge',
       startSec: 0,
       endSec: dur,
-      box: [0.68, 0.87, 1.0, 0.99],
+      box: [0.66, 0.85, 1.0, 1.0],
       action: 'gpu_delogo_patch',
       label: 'Bottom-right creator badge patch',
     },
@@ -59,9 +61,17 @@ function ensureTopCornerMasks(
       id: 'wm_outro_tail_badge',
       startSec: outroStart,
       endSec: dur,
-      box: [0.0, 0.85, 0.36, 0.99],
+      box: [0.0, 0.84, 0.38, 1.0],
       action: 'gpu_delogo_patch',
       label: 'Outro tail bottom-left badge patch',
+    },
+    {
+      id: 'wm_outro_top_tag',
+      startSec: outroStart,
+      endSec: dur,
+      box: [0.28, 0.0, 0.72, 0.1],
+      action: 'gpu_delogo_patch',
+      label: 'Outro tail top creator tag patch',
     },
   ];
 
@@ -110,6 +120,140 @@ function sanitizeWatermarkZones(
     });
 }
 
+function normalizePacingBeats(
+  rawBeats: PacingBeat[] | undefined,
+  clipDur: number,
+  climaxRelSec: number
+): PacingBeat[] {
+  const safeDur = Number(Math.max(1.5, clipDur).toFixed(2));
+  const chainContinuity = (beats: PacingBeat[]): PacingBeat[] => {
+    const out: PacingBeat[] = [];
+    for (let i = 0; i < beats.length; i++) {
+      const curr = { ...beats[i] };
+      if (i > 0) {
+        const prev = out[i - 1];
+        curr.startSec = prev.endSec;
+        // Preserve visual continuity across connected narrative beats while allowing crisp motivated framing shifts on cuts
+        const isHardCut =
+          curr.kind === 'clean_cut' ||
+          curr.kind === 'jump_trim_pause' ||
+          curr.kind === 'twist_transition';
+        const maxZoomStep = isHardCut ? 0.045 : 0.022;
+        curr.zoomFrom = Number(
+          clamp(
+            curr.zoomFrom,
+            Math.max(1.03, prev.zoomTo - maxZoomStep),
+            Math.min(1.12, prev.zoomTo + maxZoomStep)
+          ).toFixed(3)
+        );
+        curr.zoomTo = Number(clamp(curr.zoomTo, 1.03, 1.13).toFixed(3));
+        // Keep consecutive pans gentle and alternating smoothly through frame center
+        curr.panX = Number(clamp(curr.panX, -0.009, 0.009).toFixed(4));
+        curr.panY = Number(clamp(curr.panY, -0.007, 0.006).toFixed(4));
+      }
+      out.push(curr);
+    }
+    if (out.length > 0) {
+      out[0].startSec = 0;
+      out[out.length - 1].endSec = safeDur;
+    }
+    return out;
+  };
+
+  if (Array.isArray(rawBeats) && rawBeats.length >= 2) {
+    const bounded: PacingBeat[] = [];
+    let cursor = 0;
+    for (let i = 0; i < rawBeats.length; i++) {
+      const b = rawBeats[i];
+      const startSec = Number(Math.max(cursor, clamp(b.startSec, 0, safeDur - 0.3)).toFixed(2));
+      const endSec =
+        i === rawBeats.length - 1
+          ? safeDur
+          : Number(clamp(b.endSec, startSec + 0.35, safeDur).toFixed(2));
+      if (endSec - startSec < 0.2) continue;
+      bounded.push({
+        ...b,
+        startSec,
+        endSec,
+        zoomFrom: clamp(b.zoomFrom, 1.03, 1.12),
+        zoomTo: clamp(b.zoomTo, 1.03, 1.13),
+        panX: clamp(b.panX, -0.009, 0.009),
+        panY: clamp(b.panY, -0.007, 0.006),
+        transitionFlash: clamp(b.transitionFlash, 0, 0.14),
+      });
+      cursor = endSec;
+      if (cursor >= safeDur - 0.05) break;
+    }
+    if (bounded.length >= 2) {
+      return chainContinuity(bounded);
+    }
+  }
+
+  // Synthesize varied multi-beat scene plan preserving full duration when scan beats are unavailable
+  const beatCount =
+    safeDur <= 16
+      ? 3
+      : safeDur <= 45
+      ? 5
+      : Math.max(7, Math.min(18, Math.round(safeDur / 9.5)));
+  const hookEnd = Number(Math.min(safeDur * 0.3, safeDur > 45 ? 3.0 : 2.2).toFixed(2));
+  const payoffStart = Number(
+    Math.max(hookEnd + 0.8, safeDur - Math.min(9.0, Math.max(2.2, safeDur * 0.13))).toFixed(2)
+  );
+  const middleCount = Math.max(1, beatCount - 2);
+  const middleSpan = (payoffStart - hookEnd) / middleCount;
+  const cycleKinds: PacingBeatKind[] = ['clean_cut', 'zoom_accent', 'jump_trim_pause'];
+
+  const out: PacingBeat[] = [
+    {
+      startSec: 0,
+      endSec: hookEnd,
+      kind: 'hook_impact',
+      zoomFrom: 1.09,
+      zoomTo: 1.045,
+      panX: 0,
+      panY: -0.005,
+      transitionFlash: 0.11,
+      motionIntensity: 0.75,
+    },
+  ];
+
+  for (let m = 0; m < middleCount; m++) {
+    const bStart = Number((hookEnd + m * middleSpan).toFixed(2));
+    const bEnd = Number((m === middleCount - 1 ? payoffStart : hookEnd + (m + 1) * middleSpan).toFixed(2));
+    const isClimax = climaxRelSec >= bStart && climaxRelSec <= bEnd;
+    const kind: PacingBeatKind = isClimax
+      ? 'twist_transition'
+      : cycleKinds[m % cycleKinds.length];
+    const pullOut = kind === 'zoom_accent' && m % 2 === 1;
+    out.push({
+      startSec: bStart,
+      endSec: bEnd,
+      kind,
+      zoomFrom: kind === 'jump_trim_pause' ? 1.075 : pullOut ? 1.095 : 1.045,
+      zoomTo: kind === 'twist_transition' ? 1.125 : kind === 'jump_trim_pause' ? 1.11 : pullOut ? 1.045 : 1.095,
+      panX: m % 2 === 0 ? 0.008 : -0.008,
+      panY: m % 3 === 0 ? 0.004 : -0.004,
+      transitionFlash: kind === 'twist_transition' ? 0.13 : kind === 'clean_cut' ? 0.06 : 0.04,
+      motionIntensity: isClimax ? 0.9 : 0.45,
+    });
+  }
+
+  out.push({
+    startSec: payoffStart,
+    endSec: safeDur,
+    kind: 'payoff_reveal',
+    zoomFrom: 1.055,
+    zoomTo: 1.115,
+    panX: 0,
+    panY: 0.004,
+    transitionFlash: 0.12,
+    motionIntensity: 0.8,
+  });
+
+  return chainContinuity(out);
+}
+
 async function seekVideo(video: HTMLVideoElement, timeSec: number): Promise<void> {
   const maxT = Math.max(0, (video.duration || timeSec + 0.1) - 0.06);
   const clamped = clamp(timeSec, 0, maxT);
@@ -125,7 +269,7 @@ async function seekVideo(video: HTMLVideoElement, timeSec: number): Promise<void
       video.onseeked = null;
       resolve();
     };
-    const timer = window.setTimeout(done, 2000);
+    const timer = window.setTimeout(done, 4500);
     video.onseeked = () => {
       window.clearTimeout(timer);
       done();
@@ -139,7 +283,7 @@ async function seekVideo(video: HTMLVideoElement, timeSec: number): Promise<void
   });
   if (video.readyState < 2 || video.videoWidth <= 0) {
     await new Promise<void>((resolve) => {
-      const deadline = Date.now() + 1000;
+      const deadline = Date.now() + 2000;
       const poll = window.setInterval(() => {
         if ((video.readyState >= 2 && video.videoWidth > 0) || Date.now() >= deadline) {
           window.clearInterval(poll);
@@ -147,6 +291,96 @@ async function seekVideo(video: HTMLVideoElement, timeSec: number): Promise<void
         }
       }, 35);
     });
+  }
+}
+
+/**
+ * Conservatively detects dark/blank or frozen intro dead-air (up to 0.85s) at the start
+ * of clips >= 6s so videos hook immediately without truncating real visual action.
+ */
+async function detectLeadingDeadAirSec(
+  source: SourceMediaItem,
+  totalDur: number
+): Promise<number> {
+  if (totalDur < 6 || typeof document === 'undefined') return 0;
+  const probeTimes = [0.02, 0.25, 0.5, 0.78];
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.style.position = 'fixed';
+  video.style.left = '-9999px';
+  video.style.width = '2px';
+  video.style.height = '2px';
+  video.style.opacity = '0.001';
+  if (document.body) document.body.appendChild(video);
+  video.src = source.objectUrl;
+
+  try {
+    if (video.readyState < 2 || video.videoWidth <= 0) {
+      await new Promise<void>((resolve) => {
+        const timer = window.setTimeout(resolve, 4000);
+        const ready = () => {
+          if (video.readyState >= 2 && video.videoWidth > 0) {
+            window.clearTimeout(timer);
+            resolve();
+          }
+        };
+        video.onloadeddata = ready;
+        video.oncanplay = ready;
+        video.onerror = () => {
+          window.clearTimeout(timer);
+          resolve();
+        };
+        video.load();
+      });
+    }
+    if (video.readyState < 2 || video.videoWidth <= 0) return 0;
+
+    const cw = 48;
+    const ch = 48;
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return 0;
+
+    let trimTo = 0;
+    for (let i = 0; i < probeTimes.length; i++) {
+      await seekVideo(video, probeTimes[i]);
+      if (video.readyState < 2 || video.videoWidth <= 0) break;
+      ctx.drawImage(video, 0, 0, cw, ch);
+      const data = ctx.getImageData(0, 0, cw, ch).data;
+      let sumLuma = 0;
+      let sumSq = 0;
+      const n = cw * ch;
+      for (let p = 0; p < data.length; p += 4) {
+        const l = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+        sumLuma += l;
+        sumSq += l * l;
+      }
+      const meanLuma = sumLuma / n;
+      const stdLuma = Math.sqrt(Math.max(0, sumSq / n - meanLuma * meanLuma));
+      // Blank/black fade-in or flat solid card has very low brightness or near-zero texture variance
+      if (meanLuma < 14 || stdLuma < 4.5) {
+        trimTo = Math.min(0.85, probeTimes[i] + 0.14);
+      } else {
+        break;
+      }
+    }
+    return Number(trimTo.toFixed(2));
+  } catch {
+    return 0;
+  } finally {
+    video.onloadeddata = null;
+    video.oncanplay = null;
+    video.onerror = null;
+    video.onseeked = null;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    if (video.parentNode) video.parentNode.removeChild(video);
   }
 }
 
@@ -158,7 +392,8 @@ async function buildStampedContactSheet(params: {
 }): Promise<{ jpegBase64: string; timestampsSec: number[] }> {
   const { source, startSec, endSec, crop } = params;
   const clipDur = Math.max(1, endSec - startSec);
-  const cols = 3;
+  // Sample 12 frames (4x3) for 1-2+ minute explainers and 9 frames (3x3) for shorter clips
+  const cols = clipDur > 45 ? 4 : 3;
   const rows = 3;
   const totalTiles = cols * rows;
   const timestampsSec: number[] = [];
@@ -195,7 +430,7 @@ async function buildStampedContactSheet(params: {
       await new Promise<void>((resolve, reject) => {
         const timer = window.setTimeout(
           () => reject(new Error('Timed out extracting keyframes for contact sheet.')),
-          22000
+          45000
         );
         const onReady = () => {
           if (video.readyState >= 2 && video.videoWidth > 0) {
@@ -217,9 +452,9 @@ async function buildStampedContactSheet(params: {
 
     const vw = video.videoWidth || source.width || 1080;
     const vh = video.videoHeight || source.height || 1920;
-    // Match exact 9:16 edited vertical framing (3x3 = 9 frames) so Step 3 sees full scene progression
-    const tileW = 216;
-    const tileH = 384;
+    // Match exact 9:16 edited vertical framing (3x3 or 4x3) so Step 3 sees full scene progression
+    const tileW = cols === 4 ? 192 : 216;
+    const tileH = cols === 4 ? 340 : 384;
     const canvas = document.createElement('canvas');
     canvas.width = cols * tileW;
     canvas.height = rows * tileH;
@@ -244,7 +479,7 @@ async function buildStampedContactSheet(params: {
         coverSx = sx + Math.round((sw - coverSw) / 2);
       } else {
         coverSh = Math.round(sw / dstAspect);
-        coverSy = sy + Math.round((sh - coverSh) / 2);
+        coverSy = sy + Math.round((sh - coverSh) * 0.45);
       }
 
       for (let i = 0; i < totalTiles; i++) {
@@ -261,7 +496,7 @@ async function buildStampedContactSheet(params: {
         if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
           try {
             ctx.save();
-            ctx.filter = 'contrast(1.18) saturate(1.24) brightness(1.04)';
+            ctx.filter = 'contrast(1.12) saturate(1.14) brightness(1.035)';
             ctx.drawImage(video, coverSx, coverSy, coverSw, coverSh, dx, dy, tileW, tileH);
             ctx.restore();
           } catch {
@@ -326,34 +561,47 @@ export async function inspectAndSliceSegmentsStep1(params: {
     const usableEnd = Number(Math.max(2, totalDur - outroTrim).toFixed(2));
     const safeCrop = clampSafeCrop(scan.suggestedSafeCropInsets);
 
-    const segments: ViralSegment[] = scan.highActionWindows.map((win, idx) => {
-      const isShortSingleClip = totalDur <= 20 && scan.highActionWindows.length === 1;
-      const rawStart = isShortSingleClip ? 0 : win.startSec;
-      const rawEnd = isShortSingleClip ? usableEnd : win.endSec;
-      const startSec = Number(clamp(rawStart, 0, usableEnd - 1.2).toFixed(2));
-      const endSec = Number(clamp(rawEnd, startSec + 1.2, usableEnd).toFixed(2));
-      const climaxSec = Number(clamp(win.climaxSec, startSec, endSec).toFixed(2));
-      const clipZones = sanitizeWatermarkZones(
-        scan.detectedWatermarkZones,
-        startSec,
-        endSec
-      );
+    // Preserve the full intended edited duration (short clips OR 1-2+ minute explainers)
+    // while cleanly trimming leading black/blank intro dead-air (capped at 0.85s) so hooks hit immediately.
+    const primaryWin = scan.highActionWindows[0];
+    const detectedIntroDeadAir = await detectLeadingDeadAirSec(source, totalDur);
+    const rawStartSec = Math.max(primaryWin?.startSec ?? 0, detectedIntroDeadAir);
+    const startSec = Number(clamp(rawStartSec, 0, Math.max(0, usableEnd - 1.2)).toFixed(2));
+    const endSec = Number(clamp(usableEnd, startSec + 1.2, totalDur).toFixed(2));
+    const climaxSec = Number(
+      clamp(primaryWin?.climaxSec ?? startSec + (endSec - startSec) * 0.45, startSec, endSec).toFixed(2)
+    );
+    const clipZones = sanitizeWatermarkZones(
+      scan.detectedWatermarkZones,
+      startSec,
+      endSec
+    );
 
-      return {
-        clipIndex: idx + 1,
+    const editedDur = Math.max(1.2, endSec - startSec);
+    const relSceneCuts = scan.sceneCutTimestampsSec
+      .map((t) => Number((t - startSec).toFixed(2)))
+      .filter((t) => t > 0.5 && t < editedDur - 0.5);
+    const pacingBeats = normalizePacingBeats(
+      scan.pacingBeats,
+      editedDur,
+      Math.max(0, climaxSec - startSec)
+    );
+
+    const segments: ViralSegment[] = [
+      {
+        clipIndex: 1,
         startSec,
         endSec,
         climaxSec,
-        reason:
-          scan.highActionWindows.length === 1
-            ? `Full edited clip (${(endSec - startSec).toFixed(1)}s, outro trimmed ${outroTrim.toFixed(1)}s) with peak action at ${climaxSec.toFixed(1)}s`
-            : `High-retention clip ${idx + 1} (${(endSec - startSec).toFixed(1)}s) centered on peak action at ${climaxSec.toFixed(1)}s`,
+        reason: `Full edited explainer (${editedDur.toFixed(1)}s, ${pacingBeats.length} pacing beats, outro trimmed ${outroTrim.toFixed(1)}s) with peak action at ${climaxSec.toFixed(1)}s`,
         trimRange: { startSec, endSec },
         safeCropInsets: safeCrop,
         watermarkZones: clipZones,
         visualSummary: scan.visualSummary,
-      };
-    });
+        sceneCutTimestampsSec: relSceneCuts,
+        pacingBeats,
+      },
+    ];
 
     if (segments.length > 0) {
       return {
@@ -362,39 +610,12 @@ export async function inspectAndSliceSegmentsStep1(params: {
       };
     }
   } catch {
-    // Fall back to clean multi-clip (>45s) or tight outro-trimmed single clip (<=45s)
+    // Fall back to full-duration outro-trimmed clip with zero artificial duration cap
   }
 
   const totalDur = Math.max(1, source.durationSec);
   const fallbackOutroTrim = totalDur >= 6 ? 1.35 : 0;
   const fallbackUsableEnd = Number(Math.max(2, totalDur - fallbackOutroTrim).toFixed(2));
-
-  if (totalDur > 45) {
-    const clipCount = totalDur <= 135 ? 2 : 3;
-    const span = fallbackUsableEnd / clipCount;
-    const targetLen =
-      totalDur <= 135
-        ? Math.min(65, Math.max(22, span * 0.9))
-        : Math.min(120, Math.max(45, span * 0.85));
-    const safeCrop = clampSafeCrop({ top: 0, bottom: 0, left: 0, right: 0 });
-    return {
-      segments: Array.from({ length: clipCount }, (_, i) => {
-        const startSec = Number((i * span).toFixed(2));
-        const endSec = Number(Math.min(fallbackUsableEnd, startSec + targetLen).toFixed(2));
-        return {
-          clipIndex: i + 1,
-          startSec,
-          endSec,
-          climaxSec: Number((startSec + (endSec - startSec) * 0.45).toFixed(2)),
-          reason: `High-retention story segment ${i + 1} of ${clipCount} (${(endSec - startSec).toFixed(1)}s)`,
-          trimRange: { startSec, endSec },
-          safeCropInsets: safeCrop,
-          watermarkZones: [],
-        };
-      }),
-      inspectorModel: `Direct Slicer (${PIPELINE_15_WORKER_MODELS.step1[1]} role)`,
-    };
-  }
 
   const defaultSegs = buildDefaultViralSegments(source).map((seg) => {
     const endSec = Number(Math.min(seg.endSec, fallbackUsableEnd).toFixed(2));
@@ -462,6 +683,13 @@ export async function cleanAndGradeClipsStep2(params: {
       crop: safeCrop,
     });
 
+    const relClimaxSec = Number(clamp(seg.climaxSec - startSec, 0, lockedVisualDurationSec).toFixed(2));
+    const pacingBeats = normalizePacingBeats(
+      seg.pacingBeats,
+      lockedVisualDurationSec,
+      relClimaxSec
+    );
+
     prepared.push({
       clipIndex: seg.clipIndex,
       totalClips: segments.length,
@@ -470,7 +698,7 @@ export async function cleanAndGradeClipsStep2(params: {
       trimRange: { startSec, endSec },
       usableIntervals,
       lockedVisualDurationSec,
-      climaxSec: Number(clamp(seg.climaxSec - startSec, 0, lockedVisualDurationSec).toFixed(2)),
+      climaxSec: relClimaxSec,
       reason: seg.reason,
       safeCropInsets: safeCrop,
       watermarkZones: delogoZones,
@@ -481,6 +709,8 @@ export async function cleanAndGradeClipsStep2(params: {
       stampedTimestampsSec: timestampsSec,
       inspectorModel,
       visualSummary: seg.visualSummary,
+      sceneCutTimestampsSec: seg.sceneCutTimestampsSec ?? [],
+      pacingBeats,
     });
   }
 

@@ -86,11 +86,17 @@ export function probeVideoBlobToSource(params: {
 
     const timer = window.setTimeout(() => {
       fail('Timed out reading video metadata. Please try uploading the local video file directly.');
-    }, 15_000);
+    }, 45_000);
 
     video.onloadedmetadata = () => {
       // Handle WebM recordings that report Infinity until seeked
       if (video.duration === Infinity) {
+        const tryResolveDuration = () => {
+          if (Number.isFinite(video.duration) && video.duration > 0) {
+            finalize();
+          }
+        };
+        video.ondurationchange = tryResolveDuration;
         video.onseeked = () => {
           finalize();
         };

@@ -141,7 +141,12 @@ export async function probeStudioApiHealth(
   const staticEnv = getBuildRuntimeEnv();
 
   try {
-    const resp = await fetch('/api/health', { method: 'GET' });
+    const controller = new AbortController();
+    const timer = globalThis.setTimeout(() => controller.abort(), 3500);
+    const resp = await fetch('/api/health', {
+      method: 'GET',
+      signal: controller.signal,
+    }).finally(() => globalThis.clearTimeout(timer));
     const contentType = resp.headers.get('content-type') ?? '';
     if (resp.ok && contentType.includes('application/json')) {
       const data = (await resp.json()) as {
@@ -510,7 +515,7 @@ export async function runSingleClipAiRequest(params: {
           { role: 'user', content: userContent },
         ],
         temperature: 0.35,
-        max_tokens: 1500,
+        max_tokens: 3200,
         response_format: { type: 'json_object' },
       }),
     });
