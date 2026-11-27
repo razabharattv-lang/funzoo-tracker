@@ -237,12 +237,73 @@ export interface SingleClipAiResult {
   keyMissing?: boolean;
   fallbackFromGemini?: 'Quota-Limit' | 'Fallback';
   errorReason?: string;
+  callsMade?: number;
+}
+
+export interface RunQuotaStats {
+  llmCallsMade: number;
+  ttsCallsMade: number;
+  quotaExhausted: boolean;
+  quotaReason: string | null;
+}
+
+let runQuotaState: RunQuotaStats = {
+  llmCallsMade: 0,
+  ttsCallsMade: 0,
+  quotaExhausted: false,
+  quotaReason: null,
+};
+
+export function resetRunQuotaGuard(): void {
+  runQuotaState = {
+    llmCallsMade: 0,
+    ttsCallsMade: 0,
+    quotaExhausted: false,
+    quotaReason: null,
+  };
+}
+
+export function isRunQuotaExhausted(): boolean {
+  return runQuotaState.quotaExhausted;
+}
+
+export function markRunQuotaExhausted(reason = 'Daily API quota reached (HTTP 429)'): void {
+  runQuotaState.quotaExhausted = true;
+  if (!runQuotaState.quotaReason) {
+    runQuotaState.quotaReason = reason;
+  }
+}
+
+export function recordRunTtsCall(): void {
+  runQuotaState.ttsCallsMade += 1;
+}
+
+export function getRunQuotaStats(): RunQuotaStats {
+  return { ...runQuotaState };
+}
+
+function fetchWithBoundedTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 25000
+): Promise<Response> {
+  const controller = new AbortController();
+  const parentSignal = init.signal;
+  const onParentAbort = () => controller.abort();
+  parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+  const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+
+  return fetch(url, { ...init, signal: controller.signal }).finally(() => {
+    globalThis.clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', onParentAbort);
+  });
 }
 
 /**
- * STRICT 1-CALL QUOTA GUARDRAIL:
- * Makes at most ONE primary AI request per clip.
- * Never loops across multiple models and never auto-retries HTTP 429 errors.
+ * STRICT 1-CALL-PER-RUN QUOTA GUARDRAIL:
+ * Makes at most ONE external LLM/Vision API request per pipeline run with a 25s timeout.
+ * Never retries HTTP 429, never loops across multiple models, and never cascades across
+ * providers after an error — immediately latches quota exhaustion to protect daily quota.
  */
 export async function runSingleClipAiRequest(params: {
   preference: AiEnginePreference;
@@ -252,12 +313,34 @@ export async function runSingleClipAiRequest(params: {
   signal?: AbortSignal;
 }): Promise<SingleClipAiResult | null> {
   const { preference, systemPrompt, userPrompt, imageBase64Jpeg, signal } = params;
+
+  if (runQuotaState.quotaExhausted) {
+    return {
+      rawText: '',
+      modelUsed: preference,
+      provider: 'none',
+      quotaExhausted: true,
+      callsMade: runQuotaState.llmCallsMade,
+      errorReason:
+        runQuotaState.quotaReason ??
+        'Daily API quota reached earlier in this run — skipped to protect quota',
+    };
+  }
+
+  if (runQuotaState.llmCallsMade >= 1) {
+    return {
+      rawText: '',
+      modelUsed: preference,
+      provider: 'none',
+      callsMade: runQuotaState.llmCallsMade,
+      errorReason: '1-call-per-run AI budget reached — continuing with local fallback',
+    };
+  }
+
   const health = await probeStudioApiHealth();
   const staticEnv = getBuildRuntimeEnv();
 
   let targetModel: AiEnginePreference = preference;
-  const allowCrossProviderFallback = preference === 'auto';
-  let fallbackFromGemini: 'Quota-Limit' | 'Fallback' | undefined;
   if (targetModel === 'auto') {
     if (health.geminiConfigured) {
       targetModel = 'gemini-3.8-flash';
@@ -270,19 +353,23 @@ export async function runSingleClipAiRequest(params: {
     }
   }
 
-  // PATH A: Gemini 3.8 Flash (server `/api/gemini/json` primary, or static GitHub Pages key when backend absent; 1 call max, zero 429 retries)
+  // PATH A: Gemini (strictly 1 single call via server `/api/gemini/json` or static key, zero retries)
   if (targetModel === 'gemini-3.8-flash') {
     if (!health.geminiConfigured) {
       return {
         rawText: '',
-        modelUsed: 'gemini-3.8-flash',
+        modelUsed: 'gemini-4-hydrogen',
         provider: 'gemini',
         keyMissing: true,
+        callsMade: 0,
         errorReason: 'GEMINI_API_KEY not configured',
       };
     }
 
+    runQuotaState.llmCallsMade += 1;
+
     if (!health.backendAvailable && staticEnv.geminiApiKey) {
+      const staticModelId = 'gemini-4-hydrogen';
       try {
         const parts: Record<string, unknown>[] = [{ text: userPrompt }];
         if (imageBase64Jpeg) {
@@ -291,180 +378,173 @@ export async function runSingleClipAiRequest(params: {
           });
         }
 
-        const callStaticGemini = (modelId: string) =>
-          fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
-              staticEnv.geminiApiKey
-            )}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              signal,
-              body: JSON.stringify({
-                systemInstruction: { parts: [{ text: systemPrompt }] },
-                contents: [{ role: 'user', parts }],
-                generationConfig: {
-                  responseMimeType: 'application/json',
-                },
-              }),
-            }
-          );
-
-        let usedStaticModel = 'gemini-4-hydrogen';
-        let resp = await callStaticGemini(usedStaticModel);
-        if (resp.status === 404) {
-          usedStaticModel = 'gemini-3.1-flash-lite';
-          resp = await callStaticGemini(usedStaticModel);
-        }
-        if (resp.status === 404) {
-          usedStaticModel = 'gemini-2.5-flash';
-          resp = await callStaticGemini(usedStaticModel);
-        }
+        const resp = await fetchWithBoundedTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${staticModelId}:generateContent?key=${encodeURIComponent(
+            staticEnv.geminiApiKey
+          )}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal,
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: systemPrompt }] },
+              contents: [{ role: 'user', parts }],
+              generationConfig: {
+                responseMimeType: 'application/json',
+              },
+            }),
+          },
+          25000
+        );
 
         if (!resp.ok) {
           const errText = await resp.text().catch(() => '');
           const quota = isQuotaOrRateLimitStatus(resp.status, errText);
-          if (allowCrossProviderFallback && health.nvidiaConfigured) {
-            fallbackFromGemini = quota ? 'Quota-Limit' : 'Fallback';
-            targetModel = imageBase64Jpeg
-              ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
-              : 'nvidia/nemotron-3.5-lightning-30b-a3b';
-          } else {
-            return {
-              rawText: '',
-              modelUsed: usedStaticModel,
-              provider: 'gemini',
-              quotaExhausted: quota,
-              errorReason: quota
-                ? 'Gemini 429 quota limit'
-                : `Gemini HTTP ${resp.status}`,
-            };
+          if (quota) {
+            markRunQuotaExhausted('Gemini 429 quota limit');
           }
-        } else {
-          const data = (await resp.json()) as {
-            candidates?: { content?: { parts?: { text?: string }[] } }[];
-          };
-          const rawText =
-            data.candidates?.[0]?.content?.parts
-              ?.map((p) => p.text ?? '')
-              .join('') ?? '';
-          return {
-            rawText,
-            modelUsed: usedStaticModel,
-            provider: 'gemini',
-          };
-        }
-      } catch (err) {
-        if ((err as Error).name === 'AbortError') throw err;
-        if (allowCrossProviderFallback && health.nvidiaConfigured) {
-          fallbackFromGemini = 'Fallback';
-          targetModel = imageBase64Jpeg
-            ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
-            : 'nvidia/nemotron-3.5-lightning-30b-a3b';
-        } else {
           return {
             rawText: '',
-            modelUsed: 'gemini-4-hydrogen',
+            modelUsed: staticModelId,
             provider: 'gemini',
-            errorReason: 'Gemini network unreachable',
+            quotaExhausted: quota,
+            callsMade: runQuotaState.llmCallsMade,
+            errorReason: quota
+              ? 'Gemini 429 quota limit (stopped further API calls)'
+              : `Gemini HTTP ${resp.status}`,
           };
         }
+
+        const data = (await resp.json()) as {
+          candidates?: { content?: { parts?: { text?: string }[] } }[];
+        };
+        const rawText =
+          data.candidates?.[0]?.content?.parts
+            ?.map((p) => p.text ?? '')
+            .join('') ?? '';
+        return {
+          rawText,
+          modelUsed: staticModelId,
+          provider: 'gemini',
+          callsMade: runQuotaState.llmCallsMade,
+        };
+      } catch (err) {
+        if (signal?.aborted && (err as Error).name === 'AbortError') throw err;
+        const timedOut = (err as Error).name === 'AbortError';
+        return {
+          rawText: '',
+          modelUsed: staticModelId,
+          provider: 'gemini',
+          callsMade: runQuotaState.llmCallsMade,
+          errorReason: timedOut
+            ? 'Gemini request timed out (25s)'
+            : 'Gemini network unreachable',
+        };
       }
     }
 
-    if (targetModel === 'gemini-3.8-flash') try {
-      const resp = await fetch('/api/gemini/json', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal,
-        body: JSON.stringify({
-          prompt: userPrompt,
-          systemInstruction: systemPrompt,
-          imageBase64Jpeg,
-        }),
-      });
+    try {
+      const resp = await fetchWithBoundedTimeout(
+        '/api/gemini/json',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: JSON.stringify({
+            prompt: userPrompt,
+            systemInstruction: systemPrompt,
+            imageBase64Jpeg,
+          }),
+        },
+        25000
+      );
 
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
         const quota = isQuotaOrRateLimitStatus(resp.status, errText);
-        if (allowCrossProviderFallback && health.nvidiaConfigured) {
-          fallbackFromGemini = quota ? 'Quota-Limit' : 'Fallback';
-          targetModel = imageBase64Jpeg
-            ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
-            : 'nvidia/nemotron-3.5-lightning-30b-a3b';
-        } else {
-          return {
-            rawText: '',
-            modelUsed: 'gemini-3.8-flash',
-            provider: 'gemini',
-            quotaExhausted: quota,
-            errorReason: quota ? 'Gemini 429 quota limit' : `Gemini HTTP ${resp.status}`,
-          };
+        if (quota) {
+          markRunQuotaExhausted('Gemini 429 quota limit');
         }
-      } else {
-        const payload = (await resp.json()) as {
-          parsed?: Record<string, unknown>;
-          text?: string;
-          modelUsed?: string;
-        };
-        const rawText = payload.parsed
-          ? JSON.stringify(payload.parsed)
-          : payload.text ?? '';
-
-        return {
-          rawText,
-          modelUsed: payload.modelUsed ?? 'gemini-3.8-flash',
-          provider: 'gemini',
-        };
-      }
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') throw err;
-      if (allowCrossProviderFallback && health.nvidiaConfigured) {
-        fallbackFromGemini = 'Fallback';
-        targetModel = imageBase64Jpeg
-          ? 'nvidia/nemotron-3.5-super-vl-120b-a12b'
-          : 'nvidia/nemotron-3.5-lightning-30b-a3b';
-      } else {
         return {
           rawText: '',
-          modelUsed: 'gemini-3.8-flash',
+          modelUsed: 'gemini-4-hydrogen',
           provider: 'gemini',
-          errorReason: 'Gemini network unreachable',
+          quotaExhausted: quota,
+          callsMade: runQuotaState.llmCallsMade,
+          errorReason: quota
+            ? 'Gemini 429 quota limit (stopped further API calls)'
+            : `Gemini HTTP ${resp.status}`,
         };
       }
+
+      const payload = (await resp.json()) as {
+        parsed?: Record<string, unknown>;
+        text?: string;
+        modelUsed?: string;
+      };
+      const rawText = payload.parsed
+        ? JSON.stringify(payload.parsed)
+        : payload.text ?? '';
+
+      return {
+        rawText,
+        modelUsed: payload.modelUsed ?? 'gemini-4-hydrogen',
+        provider: 'gemini',
+        callsMade: runQuotaState.llmCallsMade,
+      };
+    } catch (err) {
+      if (signal?.aborted && (err as Error).name === 'AbortError') throw err;
+      const timedOut = (err as Error).name === 'AbortError';
+      return {
+        rawText: '',
+        modelUsed: 'gemini-4-hydrogen',
+        provider: 'gemini',
+        callsMade: runQuotaState.llmCallsMade,
+        errorReason: timedOut
+          ? 'Gemini request timed out (25s)'
+          : 'Gemini network unreachable',
+      };
     }
   }
 
-  // PATH B: Configured NVIDIA NIM model (single call, zero 429 retries)
+  // PATH B: Configured NVIDIA NIM model (strictly 1 single call, 25s timeout, zero retries)
   if (health.backendAvailable && !health.nvidiaStaticKeyOnly) {
+    runQuotaState.llmCallsMade += 1;
     try {
-      const resp = await fetch('/api/nvidia/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal,
-        body: JSON.stringify({
-          model: targetModel,
-          systemPrompt,
-          userPrompt,
-          imageBase64Jpeg,
-        }),
-      });
+      const resp = await fetchWithBoundedTimeout(
+        '/api/nvidia/chat',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: JSON.stringify({
+            model: targetModel,
+            systemPrompt,
+            userPrompt,
+            imageBase64Jpeg,
+          }),
+        },
+        25000
+      );
 
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
         const quota = isQuotaOrRateLimitStatus(resp.status, errText);
+        if (quota) {
+          markRunQuotaExhausted('NVIDIA NIM 429 quota limit');
+        }
         return {
           rawText: '',
           modelUsed: targetModel,
           provider: 'nvidia',
           quotaExhausted: quota,
           keyMissing: resp.status === 503,
-          fallbackFromGemini,
+          callsMade: runQuotaState.llmCallsMade,
           errorReason:
             resp.status === 503
               ? 'NVIDIA_API_KEY missing on server'
               : quota
-              ? 'NVIDIA NIM 429 quota limit'
+              ? 'NVIDIA NIM 429 quota limit (stopped further API calls)'
               : `NVIDIA NIM HTTP ${resp.status}`,
         };
       }
@@ -477,16 +557,19 @@ export async function runSingleClipAiRequest(params: {
         rawText: data.parsed ? JSON.stringify(data.parsed) : '',
         modelUsed: data.modelUsed ?? targetModel,
         provider: 'nvidia',
-        fallbackFromGemini,
+        callsMade: runQuotaState.llmCallsMade,
       };
     } catch (err) {
-      if ((err as Error).name === 'AbortError') throw err;
+      if (signal?.aborted && (err as Error).name === 'AbortError') throw err;
+      const timedOut = (err as Error).name === 'AbortError';
       return {
         rawText: '',
         modelUsed: targetModel,
         provider: 'nvidia',
-        fallbackFromGemini,
-        errorReason: 'NVIDIA NIM proxy unreachable',
+        callsMade: runQuotaState.llmCallsMade,
+        errorReason: timedOut
+          ? 'NVIDIA NIM request timed out (25s)'
+          : 'NVIDIA NIM proxy unreachable',
       };
     }
   }
@@ -498,11 +581,12 @@ export async function runSingleClipAiRequest(params: {
       modelUsed: targetModel,
       provider: 'nvidia',
       keyMissing: true,
-      fallbackFromGemini,
+      callsMade: 0,
       errorReason: 'NVIDIA API key missing',
     };
   }
 
+  runQuotaState.llmCallsMade += 1;
   const isVisionModel =
     targetModel === 'nvidia/nemotron-3.5-super-vl-120b-a12b' ||
     targetModel === 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning' ||
@@ -519,35 +603,44 @@ export async function runSingleClipAiRequest(params: {
       : userPrompt;
 
   try {
-    const resp = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${staticEnv.nvidiaApiKey}`,
+    const resp = await fetchWithBoundedTimeout(
+      'https://integrate.api.nvidia.com/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${staticEnv.nvidiaApiKey}`,
+        },
+        signal,
+        body: JSON.stringify({
+          model: targetModel,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
+          ],
+          temperature: 0.35,
+          max_tokens: 3200,
+          response_format: { type: 'json_object' },
+        }),
       },
-      signal,
-      body: JSON.stringify({
-        model: targetModel,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userContent },
-        ],
-        temperature: 0.35,
-        max_tokens: 3200,
-        response_format: { type: 'json_object' },
-      }),
-    });
+      25000
+    );
 
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
       const quota = isQuotaOrRateLimitStatus(resp.status, errText);
+      if (quota) {
+        markRunQuotaExhausted('NVIDIA NIM 429 quota limit');
+      }
       return {
         rawText: '',
         modelUsed: targetModel,
         provider: 'nvidia',
         quotaExhausted: quota,
-        fallbackFromGemini,
-        errorReason: quota ? 'NVIDIA NIM 429 quota limit' : `NVIDIA NIM HTTP ${resp.status}`,
+        callsMade: runQuotaState.llmCallsMade,
+        errorReason: quota
+          ? 'NVIDIA NIM 429 quota limit (stopped further API calls)'
+          : `NVIDIA NIM HTTP ${resp.status}`,
       };
     }
 
@@ -558,17 +651,20 @@ export async function runSingleClipAiRequest(params: {
       rawText: data.choices?.[0]?.message?.content ?? '',
       modelUsed: targetModel,
       provider: 'nvidia',
-      fallbackFromGemini,
+      callsMade: runQuotaState.llmCallsMade,
     };
   } catch (err) {
-    if ((err as Error).name === 'AbortError') throw err;
+    if (signal?.aborted && (err as Error).name === 'AbortError') throw err;
+    const timedOut = (err as Error).name === 'AbortError';
     return {
       rawText: '',
       modelUsed: targetModel,
       provider: 'nvidia',
-      corsBlocked: true,
-      fallbackFromGemini,
-      errorReason: 'NVIDIA NIM CORS blocked in static browser',
+      corsBlocked: !timedOut,
+      callsMade: runQuotaState.llmCallsMade,
+      errorReason: timedOut
+        ? 'NVIDIA NIM request timed out (25s)'
+        : 'NVIDIA NIM CORS blocked in static browser',
     };
   }
 }

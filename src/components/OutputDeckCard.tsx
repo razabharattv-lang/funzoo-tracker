@@ -172,15 +172,34 @@ export function OutputDeckCard({
 
         <div className="flex items-center gap-2 flex-wrap">
           {activeClip && (
-            <span
-              className={`px-2.5 py-1 rounded-full border-2 text-[11px] font-extrabold whitespace-nowrap ${
-                activeClip.voiceSource === 'Gemini-TTS'
-                  ? 'border-[#00C853] bg-[#E8F9EE] text-[#065F46]'
-                  : 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]'
-              }`}
-            >
-              Voice: {activeClip.voiceSource}
-            </span>
+            <>
+              <span
+                title={
+                  activeClip.metadata.aiSourceMode === 'live'
+                    ? activeClip.metadata.scriptEngine
+                    : activeClip.metadata.aiFallbackReason ||
+                      activeClip.metadata.scriptEngine
+                }
+                className={`px-2.5 py-1 rounded-full border-2 text-[11px] font-extrabold whitespace-nowrap ${
+                  activeClip.metadata.aiSourceMode === 'live'
+                    ? 'border-[#00C853] bg-[#E8F9EE] text-[#065F46]'
+                    : 'border-[#F59E0B] bg-[#FFFBEB] text-[#92400E]'
+                }`}
+              >
+                {activeClip.metadata.aiSourceMode === 'live'
+                  ? 'AI Live Response'
+                  : 'Local Fallback'}
+              </span>
+              <span
+                className={`px-2.5 py-1 rounded-full border-2 text-[11px] font-extrabold whitespace-nowrap ${
+                  activeClip.voiceSource === 'Gemini-TTS'
+                    ? 'border-[#00C853] bg-[#E8F9EE] text-[#065F46]'
+                    : 'border-[#3D5AFE] bg-[#EEF2FF] text-[#1E3A8A]'
+                }`}
+              >
+                Voice: {activeClip.voiceSource}
+              </span>
+            </>
           )}
 
           {hasMultipleClips &&
@@ -355,7 +374,11 @@ export function OutputDeckCard({
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border-2 border-[#00C853] bg-[#00C853] hover:bg-[#00B248] text-white text-xs font-extrabold transition-colors disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap shrink-0"
               >
                 <Download className="w-4 h-4" strokeWidth={2.5} />
-                <span>Download MP4</span>
+                <span>
+                  {(activeClip.mimeType ?? '').includes('webm')
+                    ? 'Download WebM'
+                    : 'Download MP4'}
+                </span>
               </button>
             </div>
           </div>

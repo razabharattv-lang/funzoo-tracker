@@ -1,7 +1,11 @@
 import { alignCaptionsOffline } from './offlineModels';
 import {
+  isQuotaOrRateLimitStatus,
+  isRunQuotaExhausted,
+  markRunQuotaExhausted,
   PIPELINE_15_WORKER_MODELS,
   probeStudioApiHealth,
+  recordRunTtsCall,
 } from './modelRouter';
 import { getBuildRuntimeEnv } from '../lib/env';
 import type {
@@ -514,81 +518,21 @@ function fetchWithTimeout(
   });
 }
 
-function splitScriptIntoTtsChapters(
-  scriptText: string,
-  maxWordsPerChunk = 85
-): string[] {
-  const clean = scriptText.replace(/\s+/g, ' ').trim();
-  if (!clean) return [];
-  const totalWords = clean.split(/\s+/).length;
-  if (totalWords <= maxWordsPerChunk + 15) return [clean];
-
-  const sentences = clean
-    .split(/(?<=[.!?।])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (sentences.length <= 1) return [clean];
-
-  const chunks: string[] = [];
-  let current = '';
-  let currentWords = 0;
-
-  for (const sentence of sentences) {
-    const sWords = sentence.split(/\s+/).filter(Boolean).length;
-    if (current && currentWords + sWords > maxWordsPerChunk) {
-      chunks.push(current.trim());
-      current = sentence;
-      currentWords = sWords;
-    } else {
-      current = current ? `${current} ${sentence}` : sentence;
-      currentWords += sWords;
-    }
+function verifyAudiblePcmSamples(
+  samples: Float32Array,
+  durationSec: number
+): void {
+  if (!samples || samples.length === 0 || !Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new Error('Step 4 failed: generated audio track is empty (0 samples).');
   }
-  if (current.trim()) {
-    chunks.push(current.trim());
+  let peak = 0;
+  for (let i = 0; i < samples.length; i += 8) {
+    const a = Math.abs(samples[i]);
+    if (a > peak) peak = a;
   }
-  return chunks.length > 0 ? chunks : [clean];
-}
-
-function concatAudioBuffers(
-  buffers: AudioBuffer[],
-  pauseSec = 0.14
-): AudioBuffer {
-  if (buffers.length === 1) return buffers[0];
-  const targetRate = buffers[0].sampleRate || 24000;
-  const pauseSamples = Math.max(0, Math.round(pauseSec * targetRate));
-
-  const resampledParts: Float32Array[] = buffers.map((buf) => {
-    const src = buf.getChannelData(0);
-    if (buf.sampleRate === targetRate) return src;
-    const ratio = buf.sampleRate / targetRate;
-    const outLen = Math.max(1, Math.round(src.length / ratio));
-    const out = new Float32Array(outLen);
-    for (let i = 0; i < outLen; i++) {
-      out[i] = src[Math.min(src.length - 1, Math.floor(i * ratio))];
-    }
-    return out;
-  });
-
-  const totalSamples =
-    resampledParts.reduce((acc, p) => acc + p.length, 0) +
-    pauseSamples * Math.max(0, resampledParts.length - 1);
-
-  const combined = new AudioBuffer({
-    length: Math.max(1, totalSamples),
-    numberOfChannels: 1,
-    sampleRate: targetRate,
-  });
-  const dst = combined.getChannelData(0);
-  let cursor = 0;
-  resampledParts.forEach((part, idx) => {
-    dst.set(part, cursor);
-    cursor += part.length;
-    if (idx < resampledParts.length - 1) {
-      cursor += pauseSamples;
-    }
-  });
-  return combined;
+  if (peak < 0.0005) {
+    throw new Error('Step 4 failed: generated audio buffer is completely silent.');
+  }
 }
 
 export function createGuaranteedFallbackVoice(params: {
@@ -672,16 +616,23 @@ export async function synthesizeCommandingVoiceover(params: {
       ? 'Bold, confident, fast-paced, emotional, suspenseful adult American female viral Shorts & Reels creator (age 30-42). Rich resonant alto; hook hard in the first 2 seconds with urgent curiosity, keep crisp brisk momentum and dramatic intensity through every twist and payoff. Never slow, dull, flat, robotic, or childish.'
       : 'Bold, confident, fast-paced, emotional, suspenseful adult American male viral Shorts & Reels creator (age 32-44). Deep authoritative baritone; slam the opening 2 seconds with urgent suspense, keep brisk punchy pacing with emotional vocal dynamics on every twist and reveal. Never slow, dull, flat, robotic, or childish.';
 
-  if (health.geminiConfigured) {
+  const quotaAlreadyTripped = isRunQuotaExhausted();
+
+  if (health.geminiConfigured && !quotaAlreadyTripped) {
     const voiceLabel = voiceGender === 'female' ? 'Female (Kore)' : 'Male (Fenrir)';
-    const ttsChapters = splitScriptIntoTtsChapters(scriptText, 85);
-    const chapterBuffers: AudioBuffer[] = [];
-    let lastTtsModel = 'gemini-3.8-flash-tts';
+    const cleanScript = scriptText.replace(/\s+/g, ' ').trim();
     let lastFailReason = '';
 
-    const synthesizeSingleGeminiChapter = async (
-      chapterText: string
-    ): Promise<{ buffer: AudioBuffer; modelUsed: string } | null> => {
+    // Strictly 1 single Gemini TTS call per clip (never loops chapters or retries 429)
+    try {
+      if (signal?.aborted) {
+        throw new DOMException('TTS cancelled', 'AbortError');
+      }
+      onStatus?.(
+        `Synthesizing natural ${voiceLabel} voiceover via Gemini 3.8 Flash TTS (1 single call)...`
+      );
+      recordRunTtsCall();
+
       if (health.backendAvailable) {
         const resp = await fetchWithTimeout(
           '/api/gemini/tts',
@@ -690,12 +641,12 @@ export async function synthesizeCommandingVoiceover(params: {
             headers: { 'Content-Type': 'application/json' },
             signal,
             body: JSON.stringify({
-              scriptText: chapterText,
+              scriptText: cleanScript,
               styleDesc,
               voiceName,
             }),
           },
-          60000
+          45000
         );
 
         if (resp.ok) {
@@ -705,73 +656,60 @@ export async function synthesizeCommandingVoiceover(params: {
             modelUsed?: string;
           };
           if (data.audioBase64) {
-            const decoded = await decodeTtsAudioToBuffer({
+            rawBuffer = await decodeTtsAudioToBuffer({
               audioBase64: data.audioBase64,
               mimeType: data.mimeType || 'audio/wav',
             });
-            return {
-              buffer: decoded,
-              modelUsed: data.modelUsed || 'gemini-3.8-flash-tts',
-            };
+            voiceEngine = `${data.modelUsed || 'gemini-3.8-flash-tts'} (${voiceName}) + Studio EQ`;
+            voiceSource = 'Gemini-TTS';
           }
         } else {
-          lastFailReason =
-            resp.status === 429
-              ? 'Cinema Audio Bed (Gemini TTS Quota Fallback)'
-              : `Cinema Audio Bed (Gemini TTS HTTP ${resp.status})`;
+          const errText = await resp.text().catch(() => '');
+          const isQuota = isQuotaOrRateLimitStatus(resp.status, errText);
+          if (isQuota) {
+            markRunQuotaExhausted('Gemini TTS 429 quota limit');
+          }
+          lastFailReason = isQuota
+            ? 'Studio Cinema Audio (Gemini TTS 429 Quota Fallback)'
+            : `Studio Cinema Audio (Gemini TTS HTTP ${resp.status})`;
         }
-        return null;
-      }
-
-      if (staticEnv.geminiApiKey) {
-        // Static GitHub Pages direct Gemini TTS call (bounded timeout, zero 429 retries)
-        const requestStaticTts = (modelId: string) =>
-          fetchWithTimeout(
-            `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
-              staticEnv.geminiApiKey
-            )}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              signal,
-              body: JSON.stringify({
-                contents: [
-                  {
-                    role: 'user',
-                    parts: [
-                      {
-                        text: `Speak fast, bold, confident, emotional, and suspenseful like a top viral ${
-                          language === 'hi' ? 'Hindi' : 'American English'
-                        } adult ${
-                          voiceGender === 'female' ? 'female' : 'male'
-                        } creator (brisk energetic tempo, never slow or flat): ${chapterText}`,
-                      },
-                    ],
-                  },
-                ],
-                generationConfig: {
-                  responseModalities: ['AUDIO'],
-                  speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName },
+      } else if (staticEnv.geminiApiKey) {
+        const staticTtsModel = 'gemini-3.8-flash-tts';
+        const resp = await fetchWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${staticTtsModel}:generateContent?key=${encodeURIComponent(
+            staticEnv.geminiApiKey
+          )}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal,
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      text: `Speak fast, bold, confident, emotional, and suspenseful like a top viral ${
+                        language === 'hi' ? 'Hindi' : 'American English'
+                      } adult ${
+                        voiceGender === 'female' ? 'female' : 'male'
+                      } creator (brisk energetic tempo, never slow or flat): ${cleanScript}`,
                     },
+                  ],
+                },
+              ],
+              generationConfig: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName },
                   },
                 },
-              }),
-            },
-            60000
-          );
-
-        let usedTtsModel = 'gemini-3.8-flash-tts';
-        let resp = await requestStaticTts(usedTtsModel);
-        if (resp.status === 404) {
-          usedTtsModel = 'gemini-3.8-flash-lite-tts';
-          resp = await requestStaticTts(usedTtsModel);
-        }
-        if (resp.status === 404) {
-          usedTtsModel = 'gemini-2.5-flash-preview-tts';
-          resp = await requestStaticTts(usedTtsModel);
-        }
+              },
+            }),
+          },
+          45000
+        );
 
         if (resp.ok) {
           const data = (await resp.json()) as {
@@ -785,60 +723,37 @@ export async function synthesizeCommandingVoiceover(params: {
             (p) => p.inlineData?.data
           );
           if (audioPart?.inlineData?.data) {
-            const decoded = await decodeTtsAudioToBuffer({
+            rawBuffer = await decodeTtsAudioToBuffer({
               audioBase64: audioPart.inlineData.data,
               mimeType: audioPart.inlineData.mimeType || 'audio/wav',
             });
-            return { buffer: decoded, modelUsed: usedTtsModel };
+            voiceEngine = `${staticTtsModel} (${voiceName}) + Studio EQ`;
+            voiceSource = 'Gemini-TTS';
           }
         } else {
-          lastFailReason =
-            resp.status === 429
-              ? 'Cinema Audio Bed (Gemini TTS Quota Fallback)'
-              : `Cinema Audio Bed (Gemini TTS HTTP ${resp.status})`;
+          const errText = await resp.text().catch(() => '');
+          const isQuota = isQuotaOrRateLimitStatus(resp.status, errText);
+          if (isQuota) {
+            markRunQuotaExhausted('Gemini TTS 429 quota limit');
+          }
+          lastFailReason = isQuota
+            ? 'Studio Cinema Audio (Gemini TTS 429 Quota Fallback)'
+            : `Studio Cinema Audio (Gemini TTS HTTP ${resp.status})`;
         }
       }
-      return null;
-    };
 
-    try {
-      for (let idx = 0; idx < ttsChapters.length; idx++) {
-        if (signal?.aborted) {
-          throw new DOMException('TTS cancelled', 'AbortError');
-        }
-        onStatus?.(
-          ttsChapters.length > 1
-            ? `Synthesizing part ${idx + 1}/${ttsChapters.length} of ${voiceLabel} voiceover via Gemini 3.8 Flash TTS...`
-            : `Synthesizing powerful natural ${voiceLabel} voiceover via Gemini 3.8 Flash TTS...`
-        );
-        const chapterResult = await synthesizeSingleGeminiChapter(ttsChapters[idx]);
-        if (!chapterResult) {
-          // Stop on first rate-limit/error so we never hammer quota on long scripts
-          break;
-        }
-        chapterBuffers.push(chapterResult.buffer);
-        lastTtsModel = chapterResult.modelUsed;
-      }
-
-      if (chapterBuffers.length === ttsChapters.length && chapterBuffers.length > 0) {
-        rawBuffer = concatAudioBuffers(chapterBuffers, 0.14);
-        voiceEngine = `${lastTtsModel} (${voiceName}) + Studio EQ`;
-        voiceSource = 'Gemini-TTS';
-      } else if (chapterBuffers.length > 0) {
-        // Keep whatever chapters succeeded rather than dropping to empty audio
-        rawBuffer = concatAudioBuffers(chapterBuffers, 0.14);
-        voiceEngine = `${lastTtsModel} (${voiceName}) + Studio EQ`;
-        voiceSource = 'Gemini-TTS';
-      } else if (lastFailReason) {
+      if (!rawBuffer && lastFailReason) {
         voiceEngine = lastFailReason;
       }
     } catch (err) {
       if (signal?.aborted) throw err;
-      voiceEngine = 'Cinema Audio Bed (Gemini TTS Offline Fallback)';
+      voiceEngine = 'Studio Cinema Audio (Gemini TTS Timeout / Offline Fallback)';
     }
+  } else if (quotaAlreadyTripped) {
+    voiceEngine = 'Studio Cinema Audio (Skipped TTS to protect daily API quota)';
   } else {
     const primaryTtsModel = PIPELINE_15_WORKER_MODELS.step4[0];
-    voiceEngine = `Cinema Audio Bed (fallback for ${primaryTtsModel})`;
+    voiceEngine = `Studio Cinema Audio (fallback for ${primaryTtsModel})`;
   }
 
   let masteredBuffer: AudioBuffer | null = null;
@@ -876,7 +791,9 @@ export async function synthesizeCommandingVoiceover(params: {
   }
 
   const pcmSamples = new Float32Array(masteredBuffer.getChannelData(0));
-  const alignedDurSec = Math.max(1.5, targetDurationSec);
+  const alignedDurSec = Math.max(1.5, masteredBuffer.duration || targetDurationSec);
+  verifyAudiblePcmSamples(pcmSamples, alignedDurSec);
+
   const wordTimings = alignCaptionsOffline({
     audioBuffer: masteredBuffer,
     scriptText,

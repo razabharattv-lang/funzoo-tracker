@@ -25,7 +25,11 @@ import {
   inspectAndSliceSegmentsStep1,
 } from './engine/visualClipper';
 import { translateClipAndBuildSeoStep3 } from './engine/intelligenceEngine';
-import { probeInitialConnectionStatus } from './engine/modelRouter';
+import {
+  getRunQuotaStats,
+  probeInitialConnectionStatus,
+  resetRunQuotaGuard,
+} from './engine/modelRouter';
 import {
   createGuaranteedFallbackVoice,
   synthesizeCommandingVoiceover,
@@ -34,6 +38,8 @@ import { renderProductionMp4Gpu } from './engine/gpuRenderer';
 import { warmOfflineEngines } from './engine/offlineModels';
 import type {
   ConnectionStatusState,
+  DiagnosticLogEntry,
+  PipelineDiagnostics,
   PipelineProgress,
   PipelineStepId,
   RenderedClipOutput,
@@ -43,6 +49,29 @@ import type {
   TrendMetadata,
   YouTubeTrendVideo,
 } from './types/studio';
+
+function createEmptyDiagnostics(): PipelineDiagnostics {
+  return {
+    sourceDurationSec: null,
+    sourceResolution: null,
+    sourceSizeBytes: null,
+    step1FramesSampled: 0,
+    step2FramesRendered: 0,
+    contactSheetBytes: 0,
+    aiCallsMade: 0,
+    aiMode: 'pending',
+    aiModel: null,
+    aiNote: null,
+    audioDurationSec: null,
+    audioSampleRate: null,
+    audioSource: null,
+    outputBlobBytes: null,
+    outputMimeType: null,
+    outputDurationSec: null,
+    renderEngine: null,
+    stepLogs: [],
+  };
+}
 
 const INITIAL_PROGRESS: PipelineProgress = {
   status: 'idle',
@@ -54,6 +83,7 @@ const INITIAL_PROGRESS: PipelineProgress = {
   runTag: null,
   startedAtMs: null,
   errorMessage: null,
+  diagnostics: createEmptyDiagnostics(),
 };
 
 const INITIAL_CONTROLS: StudioControlsState = {
@@ -343,6 +373,9 @@ export function App() {
     abortRef.current = controller;
     const { signal } = controller;
 
+    // Reset per-run API quota guard (enforces strict 1-call LLM budget and zero 429 retries)
+    resetRunQuotaGuard();
+
     // Clear stale previous outputs atomically at run start so Output Deck always matches this run
     const runSeq = ++pipelineRunSeqRef.current;
     replaceRenderedClips([]);
@@ -351,6 +384,8 @@ export function App() {
     const runStartedAtMs = Date.now();
     const completedSteps: PipelineStepId[] = [];
     const outputs: RenderedClipOutput[] = [];
+    const diagnostics: PipelineDiagnostics = createEmptyDiagnostics();
+    let currentStepId: PipelineStepId = 'step_1_fetch_clip';
     let currentStepLabel = 'Step 1/5 (Fetch)';
     const stepLabels: Record<PipelineStepId, string> = {
       step_1_fetch_clip: 'Step 1/5 (Fetch)',
@@ -364,6 +399,18 @@ export function App() {
     const safePatchConnection = (patch: Partial<ConnectionStatusState>) => {
       if (isActiveRun()) patchConnectionStatus(patch);
     };
+    const cloneDiagnostics = (): PipelineDiagnostics => ({
+      ...diagnostics,
+      stepLogs: [...diagnostics.stepLogs],
+    });
+    const pushDiagLog = (
+      step: PipelineStepId,
+      message: string,
+      status: DiagnosticLogEntry['status'] = 'ok'
+    ) => {
+      const elapsedSec = Number(((Date.now() - runStartedAtMs) / 1000).toFixed(1));
+      diagnostics.stepLogs.push({ step, message, status, atSec: elapsedSec });
+    };
     const markStep = (
       activeStep: PipelineStepId,
       percent: number,
@@ -371,6 +418,7 @@ export function App() {
       clipProgressLabel: string | null = null
     ) => {
       if (!isActiveRun()) return;
+      currentStepId = activeStep;
       currentStepLabel = stepLabels[activeStep];
       setProgress({
         status: 'running',
@@ -382,6 +430,7 @@ export function App() {
         runTag,
         startedAtMs: runStartedAtMs,
         errorMessage: null,
+        diagnostics: cloneDiagnostics(),
       });
     };
 
@@ -422,7 +471,7 @@ export function App() {
         // Keep current status if health check unavailable
       }
 
-      // STEP 1: Fetch & Smart Clipping
+      // STEP 1: Fetch & Inspect (requires real playable video + decoded canvas frames)
       markStep('step_1_fetch_clip', 6, 'Step 1/5: Verifying source video and real duration...');
 
       let activeSource = sourceMedia;
@@ -436,25 +485,50 @@ export function App() {
           replaceSourceMedia(activeSource);
         } else {
           throw new Error(
-            'Please paste a valid video link or upload a local MP4/MOV/WebM file first.'
+            'No playable video is loaded. Upload a local MP4/MOV/WebM video file or paste a direct playable video link first.'
           );
         }
       }
 
+      if (
+        !activeSource ||
+        !Number.isFinite(activeSource.durationSec) ||
+        activeSource.durationSec <= 0 ||
+        activeSource.width <= 0 ||
+        activeSource.height <= 0 ||
+        activeSource.sizeBytes <= 0
+      ) {
+        throw new Error(
+          'Source video could not be decoded (invalid duration or resolution). Please upload a standard local H.264 MP4 or WebM file.'
+        );
+      }
+
+      diagnostics.sourceDurationSec = Number(activeSource.durationSec.toFixed(2));
+      diagnostics.sourceResolution = `${activeSource.width}×${activeSource.height}`;
+      diagnostics.sourceSizeBytes = activeSource.sizeBytes;
+
       if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
 
-      const { segments, inspectorModel } = await inspectAndSliceSegmentsStep1({
+      const { segments, inspectorModel, framesSampled } = await inspectAndSliceSegmentsStep1({
         source: activeSource,
         onProgress: (detail) =>
           markStep('step_1_fetch_clip', 16, `Step 1/5: ${detail}`),
       });
-      if (segments.length === 0) {
-        throw new Error('Step 1 returned no usable video segments to process.');
+      if (segments.length === 0 || framesSampled <= 0) {
+        throw new Error(
+          'Step 1 could not extract real frames from the source video. Please upload a standard local MP4 or WebM file.'
+        );
       }
 
+      diagnostics.step1FramesSampled = framesSampled;
+      pushDiagLog(
+        'step_1_fetch_clip',
+        `Verified ${activeSource.durationSec.toFixed(1)}s (${activeSource.width}×${activeSource.height}), sampled ${framesSampled} keyframes.`,
+        'ok'
+      );
       completedSteps.push('step_1_fetch_clip');
 
-      // STEP 2: Visual Clean & Grade
+      // STEP 2: Visual Clean & Grade (requires real drawn canvas tiles + verified JPEG contact sheet)
       markStep(
         'step_2_clean_grade',
         24,
@@ -470,16 +544,35 @@ export function App() {
       });
 
       if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-      if (preparedClips.length === 0) {
-        throw new Error('Step 2 failed to prepare vertical visual clips.');
+      if (
+        preparedClips.length === 0 ||
+        preparedClips.some((c) => c.framesSampled <= 0 || c.contactSheetBytes <= 500)
+      ) {
+        throw new Error(
+          'Step 2 failed to draw readable graded frames onto the canvas. Please re-upload a standard MP4/WebM file.'
+        );
       }
+
+      diagnostics.step2FramesRendered = preparedClips.reduce(
+        (acc, c) => acc + c.framesSampled,
+        0
+      );
+      diagnostics.contactSheetBytes = preparedClips.reduce(
+        (acc, c) => acc + c.contactSheetBytes,
+        0
+      );
+      pushDiagLog(
+        'step_2_clean_grade',
+        `Graded ${diagnostics.step2FramesRendered} vertical frames (contact sheet ${Math.round(diagnostics.contactSheetBytes / 1024)} KB).`,
+        'ok'
+      );
       completedSteps.push('step_2_clean_grade');
 
-      // STEP 3: Vision-to-Action + Niche YouTube Trends (1 single YouTube call on detected topic)
+      // STEP 3: Vision-to-Action + SEO (strictly max 1 external LLM/Vision API call per run)
       markStep(
         'step_3_translate_seo',
         40,
-        'Step 3/5: Inspecting video frames & fetching live US YouTube niche trends...'
+        'Step 3/5: Inspecting video frames & generating script + SEO metadata (1 API call max)...'
       );
 
       const activeYoutubeCtx = youtubeLinkContextRef.current;
@@ -526,12 +619,31 @@ export function App() {
         clipMetadataList.push(meta);
       }
 
-      if (clipMetadataList.length !== preparedClips.length) {
-        throw new Error('Step 3 script/SEO count did not match edited clips.');
+      if (
+        clipMetadataList.length !== preparedClips.length ||
+        clipMetadataList.some(
+          (m) => !m.voiceover.trim() || !m.title.trim() || !m.description.trim()
+        )
+      ) {
+        throw new Error('Step 3 failed to produce complete narration and SEO metadata.');
       }
+
+      const primaryMeta = clipMetadataList[0];
+      const quotaAfterStep3 = getRunQuotaStats();
+      diagnostics.aiCallsMade = quotaAfterStep3.llmCallsMade;
+      diagnostics.aiMode = primaryMeta.aiSourceMode === 'live' ? 'live' : 'fallback';
+      diagnostics.aiModel = primaryMeta.scriptEngine;
+      diagnostics.aiNote = primaryMeta.aiFallbackReason ?? null;
+      pushDiagLog(
+        'step_3_translate_seo',
+        diagnostics.aiMode === 'live'
+          ? `AI Live Response (${quotaAfterStep3.llmCallsMade} call · ${primaryMeta.scriptEngine}).`
+          : `Local Fallback (${quotaAfterStep3.llmCallsMade} call · ${primaryMeta.aiFallbackReason || 'No cloud response'}).`,
+        diagnostics.aiMode === 'live' ? 'ok' : 'warn'
+      );
       completedSteps.push('step_3_translate_seo');
 
-      // STEP 4: Commanding Voiceover (Gemini 3.8 Flash TTS + Studio Broadcast EQ & SFX)
+      // STEP 4: Commanding Voiceover (verified audible PCM audio track before Step 5)
       const voiceResults: Awaited<
         ReturnType<typeof synthesizeCommandingVoiceover>
       >[] = [];
@@ -562,7 +674,7 @@ export function App() {
           markStep(
             'step_4_voiceover',
             stepPct,
-            'Step 4/5: Cloud TTS unavailable — continuing with synthesized fallback audio...',
+            'Step 4/5: Cloud TTS unavailable — continuing with synthesized studio audio...',
             clipLabel
           );
           voice = createGuaranteedFallbackVoice({
@@ -576,6 +688,16 @@ export function App() {
           });
         }
 
+        if (
+          !voice ||
+          !Number.isFinite(voice.durationSec) ||
+          voice.durationSec <= 0 ||
+          !voice.pcmSamples ||
+          voice.pcmSamples.length === 0
+        ) {
+          throw new Error('Step 4 failed to synthesize a playable audio track.');
+        }
+
         safePatchConnection({ voice: voice.voiceSource });
         meta.wordTimings = voice.wordTimings;
         voiceResults.push(voice);
@@ -584,9 +706,19 @@ export function App() {
       if (voiceResults.length !== preparedClips.length) {
         throw new Error('Step 4 voiceover count did not match edited clips.');
       }
+
+      const primaryVoice = voiceResults[0];
+      diagnostics.audioDurationSec = primaryVoice.durationSec;
+      diagnostics.audioSampleRate = primaryVoice.sampleRate;
+      diagnostics.audioSource = primaryVoice.voiceEngine;
+      pushDiagLog(
+        'step_4_voiceover',
+        `Verified audio track (${primaryVoice.durationSec.toFixed(1)}s @ ${Math.round(primaryVoice.sampleRate / 1000)}kHz · ${primaryVoice.voiceSource}).`,
+        primaryVoice.voiceSource === 'Gemini-TTS' ? 'ok' : 'warn'
+      );
       completedSteps.push('step_4_voiceover');
 
-      // STEP 5: Fast, Phone-Safe Mux & Output Deck
+      // STEP 5: Fast, Phone-Safe Mux & Output Deck (verified playable Blob > 1 KB)
       for (let i = 0; i < preparedClips.length; i++) {
         if (!isActiveRun()) throw new DOMException('Cancelled', 'AbortError');
         const clip = preparedClips[i];
@@ -610,6 +742,12 @@ export function App() {
             markStep('step_5_mux_output', overallPct, `Step 5/5: ${detail}`, clipLabel);
           },
         });
+
+        if (!rendered.blob || rendered.blob.size <= 1024 || rendered.durationSec <= 0) {
+          throw new Error(
+            `Step 5 output validation failed (${rendered.blob?.size ?? 0} bytes). Please try Chrome or Safari desktop.`
+          );
+        }
 
         const videoUrl = URL.createObjectURL(rendered.blob);
         outputs.push({
@@ -645,6 +783,17 @@ export function App() {
       if (outputs.length === 0) {
         throw new Error('Step 5 produced no playable output clips.');
       }
+
+      const primaryOut = outputs[0];
+      diagnostics.outputBlobBytes = primaryOut.fileSizeBytes;
+      diagnostics.outputMimeType = primaryOut.mimeType;
+      diagnostics.outputDurationSec = primaryOut.durationSec;
+      diagnostics.renderEngine = primaryOut.renderEngine;
+      pushDiagLog(
+        'step_5_mux_output',
+        `Exported verified ${primaryOut.mimeType} (${(primaryOut.fileSizeBytes / (1024 * 1024)).toFixed(2)} MB, ${primaryOut.durationSec.toFixed(1)}s · ${primaryOut.renderEngine}).`,
+        'ok'
+      );
       completedSteps.push('step_5_mux_output');
       replaceRenderedClips(outputs);
 
@@ -664,11 +813,12 @@ export function App() {
         activeStep: null,
         completedSteps: [...completedSteps],
         percent: 100,
-        statusDetail: `Completed ${outputs.length} production clip${outputs.length > 1 ? 's' : ''} + 5 one-click SEO copy cards.`,
+        statusDetail: `Completed ${outputs.length} verified clip${outputs.length > 1 ? 's' : ''} + 5 one-click SEO copy cards.`,
         clipProgressLabel: `${outputs.length}/${outputs.length} Done`,
         runTag,
         startedAtMs: null,
         errorMessage: null,
+        diagnostics: cloneDiagnostics(),
       });
     } catch (err) {
       outputs.forEach((o) => safeRevokeObjectUrl(o.videoUrl));
@@ -678,11 +828,15 @@ export function App() {
       const formattedMsg = rawMsg.startsWith('Step ')
         ? rawMsg
         : `${currentStepLabel}: ${rawMsg}`;
+      pushDiagLog(currentStepId, formattedMsg, 'error');
       setProgress((prev) => ({
         ...prev,
         status: 'error',
+        activeStep: currentStepId,
+        completedSteps: [...completedSteps],
         statusDetail: `${currentStepLabel} failed — see details below.`,
         errorMessage: formattedMsg,
+        diagnostics: cloneDiagnostics(),
       }));
     } finally {
       if (typeof document !== 'undefined') {

@@ -1,6 +1,7 @@
 import {
   extractJsonObject,
   fetchYouTubeTrendsFromApi,
+  isRunQuotaExhausted,
   runSingleClipAiRequest,
 } from './modelRouter';
 import {
@@ -512,10 +513,14 @@ MANDATORY SCROLL-STOPPING HOOK, SCENE-BY-SCENE BREAKDOWN & VISUAL CONTINUITY RUL
 5. FULL-DURATION PACING FIT: Write ~${targetWordCount} crisp, energetic spoken words tailored for confident, engaging delivery so narration covers the entire ${targetDurSec.toFixed(1)}s timeline smoothly and finishes cleanly before ${maxSpeechSec.toFixed(1)}s.
 6. STRICT LANGUAGE LOCK: ${strictLanguageRule} Return complete, non-empty values for Title, Description, Tags, Hashtags, and Upload Time (EST/IST). Return ONLY valid JSON.`;
 
+  const visualSummaryText = clip.visualSummary
+    ? `${clip.visualSummary.orientation}, ${clip.visualSummary.pacing} pacing, ${clip.visualSummary.sceneCutCount} scene cuts, ${clip.visualSummary.lighting} lighting`
+    : 'vertical dynamic video';
+
   const userPrompt = `CLIP HINT: ${safeTopicHint}
 CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (edited duration: ${targetDurSec.toFixed(1)}s, ${frameCount} frame timestamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
 ORDERED SCENE & CAMERA PLAN: ${pacingSummaryCue}
-DETECTED VISUAL PACING: ${clip.visualSummary}
+DETECTED VISUAL PACING: ${visualSummaryText}
 OUTPUT LANGUAGE: ${languageName}
 KEY POINTS TO KEEP: ${customAngle.trim() || `Open 0-${hookEndSec}s with a sharp suspense curiosity hook tied strictly to Frame 1, follow the ORDERED SCENE & CAMERA PLAN with smooth visual continuity from scene to scene across all ${frameCount} frames, and land a crisp payoff at ${maxSpeechSec.toFixed(1)}s.`}
 
@@ -574,7 +579,7 @@ ${exampleBeatsJson}
     }
 
     let fallbackTrends = preloadedTrends;
-    if (allowYouTubeLookup && fallbackTrends.length === 0) {
+    if (allowYouTubeLookup && !isRunQuotaExhausted() && fallbackTrends.length === 0) {
       const fallbackQuery =
         extractReadableTopicFromLabel(sourceLabel, customAngle) ||
         (language === 'hi' ? 'viral shorts explainer hindi' : 'viral shorts explained');
@@ -722,6 +727,8 @@ ${exampleBeatsJson}
     hashtags: normalizeHashtags(customizedSeo.hashtags, offlineDefaults.hashtags),
     postingTime: ensurePopulatedField(customizedSeo.postingTime, offlineDefaults.postingTime, 8),
     scriptEngine: `${aiResponse.modelUsed}${detectedTopic ? ` · Topic: ${detectedTopic}` : ''}${activeTrends.length > 0 ? ` + YouTube US (${activeTrends.length})` : ''}`,
+    aiSourceMode: 'live',
+    aiFallbackReason: undefined,
     youtubeTrendsCount: activeTrends.length,
     fetchedTrends: activeTrends,
   };

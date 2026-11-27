@@ -1,11 +1,16 @@
+import { useState } from 'react';
 import {
+  Activity,
   AlertCircle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Circle,
   Loader2,
   Radio,
   Sparkles,
 } from 'lucide-react';
+import { formatBytes } from '../lib/videoProbe';
 import type {
   ConnectionStatusState,
   PipelineProgress,
@@ -25,6 +30,14 @@ const STEPS: { id: PipelineStepId; num: string; label: string }[] = [
   { id: 'step_5_mux_output', num: '5', label: 'Output' },
 ];
 
+const STEP_SHORT_NAME: Record<PipelineStepId, string> = {
+  step_1_fetch_clip: 'S1',
+  step_2_clean_grade: 'S2',
+  step_3_translate_seo: 'S3',
+  step_4_voiceover: 'S4',
+  step_5_mux_output: 'S5',
+};
+
 function pillStyle(value: string): string {
   if (value === 'Connected' || value === 'Gemini-TTS') {
     return 'border-[#00C853] bg-[#E8F9EE] text-[#065F46]';
@@ -42,7 +55,12 @@ export function CloudProgressBar({
   progress,
   connectionStatus,
 }: CloudProgressBarProps) {
+  const [diagExpanded, setDiagExpanded] = useState(false);
   const pct = Math.max(0, Math.min(100, Math.round(progress.percent)));
+  const diag = progress.diagnostics;
+  const hasDiagnostics =
+    diag.sourceDurationSec !== null || diag.stepLogs.length > 0;
+  const showDiagBody = diagExpanded || progress.status === 'error';
 
   const statusColor =
     progress.status === 'error'
@@ -67,6 +85,20 @@ export function CloudProgressBar({
     { label: 'Voice', value: connectionStatus.voice },
   ];
 
+  const aiModeLabel =
+    diag.aiMode === 'live'
+      ? `AI Live (${diag.aiCallsMade} call)`
+      : diag.aiMode === 'fallback'
+      ? `Local Fallback (${diag.aiCallsMade} call)`
+      : 'Pending';
+
+  const aiModeTone =
+    diag.aiMode === 'live'
+      ? 'text-[#065F46]'
+      : diag.aiMode === 'fallback'
+      ? 'text-[#B45309]'
+      : 'text-[#64748B]';
+
   return (
     <section
       aria-label="5-Step Production Pipeline Progress"
@@ -90,6 +122,22 @@ export function CloudProgressBar({
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          {hasDiagnostics && (
+            <button
+              type="button"
+              onClick={() => setDiagExpanded((prev) => !prev)}
+              aria-expanded={showDiagBody}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border-2 border-[#CBD5E1] bg-[#F4F6F9] hover:border-[#3D5AFE] text-[#334155] text-[11px] font-extrabold transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Activity className="w-3.5 h-3.5 text-[#3D5AFE]" strokeWidth={2.5} />
+              <span>Run Diagnostics</span>
+              {showDiagBody ? (
+                <ChevronUp className="w-3.5 h-3.5" strokeWidth={2.5} />
+              ) : (
+                <ChevronDown className="w-3.5 h-3.5" strokeWidth={2.5} />
+              )}
+            </button>
+          )}
           {progress.clipProgressLabel && (
             <span className="px-2.5 py-1 rounded-full border-2 border-[#3D5AFE] bg-[#EEF2FF] text-[#3D5AFE] text-xs font-extrabold font-mono-tabular">
               {progress.clipProgressLabel}
@@ -176,6 +224,77 @@ export function CloudProgressBar({
           className="rounded-xl border-2 border-[#FF1744] bg-[#FFF1F3] px-3.5 py-2.5 text-xs font-bold text-[#B71C1C]"
         >
           {progress.errorMessage}
+        </div>
+      )}
+
+      {/* Toggleable Compact Run Diagnostics Strip */}
+      {hasDiagnostics && showDiagBody && (
+        <div
+          aria-label="Run Diagnostics Details"
+          className="rounded-xl border-2 border-[#E2E8F0] bg-[#F4F6F9] p-3 space-y-2.5"
+        >
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px] font-mono-tabular">
+            <div className="rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5">
+              <div className="text-[10px] font-bold uppercase text-[#64748B]">Source</div>
+              <div className="font-extrabold text-[#0F172A] truncate">
+                {diag.sourceDurationSec !== null
+                  ? `${diag.sourceDurationSec.toFixed(1)}s · ${diag.sourceResolution || '—'}`
+                  : '—'}
+              </div>
+            </div>
+            <div className="rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5">
+              <div className="text-[10px] font-bold uppercase text-[#64748B]">Frames</div>
+              <div className="font-extrabold text-[#0F172A] truncate">
+                {diag.step1FramesSampled > 0
+                  ? `S1:${diag.step1FramesSampled} / S2:${diag.step2FramesRendered}`
+                  : '—'}
+              </div>
+            </div>
+            <div className="rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5">
+              <div className="text-[10px] font-bold uppercase text-[#64748B]">AI Mode</div>
+              <div className={`font-extrabold truncate ${aiModeTone}`}>
+                {aiModeLabel}
+              </div>
+            </div>
+            <div className="rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5">
+              <div className="text-[10px] font-bold uppercase text-[#64748B]">Audio</div>
+              <div className="font-extrabold text-[#0F172A] truncate">
+                {diag.audioDurationSec !== null
+                  ? `${diag.audioDurationSec.toFixed(1)}s`
+                  : '—'}
+              </div>
+            </div>
+            <div className="rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 col-span-2 sm:col-span-1">
+              <div className="text-[10px] font-bold uppercase text-[#64748B]">Output</div>
+              <div className="font-extrabold text-[#0F172A] truncate">
+                {diag.outputBlobBytes !== null
+                  ? `${formatBytes(diag.outputBlobBytes)}`
+                  : '—'}
+              </div>
+            </div>
+          </div>
+
+          {diag.stepLogs.length > 0 && (
+            <ul className="space-y-1 text-[11px] font-mono-tabular">
+              {diag.stepLogs.map((entry, idx) => (
+                <li
+                  key={`${entry.step}-${idx}`}
+                  className={`flex items-start gap-2 rounded-lg px-2 py-1 ${
+                    entry.status === 'error'
+                      ? 'bg-[#FFF1F3] text-[#B71C1C]'
+                      : entry.status === 'warn'
+                      ? 'bg-[#FFFBEB] text-[#92400E]'
+                      : 'bg-white text-[#334155]'
+                  }`}
+                >
+                  <span className="font-extrabold shrink-0">
+                    [{STEP_SHORT_NAME[entry.step]} · {entry.atSec.toFixed(1)}s]
+                  </span>
+                  <span className="font-semibold break-words">{entry.message}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
     </section>

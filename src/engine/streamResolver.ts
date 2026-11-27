@@ -3,7 +3,7 @@ import {
   YOUTUBE_DIRECT_FETCH_BLOCKED_MSG,
 } from '../lib/urlExtractor';
 import { probeVideoBlobToSource } from '../lib/videoProbe';
-import type { SourceMediaItem, ViralSegment } from '../types/studio';
+import type { SourceMediaItem } from '../types/studio';
 
 const DIRECT_VIDEO_EXT_RE = /\.(mp4|mov|webm|m4v)(\?.*)?$/i;
 
@@ -163,25 +163,4 @@ export async function resolveLinkToSourceMedia(params: {
     label,
     platform: extracted.platform,
   });
-}
-
-/**
- * Fallback segment builder preserving real video duration with zero artificial truncation.
- */
-export function buildDefaultViralSegments(source: SourceMediaItem): ViralSegment[] {
-  const duration = Math.max(1, source.durationSec);
-  const defaultCrop = { top: 0, bottom: 0, left: 0, right: 0 };
-
-  return [
-    {
-      clipIndex: 1,
-      startSec: 0,
-      endSec: Number(duration.toFixed(2)),
-      climaxSec: Number((duration * 0.45).toFixed(2)),
-      reason: 'Full source video preserved without artificial duration cap',
-      trimRange: { startSec: 0, endSec: Number(duration.toFixed(2)) },
-      safeCropInsets: defaultCrop,
-      watermarkZones: [],
-    },
-  ];
 }

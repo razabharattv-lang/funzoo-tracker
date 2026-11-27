@@ -78,6 +78,7 @@ export interface LocalSceneScanResult {
   hasOutroBumper: boolean;
   visualSummary?: ClipVisualSummary;
   pacingBeats?: PacingBeat[];
+  framesSampled: number;
 }
 
 export interface StudioControlsState {
@@ -166,6 +167,8 @@ export interface PreparedVisualClip {
   delogoZoneCount: number;
   stampedContactSheetJpeg: string;
   stampedTimestampsSec: number[];
+  framesSampled: number;
+  contactSheetBytes: number;
   inspectorModel: string;
   visualSummary?: ClipVisualSummary;
   sceneCutTimestampsSec?: number[];
@@ -191,6 +194,8 @@ export interface TrendMetadata {
   hashtags: string;
   postingTime: string;
   scriptEngine: string;
+  aiSourceMode?: 'live' | 'fallback';
+  aiFallbackReason?: string;
   youtubeTrendsCount: number;
 }
 
@@ -255,6 +260,34 @@ export interface RenderedClipOutput {
   metadata: TrendMetadata;
 }
 
+export interface DiagnosticLogEntry {
+  step: PipelineStepId;
+  message: string;
+  status: 'ok' | 'warn' | 'error';
+  atSec: number;
+}
+
+export interface PipelineDiagnostics {
+  sourceDurationSec: number | null;
+  sourceResolution: string | null;
+  sourceSizeBytes: number | null;
+  step1FramesSampled: number;
+  step2FramesRendered: number;
+  contactSheetBytes: number;
+  aiCallsMade: number;
+  aiMode: 'pending' | 'live' | 'fallback';
+  aiModel: string | null;
+  aiNote: string | null;
+  audioDurationSec: number | null;
+  audioSampleRate: number | null;
+  audioSource: string | null;
+  outputBlobBytes: number | null;
+  outputMimeType: string | null;
+  outputDurationSec: number | null;
+  renderEngine: string | null;
+  stepLogs: DiagnosticLogEntry[];
+}
+
 export interface PipelineProgress {
   status: 'idle' | 'running' | 'completed' | 'error' | 'cancelled';
   activeStep: PipelineStepId | null;
@@ -265,6 +298,7 @@ export interface PipelineProgress {
   runTag: string | null;
   startedAtMs: number | null;
   errorMessage: string | null;
+  diagnostics: PipelineDiagnostics;
 }
 
 export interface SavedRenderRecord {

@@ -262,26 +262,9 @@ export async function analyzeVideoTimelineLocally(
     canvas.height = sampleH;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) {
-      return {
-        sceneCutTimestampsSec: [],
-        highActionWindows: [
-          {
-            startSec: 0,
-            endSec: duration,
-            climaxSec: Number((duration * 0.45).toFixed(2)),
-            motionScore: 0.5,
-          },
-        ],
-        detectedWatermarkZones: [],
-        suggestedSafeCropInsets: { top: 0, bottom: 0, left: 0, right: 0 },
-        hasOutroBumper: false,
-        visualSummary: {
-          orientation,
-          pacing: 'dynamic',
-          sceneCutCount: 0,
-          lighting: 'cinematic',
-        },
-      };
+      throw new Error(
+        'Browser 2D Canvas is unavailable for video frame inspection. Try Chrome, Edge, or Safari with hardware acceleration enabled.'
+      );
     }
 
     const sampleCount =
@@ -358,6 +341,12 @@ export async function analyzeVideoTimelineLocally(
     if (video.parentNode) {
       video.parentNode.removeChild(video);
     }
+  }
+
+  if (frames.length === 0 || motionScores.length === 0) {
+    throw new Error(
+      'Could not extract any readable video frames from this source (codec unsupported or CORS-restricted). Please upload a standard local H.264 MP4 or WebM video file directly.'
+    );
   }
 
   const sceneCutTimestampsSec: number[] = [];
@@ -630,6 +619,7 @@ export async function analyzeVideoTimelineLocally(
     hasOutroBumper,
     visualSummary,
     pacingBeats,
+    framesSampled: frames.length,
   };
 }
 
@@ -1055,6 +1045,8 @@ export function generateOfflineDirectTranslationAndMetadata(params: {
     scriptEngine: fallbackReason
       ? `Offline Direct-Script Fallback (${fallbackReason})`
       : 'Offline Direct-Script Engine (0 Cloud Quota)',
+    aiSourceMode: 'fallback',
+    aiFallbackReason: fallbackReason ?? 'Local fallback engine (no external API response)',
     youtubeTrendsCount: trends.length,
   };
 }
