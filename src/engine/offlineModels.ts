@@ -209,8 +209,20 @@ export async function analyzeVideoTimelineLocally(
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
   video.preload = 'auto';
   video.crossOrigin = 'anonymous';
+  video.style.position = 'fixed';
+  video.style.left = '-9999px';
+  video.style.top = '0';
+  video.style.width = '2px';
+  video.style.height = '2px';
+  video.style.opacity = '0.001';
+  video.style.pointerEvents = 'none';
+  if (typeof document !== 'undefined' && document.body) {
+    document.body.appendChild(video);
+  }
   video.src = source.objectUrl;
 
   const frames: Uint8ClampedArray[] = [];
@@ -219,21 +231,29 @@ export async function analyzeVideoTimelineLocally(
   const sampleH = 90;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(
-        () => reject(new Error('Timed out while loading video frames for local inspection.')),
-        15000
-      );
-      video.onloadeddata = () => {
-        window.clearTimeout(timer);
-        resolve();
-      };
-      video.onerror = () => {
-        window.clearTimeout(timer);
-        reject(new Error('Browser could not decode this video file for frame inspection.'));
-      };
-      video.load();
-    });
+    if (video.readyState < 2 || video.videoWidth <= 0) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = window.setTimeout(
+          () => reject(new Error('Timed out while loading video frames for local inspection.')),
+          15000
+        );
+        const onReady = () => {
+          if (video.readyState >= 2 && video.videoWidth > 0) {
+            window.clearTimeout(timer);
+            video.onloadeddata = null;
+            video.oncanplay = null;
+            resolve();
+          }
+        };
+        video.onloadeddata = onReady;
+        video.oncanplay = onReady;
+        video.onerror = () => {
+          window.clearTimeout(timer);
+          reject(new Error('Browser could not decode this video file for frame inspection.'));
+        };
+        video.load();
+      });
+    }
 
     const canvas = document.createElement('canvas');
     canvas.width = sampleW;
@@ -263,11 +283,11 @@ export async function analyzeVideoTimelineLocally(
     }
 
     const sampleCount =
-      duration <= 30 ? 10 : duration <= 120 ? 16 : duration <= 600 ? 22 : 28;
+      duration <= 30 ? 12 : duration <= 120 ? 16 : duration <= 600 ? 22 : 28;
     const timestamps: number[] = [];
     for (let i = 0; i < sampleCount; i++) {
       const frac = i / Math.max(1, sampleCount - 1);
-      const t = Math.min(Math.max(0.15, frac * (duration - 0.25)), Math.max(0.15, duration - 0.15));
+      const t = Math.min(Math.max(0.12, frac * (duration - 0.2)), Math.max(0.12, duration - 0.12));
       timestamps.push(Number(t.toFixed(2)));
     }
 
@@ -294,6 +314,8 @@ export async function analyzeVideoTimelineLocally(
           done();
         }
       });
+
+      if (video.readyState < 2 || video.videoWidth <= 0) continue;
 
       try {
         ctx.drawImage(video, 0, 0, sampleW, sampleH);
@@ -325,11 +347,15 @@ export async function analyzeVideoTimelineLocally(
     }
   } finally {
     video.onloadeddata = null;
+    video.oncanplay = null;
     video.onerror = null;
     video.onseeked = null;
     video.pause();
     video.removeAttribute('src');
     video.load();
+    if (video.parentNode) {
+      video.parentNode.removeChild(video);
+    }
   }
 
   const sceneCutTimestampsSec: number[] = [];

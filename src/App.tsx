@@ -26,7 +26,10 @@ import {
 } from './engine/visualClipper';
 import { translateClipAndBuildSeoStep3 } from './engine/intelligenceEngine';
 import { probeInitialConnectionStatus } from './engine/modelRouter';
-import { synthesizeCommandingVoiceover } from './engine/audioEngine';
+import {
+  createGuaranteedFallbackVoice,
+  synthesizeCommandingVoiceover,
+} from './engine/audioEngine';
 import { renderProductionMp4Gpu } from './engine/gpuRenderer';
 import { warmOfflineEngines } from './engine/offlineModels';
 import type {
@@ -348,6 +351,14 @@ export function App() {
     const runStartedAtMs = Date.now();
     const completedSteps: PipelineStepId[] = [];
     const outputs: RenderedClipOutput[] = [];
+    let currentStepLabel = 'Step 1/5 (Fetch)';
+    const stepLabels: Record<PipelineStepId, string> = {
+      step_1_fetch_clip: 'Step 1/5 (Fetch)',
+      step_2_clean_grade: 'Step 2/5 (Clean)',
+      step_3_translate_seo: 'Step 3/5 (Translate)',
+      step_4_voiceover: 'Step 4/5 (Voice)',
+      step_5_mux_output: 'Step 5/5 (Output)',
+    };
     const markStep = (
       activeStep: PipelineStepId,
       percent: number,
@@ -355,6 +366,7 @@ export function App() {
       clipProgressLabel: string | null = null
     ) => {
       if (runSeq !== pipelineRunSeqRef.current) return;
+      currentStepLabel = stepLabels[activeStep];
       setProgress({
         status: 'running',
         activeStep,
@@ -367,6 +379,34 @@ export function App() {
         errorMessage: null,
       });
     };
+
+    // Keep mobile screens awake and re-acquire Wake Lock after tab switches while pipeline runs
+    const wakeLockRef: { current: { release: () => Promise<void> } | null } = {
+      current: null,
+    };
+    const requestWakeLock = async () => {
+      try {
+        const wl = (
+          navigator as Navigator & {
+            wakeLock?: { request: (type: 'screen') => Promise<{ release: () => Promise<void> }> };
+          }
+        ).wakeLock;
+        if (wl && !signal.aborted && !document.hidden) {
+          wakeLockRef.current = await wl.request('screen');
+        }
+      } catch {
+        // Ignore if unsupported or denied by browser
+      }
+    };
+    const onPipelineVisibility = () => {
+      if (!document.hidden && !signal.aborted && runSeq === pipelineRunSeqRef.current) {
+        void requestWakeLock();
+      }
+    };
+    void requestWakeLock();
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onPipelineVisibility);
+    }
 
     try {
       // STEP 1: Fetch & Smart Clipping
@@ -489,16 +529,37 @@ export function App() {
         const clipLabel = `Clip ${clip.clipIndex}/${clip.totalClips}`;
         const stepPct = 60 + Math.round(((i + 0.5) / preparedClips.length) * 14);
 
-        const voice = await synthesizeCommandingVoiceover({
-          scriptText: meta.voiceover,
-          beats: meta.beats,
-          language: controls.language,
-          voiceGender: controls.voiceGender,
-          targetDurationSec: clip.lockedVisualDurationSec,
-          signal,
-          onStatus: (detail) =>
-            markStep('step_4_voiceover', stepPct, `Step 4/5: ${detail}`, clipLabel),
-        });
+        let voice: Awaited<ReturnType<typeof synthesizeCommandingVoiceover>>;
+        try {
+          voice = await synthesizeCommandingVoiceover({
+            scriptText: meta.voiceover,
+            beats: meta.beats,
+            language: controls.language,
+            voiceGender: controls.voiceGender,
+            targetDurationSec: clip.lockedVisualDurationSec,
+            signal,
+            onStatus: (detail) =>
+              markStep('step_4_voiceover', stepPct, `Step 4/5: ${detail}`, clipLabel),
+          });
+        } catch (voiceErr) {
+          if (signal.aborted || (voiceErr as Error)?.name === 'AbortError') {
+            throw voiceErr;
+          }
+          markStep(
+            'step_4_voiceover',
+            stepPct,
+            'Step 4/5: Cloud TTS unavailable — continuing with synthesized fallback audio...',
+            clipLabel
+          );
+          voice = createGuaranteedFallbackVoice({
+            scriptText: meta.voiceover,
+            beats: meta.beats,
+            language: controls.language,
+            voiceGender: controls.voiceGender,
+            targetDurationSec: clip.lockedVisualDurationSec,
+            reason: 'Fallback Audio',
+          });
+        }
 
         patchConnectionStatus({ voice: voice.voiceSource });
         meta.wordTimings = voice.wordTimings;
@@ -597,14 +658,25 @@ export function App() {
     } catch (err) {
       outputs.forEach((o) => safeRevokeObjectUrl(o.videoUrl));
       if (runSeq !== pipelineRunSeqRef.current || (err as Error).name === 'AbortError') return;
-      const msg =
+      const rawMsg =
         err instanceof Error ? err.message : 'Unexpected pipeline error occurred.';
+      const formattedMsg = rawMsg.startsWith('Step ')
+        ? rawMsg
+        : `${currentStepLabel}: ${rawMsg}`;
       setProgress((prev) => ({
         ...prev,
         status: 'error',
-        statusDetail: 'Pipeline stopped — see details below.',
-        errorMessage: msg,
+        statusDetail: `${currentStepLabel} failed — see details below.`,
+        errorMessage: formattedMsg,
       }));
+    } finally {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onPipelineVisibility);
+      }
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release().catch(() => {});
+        wakeLockRef.current = null;
+      }
     }
   }, [
     controls,

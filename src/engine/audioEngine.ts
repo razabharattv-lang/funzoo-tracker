@@ -99,12 +99,85 @@ async function decodeTtsAudioToBuffer(params: {
  * 6:1 compressor) and time-fits speech cleanly so narration finishes inside `targetDurationSec`
  * with zero mid-sentence cutoffs.
  */
+/**
+ * Layers subtle, non-overpowering procedural creator SFX beneath the voiceover:
+ * 1) Opening 0.04s cinematic hook sub-hit
+ * 2) Beat-transition soft whoosh sweeps on visual scene/twist cuts
+ * 3) Crisp warm pop accent on the final payoff beat
+ */
+function mixProceduralCreatorSfx(
+  samples: Float32Array,
+  sampleRate: number,
+  beats: ScriptBeat[],
+  targetDurationSec: number
+): void {
+  const len = samples.length;
+  if (len < 128) return;
+
+  // 1) Opening hook sub-hit (0.04s -> 0.30s): warm exponential bass drop
+  const hookStart = Math.floor(0.04 * sampleRate);
+  const hookDurSamples = Math.floor(0.26 * sampleRate);
+  let phase = 0;
+  for (let i = 0; i < hookDurSamples && hookStart + i < len; i++) {
+    const t = i / sampleRate;
+    const frac = i / hookDurSamples;
+    const freq = 96 * Math.exp(-frac * 0.85) + 42;
+    phase += (2 * Math.PI * freq) / sampleRate;
+    const attack = Math.min(1, t / 0.012);
+    const decay = Math.exp(-t * 11.5);
+    const hit = Math.sin(phase) * attack * decay * 0.13;
+    samples[hookStart + i] += hit;
+  }
+
+  // 2) Beat-transition cut whooshes + pop accents at interior scene/twist cuts
+  const cutTimes = beats
+    .map((b) => b.startSec)
+    .filter((t) => t > 0.9 && t < Math.max(1.2, targetDurationSec - 0.55));
+  const lastCutIdx = cutTimes.length - 1;
+
+  cutTimes.forEach((cutSec, idx) => {
+    const isPayoff = idx === lastCutIdx;
+    // Short filtered rising whoosh leading into the beat cut (0.20s)
+    const whooshLen = Math.floor(0.2 * sampleRate);
+    const whooshStart = Math.max(0, Math.floor((cutSec - 0.12) * sampleRate));
+    let wPhase1 = 0;
+    let wPhase2 = 0;
+    for (let i = 0; i < whooshLen && whooshStart + i < len; i++) {
+      const u = i / whooshLen;
+      const env = Math.sin(Math.PI * u) * Math.sin(Math.PI * u);
+      const f1 = 180 + 520 * u * u;
+      const f2 = 340 + 880 * u;
+      wPhase1 += (2 * Math.PI * f1) / sampleRate;
+      wPhase2 += (2 * Math.PI * f2) / sampleRate;
+      const whoosh = (Math.sin(wPhase1) * 0.55 + Math.sin(wPhase2) * 0.35) * env * 0.055;
+      samples[whooshStart + i] += whoosh;
+    }
+
+    // Crisp subtle pop accent right on the cut / payoff reveal (0.14s)
+    const popStart = Math.floor(cutSec * sampleRate);
+    const popLen = Math.floor(0.14 * sampleRate);
+    const popFreq = isPayoff ? 240 : 196;
+    const popGain = isPayoff ? 0.09 : 0.065;
+    for (let i = 0; i < popLen && popStart + i < len; i++) {
+      const t = i / sampleRate;
+      const env = Math.min(1, t / 0.008) * Math.exp(-t * 20);
+      const pop =
+        (Math.sin(2 * Math.PI * popFreq * t) * 0.7 +
+          Math.sin(2 * Math.PI * (popFreq * 1.5) * t) * 0.3) *
+        env *
+        popGain;
+      samples[popStart + i] += pop;
+    }
+  });
+}
+
 async function masterAndFitVoiceover(params: {
   rawBuffer: AudioBuffer;
   targetDurationSec: number;
   voiceGender: VoiceGender;
+  beats: ScriptBeat[];
 }): Promise<AudioBuffer> {
-  const { rawBuffer, targetDurationSec, voiceGender } = params;
+  const { rawBuffer, targetDurationSec, voiceGender, beats } = params;
   const outSampleRate = 48000;
   const safeTargetDur = Math.max(1.5, targetDurationSec);
   const speechBudgetSec = Math.max(1.2, safeTargetDur - 0.2);
@@ -129,14 +202,10 @@ async function masterAndFitVoiceover(params: {
   const trimmedLen = Math.max(1, lastActive - firstActive + 1);
   const trimmedDurSec = trimmedLen / rawBuffer.sampleRate;
 
-  // Keep playbackRate smoothly bounded (0.95x–1.12x) so narration fits the exact edited clip
-  // duration without squeaky chipmunk pitch shift or overflowing past visual end.
-  let playbackRate = 0.99;
-  if (trimmedDurSec > speechBudgetSec) {
-    playbackRate = Math.min(1.12, trimmedDurSec / speechBudgetSec);
-  } else if (trimmedDurSec < speechBudgetSec * 0.72) {
-    playbackRate = Math.max(0.95, trimmedDurSec / (speechBudgetSec * 0.88));
-  }
+  // Keep brisk, punchy viral creator pacing (~1.12x–1.22x effective tempo) synced cleanly
+  // to the trimmed clip duration so delivery hits hard without clipping words or losing clarity.
+  const fitRate = trimmedDurSec / speechBudgetSec;
+  const playbackRate = Math.max(1.12, Math.min(1.22, Math.max(1.15, fitRate)));
 
   // Lock mastered buffer length strictly to the edited clip duration (exact 1:1 visual sync)
   const totalOutSamples = Math.ceil(safeTargetDur * outSampleRate);
@@ -156,18 +225,18 @@ async function masterAndFitVoiceover(params: {
   highPass.frequency.value = 75;
   highPass.Q.value = 0.7;
 
-  // 2) Warm low-end chest body (+5.0dB Male / +4.2dB Female @ 175Hz)
+  // 2) Warm authoritative chest body (+5.2dB Male / +4.4dB Female @ 170Hz)
   const chestBody = offlineCtx.createBiquadFilter();
   chestBody.type = 'lowshelf';
-  chestBody.frequency.value = 175;
-  chestBody.gain.value = voiceGender === 'male' ? 5.0 : 4.2;
+  chestBody.frequency.value = 170;
+  chestBody.gain.value = voiceGender === 'male' ? 5.2 : 4.4;
 
-  // 3) Crisp top-creator vocal authority presence (+3.0dB @ 2.6kHz)
+  // 3) Bold top-creator vocal cut-through presence (+3.6dB @ 2.8kHz)
   const presencePeak = offlineCtx.createBiquadFilter();
   presencePeak.type = 'peaking';
-  presencePeak.frequency.value = 2600;
+  presencePeak.frequency.value = 2800;
   presencePeak.Q.value = 1.05;
-  presencePeak.gain.value = 3.0;
+  presencePeak.gain.value = 3.6;
 
   // 4) Remove thin/squeaky high-mid childlike resonance (-3.0dB @ 4.8kHz)
   const deSqueakCut = offlineCtx.createBiquadFilter();
@@ -176,22 +245,22 @@ async function masterAndFitVoiceover(params: {
   deSqueakCut.Q.value = 1.4;
   deSqueakCut.gain.value = -3.0;
 
-  // 5) Gentle top-end silk roll-off (-2.2dB @ 7.8kHz) to remove harsh sibilance
+  // 5) Gentle top-end silk roll-off (-2.0dB @ 7.8kHz) to remove harsh sibilance
   const smoothTop = offlineCtx.createBiquadFilter();
   smoothTop.type = 'highshelf';
   smoothTop.frequency.value = 7800;
-  smoothTop.gain.value = -2.2;
+  smoothTop.gain.value = -2.0;
 
-  // 6) Smooth broadcast dynamic leveling
+  // 6) Punchy broadcast dynamic leveling for confident forward energy
   const compressor = offlineCtx.createDynamicsCompressor();
-  compressor.threshold.value = -18;
-  compressor.knee.value = 12;
-  compressor.ratio.value = 4.0;
-  compressor.attack.value = 0.005;
-  compressor.release.value = 0.14;
+  compressor.threshold.value = -19;
+  compressor.knee.value = 10;
+  compressor.ratio.value = 4.5;
+  compressor.attack.value = 0.004;
+  compressor.release.value = 0.12;
 
   const makeup = offlineCtx.createGain();
-  makeup.gain.value = 1.24;
+  makeup.gain.value = 1.28;
 
   src.connect(highPass);
   highPass.connect(chestBody);
@@ -206,6 +275,9 @@ async function masterAndFitVoiceover(params: {
   const rendered = await offlineCtx.startRendering();
 
   const data = rendered.getChannelData(0);
+  // Layer subtle procedural creator SFX (hook hit, beat cut whoosh, payoff pop) beneath voiceover
+  mixProceduralCreatorSfx(data, outSampleRate, beats, safeTargetDur);
+
   let peak = 0;
   for (let i = 0; i < data.length; i++) {
     const a = Math.abs(data[i]);
@@ -229,264 +301,148 @@ async function masterAndFitVoiceover(params: {
 }
 
 /**
- * Clean, zero-synth-tone silent AudioBuffer used ONLY when cloud Gemini TTS is unavailable
- * so the browser's natural human OS voice (`Natural`/`Enhanced`/`Google`) plays cleanly
- * without any robotic or humming synthetic oscillator underneath.
+ * Synthesizes a clean, subtle, audible cinema suspense bed (warm low-pass harmonic pad +
+ * soft beat-synced cadence pulses) when cloud TTS is unavailable so exported MP4/WebM
+ * files always carry a genuine audible audio stream without harsh robotic buzzing.
  */
-function createCleanSilentTrack(targetDurationSec: number): AudioBuffer {
+function createAudibleFallbackTrack(
+  targetDurationSec: number,
+  beats: ScriptBeat[],
+  voiceGender: VoiceGender
+): AudioBuffer {
   const sampleRate = 48000;
   const safeTargetDur = Math.max(1.5, targetDurationSec);
   const totalSamples = Math.ceil(safeTargetDur * sampleRate);
-  return new AudioBuffer({
+  const buf = new AudioBuffer({
     length: totalSamples,
     numberOfChannels: 1,
     sampleRate,
   });
-}
+  const ch = buf.getChannelData(0);
 
-let cachedSpeechVoices: SpeechSynthesisVoice[] = [];
-let speechVoiceListenerBound = false;
+  const rootHz = voiceGender === 'female' ? 146.83 : 110.0; // D3 / A2 warm cinema root
+  const fifthHz = rootHz * 1.498;
+  const fadeSamples = Math.min(Math.floor(sampleRate * 0.14), Math.floor(totalSamples / 4));
+  const beatStarts = beats.length > 0 ? beats.map((b) => b.startSec) : [0, safeTargetDur * 0.45];
 
-function getLoadedSpeechVoices(): SpeechSynthesisVoice[] {
-  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return [];
-  try {
-    if (!speechVoiceListenerBound) {
-      speechVoiceListenerBound = true;
-      window.speechSynthesis.addEventListener?.('voiceschanged', () => {
-        try {
-          cachedSpeechVoices = window.speechSynthesis.getVoices() || [];
-        } catch {
-          // ignore
-        }
-      });
+  for (let i = 0; i < totalSamples; i++) {
+    const t = i / sampleRate;
+    const swell = 0.65 + 0.35 * Math.sin(2 * Math.PI * 0.42 * t);
+    const pad =
+      Math.sin(2 * Math.PI * rootHz * t) * 0.09 +
+      Math.sin(2 * Math.PI * fifthHz * t) * 0.055 +
+      Math.sin(2 * Math.PI * (rootHz * 2) * t) * 0.025;
+
+    let accent = 0;
+    for (let b = 0; b < beatStarts.length; b++) {
+      const dt = t - beatStarts[b];
+      if (dt >= 0 && dt < 0.28) {
+        const env = Math.exp(-dt * 12) * Math.sin(Math.PI * Math.min(1, dt / 0.04));
+        accent += env * Math.sin(2 * Math.PI * (rootHz * 1.5) * dt) * 0.09;
+      }
     }
-    const live = window.speechSynthesis.getVoices() || [];
-    if (live.length > 0) {
-      cachedSpeechVoices = live;
+
+    let sample = pad * swell + accent;
+    if (i < fadeSamples) {
+      sample *= i / Math.max(1, fadeSamples);
+    } else if (i > totalSamples - fadeSamples) {
+      sample *= (totalSamples - i) / Math.max(1, fadeSamples);
     }
-    return cachedSpeechVoices;
-  } catch {
-    return [];
+    ch[i] = Math.max(-0.45, Math.min(0.45, sample));
   }
+
+  // Add subtle hook sub-hit, cut whooshes, and payoff pop accents to the fallback bed too
+  mixProceduralCreatorSfx(ch, sampleRate, beats, safeTargetDur);
+  for (let i = 0; i < totalSamples; i++) {
+    ch[i] = Math.max(-0.65, Math.min(0.65, ch[i]));
+  }
+
+  return buf;
 }
 
-/**
- * Selects the most natural, human-sounding OS SpeechSynthesisVoice matching language
- * (`en-US` / `hi-IN`) and gender (`male` / `female`), prioritizing neural/enhanced voices
- * over legacy robotic desktop voices.
- */
-export function pickBestBrowserSpeechVoice(
-  language: OutputLanguage,
-  voiceGender: VoiceGender
-): SpeechSynthesisVoice | null {
-  const voices = getLoadedSpeechVoices();
-  if (voices.length === 0) return null;
+function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 35000
+): Promise<Response> {
+  const controller = new AbortController();
+  const parentSignal = init.signal;
+  const onParentAbort = () => controller.abort();
+  parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+  const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
 
-  const langPrefix = language === 'hi' ? 'hi' : 'en';
-  const langMatches = voices.filter((v) =>
-    v.lang.toLowerCase().startsWith(langPrefix)
+  return fetch(url, { ...init, signal: controller.signal }).finally(() => {
+    globalThis.clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', onParentAbort);
+  });
+}
+
+export function createGuaranteedFallbackVoice(params: {
+  scriptText: string;
+  beats: ScriptBeat[];
+  language: OutputLanguage;
+  voiceGender: VoiceGender;
+  targetDurationSec: number;
+  reason?: string;
+}): SynthesizedVoiceResult {
+  const alignedDurSec = Math.max(1.5, params.targetDurationSec);
+  const audioBuffer = createAudibleFallbackTrack(
+    alignedDurSec,
+    params.beats,
+    params.voiceGender
   );
-  const pool = langMatches.length > 0 ? langMatches : voices;
-
-  const femaleHints = [
-    'aria',
-    'jenny',
-    'emma',
-    'ava',
-    'allison',
-    'samantha',
-    'siri',
-    'swara',
-    'lekha',
-    'neerja',
-    'google us english',
-    'google हिन्दी',
-    'victoria',
-    'karen',
-    'moira',
-    'tessa',
-    'heera',
-    'kalpana',
-    'zira',
-    'female',
-    'kore',
-  ];
-  const maleHints = [
-    'andrew',
-    'brian',
-    'guy',
-    'steffan',
-    'ryan',
-    'eric',
-    'christopher',
-    'matthew',
-    'daniel',
-    'alex',
-    'madhur',
-    'prabhat',
-    'aaron',
-    'arthur',
-    'mark',
-    'david',
-    'hemant',
-    'ravi',
-    'male',
-    'fenrir',
-  ];
-  const naturalBonusHints = [
-    'natural',
-    'neural',
-    'online',
-    'enhanced',
-    'premium',
-    'siri',
-    'google',
-    'wavenet',
-    'studio',
-  ];
-  const roboticPenaltyHints = [
-    'child',
-    'kid',
-    'boy',
-    'girl',
-    'baby',
-    'princess',
-    'bubbles',
-    'squeak',
-    'chipmunk',
-    'espeak',
-    'compact',
-    'festival',
-    'pico',
-    'desktop',
-    'sapi',
-    'whisper',
-    'bad news',
-    'good news',
-    'zarvox',
-    'trinoids',
-    'bells',
-    'boing',
-    'fred',
-    'albert',
-    'ralph',
-    'kathy',
-    'junior',
-    'cellos',
-    'hysterical',
-    'bahh',
-    'superstar',
-    'organ',
-    'grandma',
-    'sandy',
-    'shelley',
-    'flo',
-  ];
-  const preferredHints = voiceGender === 'female' ? femaleHints : maleHints;
-  const oppositeHints = voiceGender === 'female' ? maleHints : femaleHints;
-
-  const scored = pool.map((v) => {
-    const name = v.name.toLowerCase();
-    const lang = v.lang.toLowerCase();
-    let score = 0;
-
-    if (language === 'en' && (lang === 'en-us' || lang.startsWith('en-us'))) score += 20;
-    else if (language === 'en' && lang.includes('gb')) score += 12;
-    if (language === 'hi' && lang.includes('in')) score += 22;
-
-    if (naturalBonusHints.some((h) => name.includes(h))) score += 42;
-    if (!v.localService) score += 14; // Cloud/neural OS voices avoid metallic local DSP
-    if (preferredHints.some((h) => name.includes(h))) score += 22;
-    if (oppositeHints.some((h) => name.includes(h))) score -= 12;
-    if (roboticPenaltyHints.some((h) => name.includes(h))) score -= 60;
-
-    return { voice: v, score };
+  const pcmSamples = new Float32Array(audioBuffer.getChannelData(0));
+  const wordTimings = alignCaptionsOffline({
+    audioBuffer,
+    scriptText: params.scriptText,
+    beats: params.beats,
+    language: params.language,
+    targetDurationSec: alignedDurSec,
   });
 
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0]?.voice ?? null;
+  return {
+    audioBuffer,
+    pcmSamples,
+    sampleRate: audioBuffer.sampleRate,
+    durationSec: Number(alignedDurSec.toFixed(2)),
+    voiceEngine: `Cinema Audio Bed (${params.reason || 'Gemini TTS Unavailable'})`,
+    voiceSource: 'Browser-Speech',
+    wordTimings,
+  };
 }
 
 /**
- * Speaks the narration with `window.speechSynthesis` using dramatic suspense/twist cadence:
- * mature resonant pitch (never childish/thin > 1.0), smooth controlled rate (0.95–1.12),
- * and beat-by-beat pacing across hook, rising suspense, and twist payoff.
+ * Browser robotic SpeechSynthesis is permanently disabled.
+ * Audio relies exclusively on Gemini TTS (`Fenrir`/`Kore` + Studio Broadcast EQ)
+ * and clean synthesized cinema audio-bed fallback when cloud TTS is unavailable.
  */
-export function speakWithBrowserSpeech(params: {
+export function pickBestBrowserSpeechVoice(
+  _language: OutputLanguage,
+  _voiceGender: VoiceGender
+): SpeechSynthesisVoice | null {
+  return null;
+}
+
+export function speakWithBrowserSpeech(_params: {
   scriptText: string;
+  beats?: ScriptBeat[];
   language: OutputLanguage;
   voiceGender: VoiceGender;
   targetDurationSec: number;
 }): boolean {
-  if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-    return false;
-  }
-
-  try {
-    window.speechSynthesis.cancel();
-    const voice = pickBestBrowserSpeechVoice(params.language, params.voiceGender);
-
-    // Replace harsh dashes/symbols with natural comma pauses so TTS reads dramatically
-    const normalizedText = params.scriptText
-      .replace(/[—–]+/g, ', ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (!normalizedText) return false;
-
-    const sentences = normalizedText
-      .split(/(?<=[.!?।])\s+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const segments = sentences.length > 0 ? sentences : [normalizedText];
-
-    const words = normalizedText.split(/\s+/).filter(Boolean).length;
-    const estBaseSec = Math.max(1.5, words / 2.3);
-    const budgetSec = Math.max(1.5, params.targetDurationSec - 0.35);
-    const baseRate = Math.max(0.93, Math.min(1.07, estBaseSec / budgetSec));
-    // Deep, mature, resonant pitch (never thin, squeaky, or childlike)
-    const basePitch = params.voiceGender === 'female' ? 0.94 : 0.88;
-
-    segments.forEach((sentence, idx) => {
-      const utterance = new SpeechSynthesisUtterance(sentence);
-      utterance.lang = params.language === 'hi' ? 'hi-IN' : 'en-US';
-      if (voice) utterance.voice = voice;
-
-      const isHook = idx === 0;
-      const isTwistPayoff = idx === segments.length - 1 && segments.length > 1;
-      const beatRate = isHook
-        ? Math.min(1.08, baseRate * 1.02)
-        : isTwistPayoff
-        ? Math.min(1.06, baseRate * 1.0)
-        : Math.max(0.92, baseRate * 0.96);
-
-      utterance.rate = Number(beatRate.toFixed(2));
-      utterance.pitch = isTwistPayoff ? Math.max(0.84, basePitch - 0.02) : basePitch;
-      utterance.volume = 1.0;
-      window.speechSynthesis.speak(utterance);
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  return false;
 }
 
 export function stopBrowserSpeech(): void {
-  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-    try {
-      window.speechSynthesis.cancel();
-    } catch {
-      // ignore
-    }
-  }
+  // Intentionally disabled — browser SpeechSynthesis is never invoked.
 }
 
 /**
- * STEP 4 (Commanding Voiceover):
- * Primary: `/api/gemini/tts` (`gemini-3.8-flash-tts`, `Fenrir`/`Kore`, zero 429 retries)
- * + Broadcast EQ (`+4dB` bass, `+5dB` presence, 6:1 compressor) + duration fitting.
- * Offline/Fallback: Real spoken Browser Speech Voiceover (WebAudio Formant Speech mixed
- * directly into the exported video audio track + synchronized `window.speechSynthesis`
- * OS narrator fitted cleanly to the clip's exact duration).
+ * STEP 4 (Commanding Suspense Voiceover + Subtle Procedural SFX):
+ * Primary: Gemini 3.8 Flash TTS (`Fenrir` Male / `Kore` Female, zero 429 retries)
+ * + Studio Broadcast EQ + brisk 1.12x–1.22x pacing + procedural SFX (hook hit, cut whoosh, pop).
+ * Fallback (when Gemini TTS is unavailable): Clean synthesized cinema audio-bed + procedural SFX
+ * — NEVER robotic browser `speechSynthesis`.
  */
 export async function synthesizeCommandingVoiceover(params: {
   scriptText: string;
@@ -518,11 +474,11 @@ export async function synthesizeCommandingVoiceover(params: {
   const styleDesc =
     language === 'hi'
       ? voiceGender === 'female'
-        ? 'Top on-camera adult female Hindi YouTube & Reels creator (age 30-42). Commanding, crisp, energetic deep alto tone; hit an instant 1.5-second pattern-interrupt hook, punch micro-twists every 3-4 seconds with sharp vocal dynamics and clear authority. Strictly mature powerful voice — never thin, childlike, squeaky, or monotonous.'
-        : 'Top on-camera adult male Hindi YouTube & Reels creator (age 32-44). Deep, commanding, crisp energetic baritone; hit an explosive 1.5-second curiosity hook, drive momentum with crisp micro-twist inflections every 3-4 seconds and authoritative clarity. Strictly deep adult voice — never thin, childlike, squeaky, or monotonous.'
+        ? 'Bold, confident, fast-paced, emotional, suspenseful adult female Hindi viral Shorts & Reels creator (age 30-42). Rich authoritative alto; attack the first 2 seconds with urgent curiosity, keep brisk energetic momentum with sharp dramatic shifts on every twist and payoff. Never slow, dull, flat, robotic, or childish.'
+        : 'Bold, confident, fast-paced, emotional, suspenseful adult male Hindi viral Shorts & Reels creator (age 32-44). Deep commanding baritone; hit the opening 2 seconds with urgent suspense, drive brisk punchy momentum with dramatic vocal inflection on every twist and reveal. Never slow, dull, flat, robotic, or childish.'
       : voiceGender === 'female'
-      ? 'Top on-camera adult American female YouTube & Reels creator (age 30-42). Commanding, crisp, energetic resonant alto; hit an instant 1.5-second pattern-interrupt opener, deliver lively vocal shifts on every 3-4 second micro-twist with confident authority. Strictly mature resonant voice — never thin, childlike, squeaky, or monotonous.'
-      : 'Top on-camera adult American male YouTube & Reels creator (age 32-44). Commanding, crisp, energetic deep baritone; punch the first 1.5 seconds with a sharp pattern-interrupt hook, vary energy on every 3-4 second micro-twist with studio broadcast authority. Strictly deep mature voice — never thin, childlike, squeaky, or monotonous.';
+      ? 'Bold, confident, fast-paced, emotional, suspenseful adult American female viral Shorts & Reels creator (age 30-42). Rich resonant alto; hook hard in the first 2 seconds with urgent curiosity, keep crisp brisk momentum and dramatic intensity through every twist and payoff. Never slow, dull, flat, robotic, or childish.'
+      : 'Bold, confident, fast-paced, emotional, suspenseful adult American male viral Shorts & Reels creator (age 32-44). Deep authoritative baritone; slam the opening 2 seconds with urgent suspense, keep brisk punchy pacing with emotional vocal dynamics on every twist and reveal. Never slow, dull, flat, robotic, or childish.';
 
   if (health.geminiConfigured) {
     onStatus?.(
@@ -531,16 +487,20 @@ export async function synthesizeCommandingVoiceover(params: {
 
     try {
       if (health.backendAvailable) {
-        const resp = await fetch('/api/gemini/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal,
-          body: JSON.stringify({
-            scriptText,
-            styleDesc,
-            voiceName,
-          }),
-        });
+        const resp = await fetchWithTimeout(
+          '/api/gemini/tts',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal,
+            body: JSON.stringify({
+              scriptText,
+              styleDesc,
+              voiceName,
+            }),
+          },
+          35000
+        );
 
         if (resp.ok) {
           const data = (await resp.json()) as {
@@ -559,13 +519,13 @@ export async function synthesizeCommandingVoiceover(params: {
         } else {
           voiceEngine =
             resp.status === 429
-              ? `Browser Speech (${voiceGender === 'female' ? 'Female' : 'Male'} · TTS Quota Fallback)`
-              : `Browser Speech (${voiceGender === 'female' ? 'Female' : 'Male'} · TTS HTTP ${resp.status})`;
+              ? 'Cinema Audio Bed (Gemini TTS Quota Fallback)'
+              : `Cinema Audio Bed (Gemini TTS HTTP ${resp.status})`;
         }
       } else if (staticEnv.geminiApiKey) {
-        // Static GitHub Pages direct Gemini TTS call (1 call, zero 429 retries)
+        // Static GitHub Pages direct Gemini TTS call (1 call, bounded timeout, zero 429 retries)
         const requestStaticTts = (modelId: string) =>
-          fetch(
+          fetchWithTimeout(
             `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
               staticEnv.geminiApiKey
             )}`,
@@ -577,7 +537,15 @@ export async function synthesizeCommandingVoiceover(params: {
                 contents: [
                   {
                     role: 'user',
-                    parts: [{ text: `${styleDesc}\n\nSpeak naturally: ${scriptText}` }],
+                    parts: [
+                      {
+                        text: `Speak fast, bold, confident, emotional, and suspenseful like a top viral ${
+                          language === 'hi' ? 'Hindi' : 'American English'
+                        } adult ${
+                          voiceGender === 'female' ? 'female' : 'male'
+                        } creator (brisk energetic tempo, never slow or flat): ${scriptText}`,
+                      },
+                    ],
                   },
                 ],
                 generationConfig: {
@@ -589,7 +557,8 @@ export async function synthesizeCommandingVoiceover(params: {
                   },
                 },
               }),
-            }
+            },
+            35000
           );
 
         let usedTtsModel = 'gemini-3.8-flash-tts';
@@ -621,31 +590,30 @@ export async function synthesizeCommandingVoiceover(params: {
         } else {
           voiceEngine =
             resp.status === 429
-              ? `Browser Speech (${voiceGender === 'female' ? 'Female' : 'Male'} · TTS Quota Fallback)`
-              : `Browser Speech (${voiceGender === 'female' ? 'Female' : 'Male'} · TTS HTTP ${resp.status})`;
+              ? 'Cinema Audio Bed (Gemini TTS Quota Fallback)'
+              : `Cinema Audio Bed (Gemini TTS HTTP ${resp.status})`;
         }
       }
     } catch (err) {
-      if ((err as Error).name === 'AbortError') throw err;
-      voiceEngine = `Browser Speech (${voiceGender === 'female' ? 'Female' : 'Male'} · Offline Fallback)`;
+      if (signal?.aborted) throw err;
+      voiceEngine = 'Cinema Audio Bed (Gemini TTS Offline Fallback)';
     }
   } else {
-    const osVoice = pickBestBrowserSpeechVoice(language, voiceGender);
-    const osVoiceLabel = osVoice ? osVoice.name : voiceGender === 'female' ? 'Female' : 'Male';
     const primaryTtsModel = PIPELINE_15_WORKER_MODELS.step4[0];
-    voiceEngine = `Browser Speech (${osVoiceLabel} · fallback for ${primaryTtsModel})`;
+    voiceEngine = `Cinema Audio Bed (fallback for ${primaryTtsModel})`;
   }
 
   let masteredBuffer: AudioBuffer | null = null;
   if (rawBuffer) {
     onStatus?.(
-      'Applying Deep Broadcast EQ (75Hz HPF, warm chest body, de-squeak filter & smooth leveling)...'
+      'Applying Deep Broadcast EQ + subtle creator SFX (hook hit, cut whoosh & payoff pop)...'
     );
     try {
       masteredBuffer = await masterAndFitVoiceover({
         rawBuffer,
         targetDurationSec,
         voiceGender,
+        beats,
       });
     } catch {
       masteredBuffer = rawBuffer;
@@ -654,14 +622,12 @@ export async function synthesizeCommandingVoiceover(params: {
 
   if (!masteredBuffer) {
     onStatus?.(
-      `Ready for natural human device voiceover (${targetDurationSec.toFixed(1)}s · zero synth tones)...`
+      `Synthesizing clean cinema audio bed (${targetDurationSec.toFixed(1)}s)...`
     );
-    masteredBuffer = createCleanSilentTrack(targetDurationSec);
+    masteredBuffer = createAudibleFallbackTrack(targetDurationSec, beats, voiceGender);
     voiceSource = 'Browser-Speech';
     if (!voiceEngine) {
-      const osVoice = pickBestBrowserSpeechVoice(language, voiceGender);
-      const osVoiceLabel = osVoice ? osVoice.name : voiceGender === 'female' ? 'Female' : 'Male';
-      voiceEngine = `Browser Speech (${osVoiceLabel} · Natural Device Voice)`;
+      voiceEngine = 'Cinema Audio Bed (Gemini TTS Unavailable)';
     }
   }
 

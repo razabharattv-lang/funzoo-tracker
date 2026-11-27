@@ -25,6 +25,7 @@ interface InitMessage {
   wordTimings?: AlignedWordTiming[];
   safeCropInsets: SafeCropInsets;
   watermarkZones: WatermarkZone[];
+  bumperTrimmedSec?: number;
   sampleRate: number;
   pcmSamples: ArrayBuffer;
 }
@@ -66,22 +67,22 @@ uniform int u_zoneCount;
 uniform vec4 u_zones[6]; // x1, y1, x2, y2 in normalized frame coords
 
 vec3 gradeCinema(vec3 c, vec2 uv) {
-  // High-engagement cinema S-curve contrast + balanced vibrance/saturation boost
-  c = clamp((c - 0.5) * 1.24 + 0.52, 0.0, 1.0);
+  // Crisp cinema color grading matching contrast(1.18) saturate(1.24) brightness(1.04)
+  c = clamp((c - 0.5) * 1.18 + 0.5 + 0.04, 0.0, 1.0);
   float luma = dot(c, vec3(0.299, 0.587, 0.114));
-  c = mix(vec3(luma), c, 1.34);
-  // Visible cinematic split tone (rich teal shadows / warm golden highlights)
-  vec3 shadowTint = vec3(-0.020, 0.012, 0.032) * (1.0 - luma);
-  vec3 highlightTint = vec3(0.030, 0.015, -0.014) * luma;
+  c = mix(vec3(luma), c, 1.24);
+  // Subtle cinematic split tone (clean deep shadows / warm punchy highlights)
+  vec3 shadowTint = vec3(-0.014, 0.009, 0.022) * (1.0 - luma);
+  vec3 highlightTint = vec3(0.022, 0.011, -0.008) * luma;
   c = clamp(c + shadowTint + highlightTint, 0.0, 1.0);
   // Balanced cinema vignette around outer borders for crisp center pop
   float dist = distance(uv, vec2(0.5, 0.5));
-  float vig = 1.0 - smoothstep(0.44, 0.90, dist) * 0.30;
+  float vig = 1.0 - smoothstep(0.46, 0.92, dist) * 0.24;
   return clamp(c * vig, 0.0, 1.0);
 }
 
 void main() {
-  // Full-bleed 9:16 vertical cover-fit inside safe crop + dynamic motion push-in (1.08x -> 1.15x)
+  // Full-bleed 9:16 vertical cover-fit inside safe crop + subtle smooth zoom motion (1.04x -> 1.10x)
   float cropW = max(0.2, 1.0 - u_crop.x - u_crop.z);
   float cropH = max(0.2, 1.0 - u_crop.y - u_crop.w);
   float effSrcW = u_srcSize.x * cropW;
@@ -99,10 +100,10 @@ void main() {
     uv.y = (uv.y - 0.5) * scale + 0.5;
   }
 
-  // Smooth full-bleed anti-copyright push-in + gentle motion drift (eliminates dark sidebars)
+  // Smooth zoom push-in (1.04x -> 1.10x) + gentle center-safe motion drift
   float tSmooth = smoothstep(0.0, 1.0, clamp(u_timeFrac, 0.0, 1.0));
-  float zoom = 1.08 + 0.07 * tSmooth;
-  vec2 drift = vec2((tSmooth - 0.5) * 0.014, (tSmooth - 0.5) * 0.018);
+  float zoom = 1.04 + 0.06 * tSmooth;
+  vec2 drift = vec2((tSmooth - 0.5) * 0.010, (tSmooth - 0.5) * 0.012);
   uv = (uv - 0.5) / zoom + 0.5 + drift;
 
   vec2 srcUv = vec2(
@@ -110,19 +111,23 @@ void main() {
     u_crop.y + uv.y * cropH
   );
 
-  // Seamless blended corner delogo patch (samples clean adjacent interior texture)
+  // Seamless blended corner delogo patch (full coverage flush to frame borders, feathered interior edges)
   float maskStrength = 0.0;
   vec2 patchShift = vec2(0.0);
   for (int i = 0; i < 6; i++) {
     if (i >= u_zoneCount) break;
     vec4 z = u_zones[i];
-    float edgeX = min(v_uv.x - z.x, z.z - v_uv.x);
-    float edgeY = min(v_uv.y - z.y, z.w - v_uv.y);
-    float inside = smoothstep(0.0, 0.03, edgeX) * smoothstep(0.0, 0.025, edgeY);
-    if (inside > maskStrength) {
-      maskStrength = inside;
-      float dirY = ((z.y + z.w) * 0.5 < 0.5) ? 1.0 : -1.0;
-      patchShift = vec2(0.0, dirY * (z.w - z.y) * 1.18 * cropH);
+    if (v_uv.x >= z.x && v_uv.x <= z.z && v_uv.y >= z.y && v_uv.y <= z.w) {
+      float fL = (z.x <= 0.01) ? 1.0 : smoothstep(0.0, 0.025, v_uv.x - z.x);
+      float fR = (z.z >= 0.99) ? 1.0 : smoothstep(0.0, 0.025, z.z - v_uv.x);
+      float fT = (z.y <= 0.01) ? 1.0 : smoothstep(0.0, 0.02, v_uv.y - z.y);
+      float fB = (z.w >= 0.99) ? 1.0 : smoothstep(0.0, 0.02, z.w - v_uv.y);
+      float inside = fL * fR * fT * fB;
+      if (inside > maskStrength) {
+        maskStrength = inside;
+        float dirY = ((z.y + z.w) * 0.5 < 0.5) ? 1.0 : -1.0;
+        patchShift = vec2(0.0, dirY * (z.w - z.y) * 1.18 * cropH);
+      }
     }
   }
 
@@ -136,11 +141,11 @@ void main() {
      texture(u_tex, clamp(clampedUv - vec2(texel.x, 0.0), vec2(0.002), vec2(0.998))).rgb +
      texture(u_tex, clamp(clampedUv + vec2(0.0, texel.y), vec2(0.002), vec2(0.998))).rgb +
      texture(u_tex, clamp(clampedUv - vec2(0.0, texel.y), vec2(0.002), vec2(0.998))).rgb) * 0.25;
-  vec3 col = clamp(baseCol + (baseCol - blurNeighbors) * 0.58, 0.0, 1.0);
+  vec3 col = clamp(baseCol + (baseCol - blurNeighbors) * 0.68, 0.0, 1.0);
 
   if (maskStrength > 0.01) {
     vec2 cleanCenterUv = clamp(srcUv + patchShift, vec2(0.005), vec2(0.995));
-    vec2 px = vec2(8.0) * texel;
+    vec2 px = vec2(11.0) * texel;
     vec3 acc = vec3(0.0);
     float total = 0.0;
     for (int ox = -2; ox <= 2; ox++) {
@@ -208,6 +213,8 @@ function releaseWorkerResources(): void {
 let width = 720;
 let height = 1280;
 let fps = 30;
+let clipDurationSec = 10;
+let bumperTrimmedSec = 0;
 let language: OutputLanguage = 'en';
 let safeCrop: SafeCropInsets = { top: 0, bottom: 0, left: 0, right: 0 };
 let watermarkZones: WatermarkZone[] = [];
@@ -368,6 +375,8 @@ async function handleInit(msg: InitMessage): Promise<void> {
   width = msg.width;
   height = msg.height;
   fps = msg.fps;
+  clipDurationSec = Math.max(1.5, msg.durationSec);
+  bumperTrimmedSec = Math.max(0, msg.bumperTrimmedSec ?? 0);
   language = msg.language;
   safeCrop = msg.safeCropInsets;
   watermarkZones = msg.watermarkZones;
@@ -502,8 +511,24 @@ async function handleFrame(msg: FrameMessage): Promise<void> {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.flush();
 
-    // Composite cinema-graded GPU frame + kinetic captions onto output OffscreenCanvas
+    // Clear previous frame & caption state completely before compositing fresh GPU frame + single caption
+    overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+    overlayCtx.globalAlpha = 1;
+    overlayCtx.globalCompositeOperation = 'source-over';
+    overlayCtx.shadowColor = 'transparent';
+    overlayCtx.shadowBlur = 0;
+    overlayCtx.shadowOffsetX = 0;
+    overlayCtx.shadowOffsetY = 0;
+    overlayCtx.clearRect(0, 0, width, height);
     overlayCtx.drawImage(glCanvas, 0, 0, width, height);
+    if (bumperTrimmedSec > 0 && clipDurationSec - msg.timeSec < 0.32) {
+      const fadeAlpha = Math.max(
+        0,
+        Math.min(0.88, (0.32 - (clipDurationSec - msg.timeSec)) / 0.32)
+      );
+      overlayCtx.fillStyle = `rgba(9, 14, 26, ${fadeAlpha.toFixed(3)})`;
+      overlayCtx.fillRect(0, 0, width, height);
+    }
     drawCapCutPopCaption({
       ctx: overlayCtx,
       chunks: captionChunks,

@@ -117,6 +117,7 @@ export function OutputDeckCard({
     if (!activeClip || !isBrowserSpeechClip || !browserSpeechSyncEnabled) return;
     speakWithBrowserSpeech({
       scriptText: activeClip.metadata.voiceover,
+      beats: activeClip.metadata.beats,
       language: activeClip.language,
       voiceGender: activeClip.voiceGender,
       targetDurationSec: activeClip.durationSec,
@@ -411,6 +412,7 @@ export function OutputDeckCard({
                   onClick={() =>
                     speakWithBrowserSpeech({
                       scriptText: activeClip.metadata.voiceover,
+                      beats: activeClip.metadata.beats,
                       language: activeClip.language,
                       voiceGender: activeClip.voiceGender,
                       targetDurationSec: activeClip.durationSec,

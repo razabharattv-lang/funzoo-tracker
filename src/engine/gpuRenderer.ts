@@ -50,6 +50,105 @@ function computeTargetDimensions(
   return isMobile ? { width: 720, height: 1280 } : { width: 1080, height: 1920 };
 }
 
+function ensureAudiblePcmBuffer(
+  pcmSamples: Float32Array,
+  sampleRate: number,
+  durationSec: number
+): Float32Array {
+  const safeRate = Math.max(8000, Math.round(sampleRate || 48000));
+  const targetLen = Math.max(
+    pcmSamples.length,
+    Math.ceil(Math.max(1.5, durationSec) * safeRate)
+  );
+  const out = new Float32Array(targetLen);
+  if (pcmSamples.length > 0) {
+    out.set(pcmSamples.subarray(0, targetLen), 0);
+  }
+
+  let peak = 0;
+  for (let i = 0; i < out.length; i += 8) {
+    const a = Math.abs(out[i]);
+    if (a > peak) peak = a;
+  }
+
+  // If upstream voice track is completely silent, synthesize a subtle audible cinema bed
+  if (peak < 0.002) {
+    const fadeLen = Math.min(Math.floor(safeRate * 0.12), Math.floor(targetLen / 4));
+    for (let i = 0; i < targetLen; i++) {
+      const t = i / safeRate;
+      const swell = 0.65 + 0.35 * Math.sin(2 * Math.PI * 0.45 * t);
+      let sample =
+        (Math.sin(2 * Math.PI * 110 * t) * 0.085 +
+          Math.sin(2 * Math.PI * 164.81 * t) * 0.05 +
+          Math.sin(2 * Math.PI * 220 * t) * 0.022) *
+        swell;
+      if (i < fadeLen) sample *= i / Math.max(1, fadeLen);
+      else if (i > targetLen - fadeLen) sample *= (targetLen - i) / Math.max(1, fadeLen);
+      out[i] = sample;
+    }
+  }
+  return out;
+}
+
+function formatVideoDecodeError(
+  video: HTMLVideoElement,
+  sourceLabel: string,
+  stage: string
+): string {
+  const code = video.error?.code;
+  const mediaReason =
+    video.error?.message ||
+    (code === 3
+      ? 'MEDIA_ERR_DECODE (corrupted or unsupported video stream)'
+      : code === 4
+      ? 'MEDIA_ERR_SRC_NOT_SUPPORTED (unsupported codec/container)'
+      : 'browser could not decode video frames');
+  return `${stage}: Failed to decode "${sourceLabel}" — ${mediaReason}. Try re-exporting as standard H.264 MP4.`;
+}
+
+async function loadVideoElementForRender(
+  video: HTMLVideoElement,
+  sourceLabel: string,
+  stage: string,
+  timeoutMs = 25000
+): Promise<void> {
+  if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      video.onloadeddata = null;
+      video.oncanplay = null;
+      video.onerror = null;
+      if (err) reject(err);
+      else resolve();
+    };
+    const timer = window.setTimeout(
+      () =>
+        finish(
+          new Error(
+            `${stage}: Timed out waiting for decodable frames from "${sourceLabel}".`
+          )
+        ),
+      timeoutMs
+    );
+    const onReady = () => {
+      if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        finish();
+      }
+    };
+    video.onloadeddata = onReady;
+    video.oncanplay = onReady;
+    video.onerror = () =>
+      finish(new Error(formatVideoDecodeError(video, sourceLabel, stage)));
+    video.load();
+  });
+}
+
 async function waitForVideoFrameReady(
   video: HTMLVideoElement,
   timeoutMs = 3500
@@ -85,6 +184,32 @@ async function waitForVideoFrameReady(
   });
 }
 
+async function waitUntilTabVisible(signal?: AbortSignal): Promise<void> {
+  if (typeof document === 'undefined' || !document.hidden) return;
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      document.removeEventListener('visibilitychange', onVis);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onVis = () => {
+      if (!document.hidden) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException('Render cancelled', 'AbortError'));
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    document.addEventListener('visibilitychange', onVis);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 async function seekVideoPrecise(
   video: HTMLVideoElement,
   targetSec: number
@@ -107,7 +232,7 @@ async function seekVideoPrecise(
       video.onseeked = null;
       resolve();
     };
-    const timer = window.setTimeout(done, 1200);
+    const timer = window.setTimeout(done, 2200);
     video.onseeked = () => {
       window.clearTimeout(timer);
       done();
@@ -121,7 +246,7 @@ async function seekVideoPrecise(
   });
 
   if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
-    await waitForVideoFrameReady(video, 1200);
+    await waitForVideoFrameReady(video, 2000);
   }
 }
 
@@ -130,7 +255,8 @@ async function seekVideoPrecise(
  * with real video dimensions (never a 1 KB header-only / 0:00 black container).
  */
 async function verifyPlayableVideoBlob(
-  blob: Blob
+  blob: Blob,
+  expectedDurationSec = 0
 ): Promise<{ valid: boolean; reason?: string }> {
   if (!blob || blob.size <= 1024) {
     return {
@@ -158,32 +284,58 @@ async function verifyPlayableVideoBlob(
   probeVideo.preload = 'metadata';
 
   try {
-    const ok = await new Promise<boolean>((resolve) => {
+    const check = await new Promise<{ ok: boolean; reason?: string }>((resolve) => {
       let settled = false;
-      const finish = (result: boolean) => {
+      const finish = (result: { ok: boolean; reason?: string }) => {
         if (settled) return;
         settled = true;
         window.clearTimeout(timer);
         resolve(result);
       };
-      const timer = window.setTimeout(() => finish(true), 3500);
+      const timer = window.setTimeout(() => finish({ ok: true }), 3500);
       probeVideo.onloadedmetadata = () => {
         const hasDims = probeVideo.videoWidth > 0 && probeVideo.videoHeight > 0;
-        const hasDur =
-          probeVideo.duration === Infinity ||
-          (Number.isFinite(probeVideo.duration) && probeVideo.duration > 0.1);
-        finish(hasDims && hasDur);
+        if (!hasDims) {
+          finish({
+            ok: false,
+            reason: 'Browser could not decode video frames from the recorded blob (0x0 track).',
+          });
+          return;
+        }
+        const rawDur = probeVideo.duration;
+        if (rawDur === Infinity) {
+          finish({ ok: true });
+          return;
+        }
+        const minAcceptableDur =
+          expectedDurationSec > 2.5
+            ? Math.max(1.2, expectedDurationSec * 0.72)
+            : 0.4;
+        if (!Number.isFinite(rawDur) || rawDur < minAcceptableDur) {
+          finish({
+            ok: false,
+            reason: `Recorded clip duration was truncated (${Number.isFinite(rawDur) ? rawDur.toFixed(1) : '0.0'}s vs expected ${expectedDurationSec.toFixed(1)}s).`,
+          });
+          return;
+        }
+        finish({ ok: true });
       };
-      probeVideo.onerror = () => finish(false);
+      probeVideo.onerror = () =>
+        finish({
+          ok: false,
+          reason: 'Browser could not decode video frames from the recorded blob (0:00 / empty track).',
+        });
       probeVideo.src = probeUrl;
       probeVideo.load();
     });
 
-    return ok
+    return check.ok
       ? { valid: true }
       : {
           valid: false,
-          reason: 'Browser could not decode video frames from the recorded blob (0:00 / empty track).',
+          reason:
+            check.reason ||
+            'Browser could not decode video frames from the recorded blob (0:00 / empty track).',
         };
   } finally {
     probeVideo.onloadedmetadata = null;
@@ -274,24 +426,10 @@ async function renderSinglePassWebCodecsWorker(params: {
   };
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(
-        () => reject(new Error('Timed out loading source video for GPU render.')),
-        15000
-      );
-      video.onloadeddata = () => {
-        window.clearTimeout(timer);
-        resolve();
-      };
-      video.onerror = () => {
-        window.clearTimeout(timer);
-        reject(new Error('Failed to decode source video for GPU render.'));
-      };
-      video.load();
-    });
+    await loadVideoElementForRender(video, source.label, 'Step 5 WebCodecs');
     await waitForVideoFrameReady(video, 3500);
-    if (video.videoWidth <= 0 || video.videoHeight <= 0) {
-      throw new Error('Source video had no decodable frame dimensions for GPU render.');
+    if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      throw new Error(formatVideoDecodeError(video, source.label, 'Step 5 WebCodecs'));
     }
 
     worker = new Worker(new URL('./renderWorker.ts', import.meta.url), {
@@ -364,14 +502,13 @@ async function renderSinglePassWebCodecsWorker(params: {
         };
       });
 
-    // Pad PCM buffer to at least full clip duration so audio track aligns cleanly without truncating video
-    const targetPcmSamples = Math.max(
-      voice.pcmSamples.length,
-      Math.ceil(durationSec * voice.sampleRate)
+    // Guarantee full-duration audible PCM buffer so exported MP4 always carries playable audio
+    const pcmCopy = ensureAudiblePcmBuffer(
+      voice.pcmSamples,
+      voice.sampleRate,
+      durationSec
     );
-    const pcmCopy = new Float32Array(targetPcmSamples);
-    pcmCopy.set(voice.pcmSamples, 0);
-    const readyPromise = nextWorkerReply(25_000);
+    const readyPromise = nextWorkerReply(40_000);
     worker.postMessage(
       {
         type: 'init',
@@ -386,6 +523,7 @@ async function renderSinglePassWebCodecsWorker(params: {
         wordTimings: voice.wordTimings,
         safeCropInsets: clip.safeCropInsets,
         watermarkZones: clip.watermarkZones,
+        bumperTrimmedSec: clip.bumperTrimmedSec,
         sampleRate: voice.sampleRate,
         pcmSamples: pcmCopy.buffer,
       },
@@ -407,12 +545,20 @@ async function renderSinglePassWebCodecsWorker(params: {
         clip.trimRange.startSec + Math.min(maxOffsetSec, timeSec * PACE_FACTOR);
       await seekVideoPrecise(video, sourceTimeSec);
       if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
-        await waitForVideoFrameReady(video, 1200);
+        if (typeof document !== 'undefined' && document.hidden) {
+          onProgress?.(
+            Math.min(96, Math.round(((i + 1) / totalFrames) * 95)),
+            `Paused in background (Clip ${clip.clipIndex}/${clip.totalClips}) — will resume automatically when tab returns...`
+          );
+          await waitUntilTabVisible(signal);
+          await seekVideoPrecise(video, sourceTimeSec);
+        }
+        await waitForVideoFrameReady(video, 2000);
       }
 
       const bitmap = await createImageBitmap(video);
       try {
-        const ackPromise = nextWorkerReply(15_000);
+        const ackPromise = nextWorkerReply(25_000);
         worker.postMessage(
           {
             type: 'frame',
@@ -444,7 +590,7 @@ async function renderSinglePassWebCodecsWorker(params: {
     }
 
     onProgress?.(98, `Finalizing MP4 container for Clip ${clip.clipIndex}/${clip.totalClips}...`);
-    const donePromise = nextWorkerReply(30_000);
+    const donePromise = nextWorkerReply(60_000);
     worker.postMessage({ type: 'finish' });
     const doneMsg = await donePromise;
     const mp4Buffer = doneMsg.mp4Buffer as ArrayBuffer;
@@ -457,7 +603,7 @@ async function renderSinglePassWebCodecsWorker(params: {
     }
 
     const blob = new Blob([mp4Buffer], { type: 'video/mp4' });
-    const check = await verifyPlayableVideoBlob(blob);
+    const check = await verifyPlayableVideoBlob(blob, durationSec);
     if (!check.valid) {
       throw new Error(check.reason || 'WebCodecs MP4 failed playable video verification.');
     }
@@ -555,21 +701,7 @@ async function runSingleMediaRecorderAttempt(params: {
   let recorder: MediaRecorder | null = null;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(
-        () => reject(new Error('Timed out loading video for Canvas MediaRecorder export.')),
-        15000
-      );
-      video.onloadeddata = () => {
-        window.clearTimeout(timer);
-        resolve();
-      };
-      video.onerror = () => {
-        window.clearTimeout(timer);
-        reject(new Error('Unable to decode video for Canvas MediaRecorder export.'));
-      };
-      video.load();
-    });
+    await loadVideoElementForRender(video, source.label, 'Step 5 Canvas Render');
 
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) throw new Error('Canvas 2D context unavailable.');
@@ -630,11 +762,18 @@ async function runSingleMediaRecorderAttempt(params: {
     vignetteGrad.addColorStop(0.7, 'rgba(10, 18, 34, 0.12)');
     vignetteGrad.addColorStop(1, 'rgba(6, 12, 24, 0.42)');
 
-    // Visible cinema split-tone wash (rich teal shadows / warm golden highlights)
+    // Visible cinema split-tone wash (subtle shadows / warm highlights)
     const gradeWash = ctx.createLinearGradient(0, 0, 0, height);
-    gradeWash.addColorStop(0, 'rgba(14, 116, 144, 0.15)');
-    gradeWash.addColorStop(0.5, 'rgba(255, 190, 110, 0.10)');
-    gradeWash.addColorStop(1, 'rgba(12, 20, 38, 0.20)');
+    gradeWash.addColorStop(0, 'rgba(14, 116, 144, 0.10)');
+    gradeWash.addColorStop(0.5, 'rgba(255, 195, 120, 0.08)');
+    gradeWash.addColorStop(1, 'rgba(12, 20, 38, 0.14)');
+
+    // Fast tiny scratch canvas for hardware-safe frosted corner delogo patching (<0.2ms/zone
+    // instead of full-canvas CPU blur(16px) which throttles MediaRecorder to ~3fps / 2s clips)
+    const delogoScratch = document.createElement('canvas');
+    delogoScratch.width = 40;
+    delogoScratch.height = 24;
+    const delogoCtx = delogoScratch.getContext('2d', { alpha: false });
 
     let drawnRealVideoFrames = 0;
     const paintFrame = (elapsedSec: number) => {
@@ -651,10 +790,10 @@ async function runSingleMediaRecorderAttempt(params: {
           return;
         }
 
-        // Full-bleed 9:16 anti-copyright push-in (1.08x -> 1.15x) + subtle motion drift (no dark sidebars)
+        // Full-bleed 9:16 smooth zoom motion (1.04x -> 1.10x) + gentle center-safe drift
         const tFrac = Math.max(0, Math.min(1, elapsedSec / Math.max(0.1, durationSec)));
         const smoothT = tFrac * tFrac * (3 - 2 * tFrac);
-        const zoom = 1.08 + 0.07 * smoothT;
+        const zoom = 1.04 + 0.06 * smoothT;
         const zoomSw = Math.max(16, Math.round(drawSw / zoom));
         const zoomSh = Math.max(16, Math.round(drawSh / zoom));
         const zoomSx = Math.max(
@@ -668,16 +807,26 @@ async function runSingleMediaRecorderAttempt(params: {
           0,
           Math.min(
             vh - zoomSh,
-            drawSy + Math.round((drawSh - zoomSh) * (0.47 + 0.06 * smoothT))
+            drawSy + Math.round((drawSh - zoomSh) * (0.48 + 0.04 * smoothT))
           )
         );
 
+        // Reset canvas state and clear previous frame/captions cleanly before painting fresh frame
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.clearRect(0, 0, width, height);
+
         ctx.save();
-        ctx.filter = 'contrast(1.24) saturate(1.34) brightness(1.04)';
+        ctx.filter = 'contrast(1.18) saturate(1.24) brightness(1.04)';
         ctx.drawImage(video, zoomSx, zoomSy, zoomSw, zoomSh, 0, 0, width, height);
         ctx.restore();
 
-        // Visible cinema split-tone wash + balanced clarity vignette
+        // Subtle cinema split-tone wash + balanced clarity vignette
         ctx.save();
         ctx.globalCompositeOperation = 'soft-light';
         ctx.fillStyle = gradeWash;
@@ -687,41 +836,65 @@ async function runSingleMediaRecorderAttempt(params: {
         ctx.fillStyle = vignetteGrad;
         ctx.fillRect(0, 0, width, height);
 
-        // Seamless blended corner delogo patch (samples adjacent clean video area with matching color grade)
+        // Seamless blended corner delogo patch via downsampled clean-neighbor upscale (fast & Safari-safe)
         for (const z of clip.watermarkZones) {
           if (elapsedSec >= z.startSec && elapsedSec <= z.endSec) {
             const zx = Math.round(z.box[0] * width);
             const zy = Math.round(z.box[1] * height);
             const zw = Math.max(12, Math.round((z.box[2] - z.box[0]) * width));
             const zh = Math.max(12, Math.round((z.box[3] - z.box[1]) * height));
-            const radius = Math.min(22, Math.round(Math.min(zw, zh) * 0.3));
+            const radius = Math.min(20, Math.round(Math.min(zw, zh) * 0.3));
             const isTop = (z.box[1] + z.box[3]) * 0.5 < 0.5;
-            const shiftPx = isTop ? -Math.round(zh * 1.18) : Math.round(zh * 1.18);
+            const srcZoneX = Math.max(
+              0,
+              Math.min(vw - 8, Math.round(zoomSx + z.box[0] * zoomSw))
+            );
+            const srcZoneW = Math.max(
+              8,
+              Math.min(vw - srcZoneX, Math.round((z.box[2] - z.box[0]) * zoomSw))
+            );
+            const srcZoneH = Math.max(8, Math.round((z.box[3] - z.box[1]) * zoomSh));
+            const rawSampleY =
+              zoomSy + z.box[1] * zoomSh + (isTop ? srcZoneH * 1.15 : -srcZoneH * 1.15);
+            const sampleSrcY = Math.max(
+              0,
+              Math.min(Math.max(0, vh - srcZoneH), Math.round(rawSampleY))
+            );
+
             ctx.save();
             ctx.beginPath();
             ctx.roundRect(zx, zy, zw, zh, radius);
             ctx.clip();
-            ctx.filter = 'blur(18px) contrast(1.22) saturate(1.30) brightness(1.03)';
-            ctx.drawImage(
-              video,
-              zoomSx,
-              zoomSy,
-              zoomSw,
-              zoomSh,
-              0,
-              shiftPx,
-              width,
-              height
-            );
+            if (delogoCtx) {
+              delogoCtx.drawImage(
+                video,
+                srcZoneX,
+                sampleSrcY,
+                srcZoneW,
+                Math.min(srcZoneH, vh - sampleSrcY),
+                0,
+                0,
+                delogoScratch.width,
+                delogoScratch.height
+              );
+              ctx.imageSmoothingEnabled = true;
+              ctx.imageSmoothingQuality = 'high';
+              ctx.drawImage(delogoScratch, 0, 0, delogoScratch.width, delogoScratch.height, zx, zy, zw, zh);
+            } else {
+              ctx.fillStyle = 'rgba(12, 18, 30, 0.72)';
+              ctx.fillRect(zx, zy, zw, zh);
+            }
+            ctx.fillStyle = 'rgba(10, 16, 28, 0.14)';
+            ctx.fillRect(zx, zy, zw, zh);
             ctx.restore();
           }
         }
 
-        // Clean outro/end-card mask fade in the final 0.25s when bumper trimming is active
-        if (clip.bumperTrimmedSec > 0 && durationSec - elapsedSec < 0.25) {
+        // Clean outro/end-card mask fade in the final 0.32s when bumper trimming is active
+        if (clip.bumperTrimmedSec > 0 && durationSec - elapsedSec < 0.32) {
           const fadeAlpha = Math.max(
             0,
-            Math.min(0.85, (0.25 - (durationSec - elapsedSec)) / 0.25)
+            Math.min(0.88, (0.32 - (durationSec - elapsedSec)) / 0.32)
           );
           ctx.fillStyle = `rgba(9, 14, 26, ${fadeAlpha.toFixed(3)})`;
           ctx.fillRect(0, 0, width, height);
@@ -754,24 +927,39 @@ async function runSingleMediaRecorderAttempt(params: {
     };
 
     const tracks: MediaStreamTrack[] = [...videoTracks];
-    if (includeAudio && voice.pcmSamples.length > 0) {
+    let hasAttachedAudio = false;
+    if (includeAudio) {
       try {
-        try {
-          audioCtx = new AudioContext({ sampleRate: voice.sampleRate });
-        } catch {
-          audioCtx = new AudioContext();
+        const audiblePcm = ensureAudiblePcmBuffer(
+          voice.pcmSamples,
+          voice.sampleRate,
+          durationSec
+        );
+        audioCtx = new AudioContext();
+        const targetRate = audioCtx.sampleRate || voice.sampleRate || 48000;
+        const srcRate = voice.sampleRate || 48000;
+        const outLen = Math.max(1, Math.round((audiblePcm.length / srcRate) * targetRate));
+        const resampled = new Float32Array(outLen);
+        if (srcRate === targetRate) {
+          resampled.set(audiblePcm.subarray(0, outLen));
+        } else {
+          const ratio = srcRate / targetRate;
+          for (let s = 0; s < outLen; s++) {
+            const srcIdx = Math.min(audiblePcm.length - 1, Math.floor(s * ratio));
+            resampled[s] = audiblePcm[srcIdx];
+          }
         }
         const audioDest = audioCtx.createMediaStreamDestination();
         audioSource = audioCtx.createBufferSource();
-        const playBuf = audioCtx.createBuffer(
-          1,
-          voice.pcmSamples.length,
-          voice.sampleRate
-        );
-        playBuf.copyToChannel(new Float32Array(voice.pcmSamples), 0);
+        const playBuf = audioCtx.createBuffer(1, outLen, targetRate);
+        playBuf.copyToChannel(resampled, 0);
         audioSource.buffer = playBuf;
         audioSource.connect(audioDest);
-        tracks.push(...audioDest.stream.getAudioTracks());
+        const audioTracks = audioDest.stream.getAudioTracks();
+        if (audioTracks.length > 0) {
+          tracks.push(...audioTracks);
+          hasAttachedAudio = true;
+        }
       } catch {
         // Proceed with canvas video track if WebAudio MediaStreamDestination fails
       }
@@ -780,12 +968,16 @@ async function runSingleMediaRecorderAttempt(params: {
     combinedStream = new MediaStream(tracks);
 
     const chunks: BlobPart[] = [];
+    const safeMime =
+      !hasAttachedAudio && mimeType.includes('codecs=')
+        ? mimeType.split(';')[0]
+        : mimeType;
     try {
       const options: MediaRecorderOptions = {
         videoBitsPerSecond: bitrate,
       };
-      if (mimeType) options.mimeType = mimeType;
-      if (includeAudio) options.audioBitsPerSecond = 128_000;
+      if (safeMime) options.mimeType = safeMime;
+      if (hasAttachedAudio) options.audioBitsPerSecond = 128_000;
       recorder = new MediaRecorder(combinedStream, options);
     } catch {
       recorder = new MediaRecorder(combinedStream);
@@ -835,88 +1027,167 @@ async function runSingleMediaRecorderAttempt(params: {
       videoPlaying = false;
     }
 
-    const startWallMs = performance.now();
+    let renderedElapsedSec = 0;
+    let lastTickMs = performance.now();
     let lastDrawMs = 0;
+    let seekingInFlight = false;
+    let pausedForBackground = typeof document !== 'undefined' && document.hidden;
     const frameIntervalMs = Math.max(24, Math.floor(1000 / fps));
 
-    await new Promise<void>((resolve, reject) => {
-      let finished = false;
-      const done = (err?: unknown) => {
-        if (finished) return;
-        finished = true;
-        if (rafId) cancelAnimationFrame(rafId);
-        if (pumpTimer !== null) {
-          window.clearInterval(pumpTimer);
-          pumpTimer = null;
+    const handleVisibilityChange = () => {
+      if (typeof document === 'undefined') return;
+      if (document.hidden) {
+        pausedForBackground = true;
+        try {
+          video.pause();
+        } catch {
+          // ignore
         }
-        if (err) reject(err);
-        else resolve();
-      };
+        try {
+          if (activeRecorder.state === 'recording') activeRecorder.pause();
+        } catch {
+          // ignore if pause unsupported
+        }
+        audioCtx?.suspend().catch(() => {});
+        onProgress?.(
+          Math.min(96, Math.round((renderedElapsedSec / durationSec) * 96)),
+          `Preserving Clip ${clip.clipIndex}/${clip.totalClips} (${renderedElapsedSec.toFixed(1)}s/${durationSec.toFixed(1)}s) while in background...`
+        );
+      } else {
+        pausedForBackground = false;
+        lastTickMs = performance.now();
+        try {
+          if (activeRecorder.state === 'paused') activeRecorder.resume();
+        } catch {
+          // ignore
+        }
+        audioCtx?.resume().catch(() => {});
+        if (videoPlaying) {
+          video.play().catch(() => {});
+        }
+      }
+    };
 
-      const step = () => {
-        if (finished) return;
-        if (signal?.aborted) {
-          done(new DOMException('Render cancelled', 'AbortError'));
-          return;
-        }
-        if (recorderFailedMsg) {
-          done(new Error(recorderFailedMsg));
-          return;
-        }
-        const now = performance.now();
-        const elapsedSec = (now - startWallMs) / 1000;
-        if (elapsedSec >= durationSec) {
-          paintFrame(durationSec);
-          try {
-            primaryVideoTrack.requestFrame?.();
-          } catch {
-            // ignore
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let finished = false;
+        const done = (err?: unknown) => {
+          if (finished) return;
+          finished = true;
+          if (rafId) cancelAnimationFrame(rafId);
+          if (pumpTimer !== null) {
+            window.clearInterval(pumpTimer);
+            pumpTimer = null;
           }
-          done();
-          return;
-        }
+          if (err) reject(err);
+          else resolve();
+        };
 
-        if (now - lastDrawMs >= frameIntervalMs * 0.8) {
-          lastDrawMs = now;
-          if (!videoPlaying) {
-            const targetT = Math.min(
-              clip.trimRange.startSec + elapsedSec * PACE_FACTOR,
-              Math.max(0, (video.duration || durationSec) - 0.05)
-            );
+        const step = () => {
+          if (finished) return;
+          if (signal?.aborted) {
+            done(new DOMException('Render cancelled', 'AbortError'));
+            return;
+          }
+          if (recorderFailedMsg) {
+            done(new Error(recorderFailedMsg));
+            return;
+          }
+          const now = performance.now();
+          if (pausedForBackground || (typeof document !== 'undefined' && document.hidden)) {
+            lastTickMs = now;
+            return;
+          }
+
+          // Advance rendered timeline with capped delta so background timer stalls never skip ahead
+          const dtSec = Math.max(0, Math.min(0.12, (now - lastTickMs) / 1000));
+          lastTickMs = now;
+          renderedElapsedSec += dtSec;
+
+          if (renderedElapsedSec >= durationSec) {
+            paintFrame(durationSec);
             try {
-              if (Math.abs(video.currentTime - targetT) > 0.08) {
-                video.currentTime = targetT;
-              }
+              primaryVideoTrack.requestFrame?.();
             } catch {
               // ignore
             }
-          }
-          paintFrame(elapsedSec);
-          try {
-            primaryVideoTrack.requestFrame?.();
-          } catch {
-            // ignore
+            done();
+            return;
           }
 
-          const pct = Math.min(96, Math.round((elapsedSec / durationSec) * 96));
-          onProgress?.(
-            pct,
-            `Recording Clip ${clip.clipIndex}/${clip.totalClips} (${elapsedSec.toFixed(1)}s/${durationSec.toFixed(1)}s · Canvas MediaRecorder)...`
-          );
-        }
-      };
+          if (now - lastDrawMs >= frameIntervalMs * 0.8) {
+            lastDrawMs = now;
+            const maxSourceT = Math.max(
+              0,
+              (Number.isFinite(video.duration) && video.duration > 0
+                ? video.duration
+                : clip.trimRange.endSec) - 0.04
+            );
+            const expectedSourceT = Math.min(
+              clip.trimRange.startSec + renderedElapsedSec * PACE_FACTOR,
+              maxSourceT
+            );
+            const driftSec = Math.abs(video.currentTime - expectedSourceT);
 
-      const rafLoop = () => {
-        step();
-        if (!finished) {
-          rafId = requestAnimationFrame(rafLoop);
-        }
-      };
+            // Keep off-screen source <video> cleanly synchronized across the full edited duration
+            if (
+              (!videoPlaying || video.paused || video.ended || driftSec > 0.28) &&
+              !seekingInFlight &&
+              !video.seeking
+            ) {
+              if (videoPlaying && video.paused && !video.ended && driftSec <= 0.35) {
+                video.play().catch(() => {});
+              } else if (driftSec > 0.08) {
+                seekingInFlight = true;
+                const releaseSeek = () => {
+                  seekingInFlight = false;
+                  video.removeEventListener('seeked', releaseSeek);
+                };
+                video.addEventListener('seeked', releaseSeek, { once: true });
+                window.setTimeout(releaseSeek, 180);
+                try {
+                  video.currentTime = expectedSourceT;
+                } catch {
+                  releaseSeek();
+                }
+              }
+            }
 
-      // Dual-pump (rAF + interval) ensures frames still record if rAF throttles on mobile
-      pumpTimer = window.setInterval(step, frameIntervalMs);
-      rafId = requestAnimationFrame(rafLoop);
-    });
+            paintFrame(renderedElapsedSec);
+            try {
+              primaryVideoTrack.requestFrame?.();
+            } catch {
+              // ignore
+            }
+
+            const pct = Math.min(96, Math.round((renderedElapsedSec / durationSec) * 96));
+            onProgress?.(
+              pct,
+              `Recording Clip ${clip.clipIndex}/${clip.totalClips} (${renderedElapsedSec.toFixed(1)}s/${durationSec.toFixed(1)}s · Canvas MediaRecorder)...`
+            );
+          }
+        };
+
+        const rafLoop = () => {
+          step();
+          if (!finished) {
+            rafId = requestAnimationFrame(rafLoop);
+          }
+        };
+
+        // Dual-pump (rAF + interval) ensures frames still record if rAF throttles on mobile
+        pumpTimer = window.setInterval(step, frameIntervalMs);
+        rafId = requestAnimationFrame(rafLoop);
+      });
+    } finally {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+    }
 
     if (activeRecorder.state === 'recording') {
       try {
@@ -924,7 +1195,7 @@ async function runSingleMediaRecorderAttempt(params: {
       } catch {
         // ignore if unsupported
       }
-      await new Promise((r) => window.setTimeout(r, 120));
+      await new Promise((r) => window.setTimeout(r, 140));
       activeRecorder.stop();
     }
     await stoppedPromise;
@@ -938,13 +1209,14 @@ async function runSingleMediaRecorderAttempt(params: {
       : 'video/webm';
     const blob = new Blob(chunks, { type: cleanMime });
 
-    if (drawnRealVideoFrames < 2 || blob.size <= 4096) {
+    const minExpectedFrames = Math.max(4, Math.floor(durationSec * 4));
+    if (drawnRealVideoFrames < minExpectedFrames || blob.size <= 4096) {
       throw new Error(
-        `MediaRecorder produced an empty or black output (${blob.size} bytes, ${drawnRealVideoFrames} real video frames).`
+        `MediaRecorder produced an incomplete output (${blob.size} bytes, ${drawnRealVideoFrames}/${minExpectedFrames} real video frames).`
       );
     }
 
-    const check = await verifyPlayableVideoBlob(blob);
+    const check = await verifyPlayableVideoBlob(blob, durationSec);
     if (!check.valid) {
       throw new Error(
         check.reason || `Recorded clip (${blob.size} bytes) was not playable.`
@@ -1073,6 +1345,13 @@ async function renderCanvasMediaRecorderFallback(params: {
     label: `${primaryMime || 'default'} (video-only)`,
   });
 
+  // Cap MediaRecorder canvas size to crisp 720x1280 @ 24fps so real-time Canvas 2D capture
+  // sustains full-duration frame throughput without dropping frames or truncating to ~2s
+  const safeWidth = Math.min(params.width, 720);
+  const safeHeight = Math.min(params.height, 1280);
+  const safeFps = Math.min(params.fps, 24);
+  const safeBitrate = Math.min(params.bitrate, 2_800_000);
+
   let lastError: Error | null = null;
   for (let i = 0; i < attempts.length; i++) {
     if (params.signal?.aborted) {
@@ -1088,6 +1367,10 @@ async function renderCanvasMediaRecorderFallback(params: {
     try {
       return await runSingleMediaRecorderAttempt({
         ...params,
+        width: safeWidth,
+        height: safeHeight,
+        fps: safeFps,
+        bitrate: safeBitrate,
         mimeType: attempt.mimeType,
         includeAudio: attempt.includeAudio,
       });

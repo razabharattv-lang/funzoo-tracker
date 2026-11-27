@@ -29,6 +29,7 @@ function ensureTopCornerMasks(
   clipDur: number
 ): WatermarkZone[] {
   const dur = Number(Math.max(1, clipDur).toFixed(2));
+  const outroStart = Number(Math.max(0, dur - 0.8).toFixed(2));
   const defaults: WatermarkZone[] = [
     {
       id: 'wm_top_left_cover',
@@ -46,9 +47,25 @@ function ensureTopCornerMasks(
       action: 'gpu_delogo_patch',
       label: 'Top-right corner delogo patch',
     },
+    {
+      id: 'wm_bottom_right_badge',
+      startSec: 0,
+      endSec: dur,
+      box: [0.68, 0.87, 1.0, 0.99],
+      action: 'gpu_delogo_patch',
+      label: 'Bottom-right creator badge patch',
+    },
+    {
+      id: 'wm_outro_tail_badge',
+      startSec: outroStart,
+      endSec: dur,
+      box: [0.0, 0.85, 0.36, 0.99],
+      action: 'gpu_delogo_patch',
+      label: 'Outro tail bottom-left badge patch',
+    },
   ];
 
-  // Keep detected bottom-corner zones while always guaranteeing clean top-left & top-right delogo patches
+  // Keep detected bottom-corner zones while always guaranteeing clean corner & outro-tail delogo patches
   const extraNonTop = existing.filter((z) => {
     const cy = (z.box[1] + z.box[3]) / 2;
     return cy >= 0.5 && z.action === 'gpu_delogo_patch';
@@ -94,24 +111,43 @@ function sanitizeWatermarkZones(
 }
 
 async function seekVideo(video: HTMLVideoElement, timeSec: number): Promise<void> {
+  const maxT = Math.max(0, (video.duration || timeSec + 0.1) - 0.06);
+  const clamped = clamp(timeSec, 0, maxT);
+  if (
+    Math.abs(video.currentTime - clamped) < 0.01 &&
+    video.readyState >= 2 &&
+    video.videoWidth > 0
+  ) {
+    return;
+  }
   await new Promise<void>((resolve) => {
     const done = () => {
       video.onseeked = null;
       resolve();
     };
-    const timer = window.setTimeout(done, 1100);
+    const timer = window.setTimeout(done, 2000);
     video.onseeked = () => {
       window.clearTimeout(timer);
       done();
     };
     try {
-      const maxT = Math.max(0, (video.duration || timeSec + 0.1) - 0.06);
-      video.currentTime = clamp(timeSec, 0, maxT);
+      video.currentTime = clamped;
     } catch {
       window.clearTimeout(timer);
       done();
     }
   });
+  if (video.readyState < 2 || video.videoWidth <= 0) {
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + 1000;
+      const poll = window.setInterval(() => {
+        if ((video.readyState >= 2 && video.videoWidth > 0) || Date.now() >= deadline) {
+          window.clearInterval(poll);
+          resolve();
+        }
+      }, 35);
+    });
+  }
 }
 
 async function buildStampedContactSheet(params: {
@@ -123,7 +159,7 @@ async function buildStampedContactSheet(params: {
   const { source, startSec, endSec, crop } = params;
   const clipDur = Math.max(1, endSec - startSec);
   const cols = 3;
-  const rows = 2;
+  const rows = 3;
   const totalTiles = cols * rows;
   const timestampsSec: number[] = [];
 
@@ -138,30 +174,50 @@ async function buildStampedContactSheet(params: {
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
   video.preload = 'auto';
   video.crossOrigin = 'anonymous';
+  video.style.position = 'fixed';
+  video.style.left = '-9999px';
+  video.style.top = '0';
+  video.style.width = '2px';
+  video.style.height = '2px';
+  video.style.opacity = '0.001';
+  video.style.pointerEvents = 'none';
+  if (typeof document !== 'undefined' && document.body) {
+    document.body.appendChild(video);
+  }
   video.src = source.objectUrl;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(
-        () => reject(new Error('Timed out extracting keyframes for contact sheet.')),
-        14000
-      );
-      video.onloadeddata = () => {
-        window.clearTimeout(timer);
-        resolve();
-      };
-      video.onerror = () => {
-        window.clearTimeout(timer);
-        reject(new Error('Unable to decode source video keyframes.'));
-      };
-      video.load();
-    });
+    if (video.readyState < 2 || video.videoWidth <= 0) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = window.setTimeout(
+          () => reject(new Error('Timed out extracting keyframes for contact sheet.')),
+          22000
+        );
+        const onReady = () => {
+          if (video.readyState >= 2 && video.videoWidth > 0) {
+            window.clearTimeout(timer);
+            video.onloadeddata = null;
+            video.oncanplay = null;
+            resolve();
+          }
+        };
+        video.onloadeddata = onReady;
+        video.oncanplay = onReady;
+        video.onerror = () => {
+          window.clearTimeout(timer);
+          reject(new Error('Unable to decode source video keyframes.'));
+        };
+        video.load();
+      });
+    }
 
     const vw = video.videoWidth || source.width || 1080;
     const vh = video.videoHeight || source.height || 1920;
-    // Match exact 9:16 edited vertical framing so Step 3 scripts strictly from the edited clip frames
+    // Match exact 9:16 edited vertical framing (3x3 = 9 frames) so Step 3 sees full scene progression
     const tileW = 216;
     const tileH = 384;
     const canvas = document.createElement('canvas');
@@ -202,13 +258,15 @@ async function buildStampedContactSheet(params: {
         const dx = col * tileW;
         const dy = row * tileH;
 
-        try {
-          ctx.save();
-          ctx.filter = 'contrast(1.2) saturate(1.28) brightness(1.03)';
-          ctx.drawImage(video, coverSx, coverSy, coverSw, coverSh, dx, dy, tileW, tileH);
-          ctx.restore();
-        } catch {
-          // Keep solid dark tile if a single frame decode fails
+        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          try {
+            ctx.save();
+            ctx.filter = 'contrast(1.18) saturate(1.24) brightness(1.04)';
+            ctx.drawImage(video, coverSx, coverSy, coverSw, coverSh, dx, dy, tileW, tileH);
+            ctx.restore();
+          } catch {
+            // Keep solid dark tile if a single frame decode fails
+          }
         }
 
         // Timestamp stamp for exact second-by-second action alignment in Step 3
@@ -227,11 +285,15 @@ async function buildStampedContactSheet(params: {
     return { jpegBase64: '', timestampsSec };
   } finally {
     video.onloadeddata = null;
+    video.oncanplay = null;
     video.onerror = null;
     video.onseeked = null;
     video.pause();
     video.removeAttribute('src');
     video.load();
+    if (video.parentNode) {
+      video.parentNode.removeChild(video);
+    }
   }
 }
 
@@ -250,18 +312,26 @@ export async function inspectAndSliceSegmentsStep1(params: {
   try {
     const scan = await analyzeVideoTimelineLocally(source, onProgress);
     const totalDur = Math.max(1, source.durationSec);
-    // Keep short clips (~15s) intact; only trim detected outro end-cards on >=20s clips
+    // Trim final ~1.2s–1.5s outro/owner-badge tail on short/social clips while preserving full action body
     const outroTrim =
-      scan.hasOutroBumper && totalDur >= 20
-        ? Math.min(1.0, Math.max(0.6, totalDur * 0.04))
+      totalDur >= 6
+        ? scan.hasOutroBumper || source.trimSocialEndCard
+          ? 1.5
+          : totalDur <= 45
+          ? 1.35
+          : 1.25
+        : totalDur >= 3.5
+        ? Number(Math.min(1.0, totalDur * 0.18).toFixed(2))
         : 0;
-    const usableEnd = Math.max(2, totalDur - outroTrim);
+    const usableEnd = Number(Math.max(2, totalDur - outroTrim).toFixed(2));
     const safeCrop = clampSafeCrop(scan.suggestedSafeCropInsets);
 
     const segments: ViralSegment[] = scan.highActionWindows.map((win, idx) => {
-      const rawStart = totalDur <= 20 ? 0 : win.startSec;
+      const isShortSingleClip = totalDur <= 20 && scan.highActionWindows.length === 1;
+      const rawStart = isShortSingleClip ? 0 : win.startSec;
+      const rawEnd = isShortSingleClip ? usableEnd : win.endSec;
       const startSec = Number(clamp(rawStart, 0, usableEnd - 1.2).toFixed(2));
-      const endSec = Number(clamp(win.endSec, startSec + 1.2, usableEnd).toFixed(2));
+      const endSec = Number(clamp(rawEnd, startSec + 1.2, usableEnd).toFixed(2));
       const climaxSec = Number(clamp(win.climaxSec, startSec, endSec).toFixed(2));
       const clipZones = sanitizeWatermarkZones(
         scan.detectedWatermarkZones,
@@ -276,7 +346,7 @@ export async function inspectAndSliceSegmentsStep1(params: {
         climaxSec,
         reason:
           scan.highActionWindows.length === 1
-            ? `Tight trimmed clip (${(endSec - startSec).toFixed(1)}s) with peak action at ${climaxSec.toFixed(1)}s`
+            ? `Full edited clip (${(endSec - startSec).toFixed(1)}s, outro trimmed ${outroTrim.toFixed(1)}s) with peak action at ${climaxSec.toFixed(1)}s`
             : `High-retention clip ${idx + 1} (${(endSec - startSec).toFixed(1)}s) centered on peak action at ${climaxSec.toFixed(1)}s`,
         trimRange: { startSec, endSec },
         safeCropInsets: safeCrop,
@@ -292,13 +362,16 @@ export async function inspectAndSliceSegmentsStep1(params: {
       };
     }
   } catch {
-    // Fall back to clean multi-clip (>30s) or tight single-clip (<=30s) segmentation
+    // Fall back to clean multi-clip (>45s) or tight outro-trimmed single clip (<=45s)
   }
 
   const totalDur = Math.max(1, source.durationSec);
+  const fallbackOutroTrim = totalDur >= 6 ? 1.35 : 0;
+  const fallbackUsableEnd = Number(Math.max(2, totalDur - fallbackOutroTrim).toFixed(2));
+
   if (totalDur > 45) {
     const clipCount = totalDur <= 135 ? 2 : 3;
-    const span = totalDur / clipCount;
+    const span = fallbackUsableEnd / clipCount;
     const targetLen =
       totalDur <= 135
         ? Math.min(65, Math.max(22, span * 0.9))
@@ -307,7 +380,7 @@ export async function inspectAndSliceSegmentsStep1(params: {
     return {
       segments: Array.from({ length: clipCount }, (_, i) => {
         const startSec = Number((i * span).toFixed(2));
-        const endSec = Number(Math.min(totalDur, startSec + targetLen).toFixed(2));
+        const endSec = Number(Math.min(fallbackUsableEnd, startSec + targetLen).toFixed(2));
         return {
           clipIndex: i + 1,
           startSec,
@@ -323,8 +396,18 @@ export async function inspectAndSliceSegmentsStep1(params: {
     };
   }
 
+  const defaultSegs = buildDefaultViralSegments(source).map((seg) => {
+    const endSec = Number(Math.min(seg.endSec, fallbackUsableEnd).toFixed(2));
+    return {
+      ...seg,
+      endSec,
+      climaxSec: Number(Math.min(seg.climaxSec, endSec * 0.55).toFixed(2)),
+      trimRange: { startSec: seg.startSec, endSec },
+    };
+  });
+
   return {
-    segments: buildDefaultViralSegments(source),
+    segments: defaultSegs,
     inspectorModel: `Direct Slicer (${PIPELINE_15_WORKER_MODELS.step1[1]} role)`,
   };
 }

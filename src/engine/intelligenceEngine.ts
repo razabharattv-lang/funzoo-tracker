@@ -77,12 +77,20 @@ function normalizeBeats(
     .map((s) => s.trim())
     .filter(Boolean);
   const parts = sentences.length > 0 ? sentences : [voiceover.trim()];
-  const step = safeDur / parts.length;
-  return parts.map((text, idx) => ({
-    startSec: Number((idx * step).toFixed(2)),
-    endSec: Number(Math.min(safeDur, (idx + 1) * step).toFixed(2)),
-    text,
-  }));
+  const weights = parts.map((p) => Math.max(2, p.split(/\s+/).filter(Boolean).length));
+  const totalWeight = weights.reduce((a, b) => a + b, 0) || 1;
+  let cursor = 0;
+  return parts.map((text, idx) => {
+    const span = (weights[idx] / totalWeight) * safeDur;
+    const startSec = cursor;
+    const endSec = idx === parts.length - 1 ? safeDur : Math.min(safeDur, cursor + span);
+    cursor = endSec;
+    return {
+      startSec: Number(startSec.toFixed(2)),
+      endSec: Number(endSec.toFixed(2)),
+      text,
+    };
+  });
 }
 
 function isPlaceholderSeoText(value: string): boolean {
@@ -96,6 +104,72 @@ function isPlaceholderSeoText(value: string): boolean {
     lower.includes('comma-separated niche tags') ||
     lower.includes('best upload window with both usa est')
   );
+}
+
+const WEAK_OPENER_REGEX =
+  /^(in this video|today we|welcome back|hey guys|watch this clip|this video shows|here we see|let'?s take a look|look at this video|आज के वीडियो में|इस वीडियो में|दोस्तों आज हम|आज हम देखेंगे)/i;
+
+function enforcePunchyOpeningHook(params: {
+  voiceover: string;
+  beats: ScriptBeat[];
+  detectedTopic: string | null;
+  language: OutputLanguage;
+  targetDurationSec: number;
+}): { voiceover: string; beats: ScriptBeat[] } {
+  const { language, targetDurationSec } = params;
+  const trimmedVo = params.voiceover.trim();
+  const sentences = trimmedVo
+    .split(/(?<=[.!?।])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const firstSentence = sentences[0] ?? trimmedVo;
+  const needsUpgrade =
+    !firstSentence ||
+    WEAK_OPENER_REGEX.test(firstSentence) ||
+    firstSentence.length < 14;
+
+  if (!needsUpgrade) {
+    return { voiceover: trimmedVo, beats: params.beats };
+  }
+
+  const cleanTopic =
+    (params.detectedTopic ?? '')
+      .replace(/["'`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim() || (language === 'hi' ? 'इस सीन' : 'this exact moment');
+
+  const upgradedHook =
+    language === 'hi'
+      ? `रुकिए—${cleanTopic} में अभी जो होने वाला है, देखकर यकीन नहीं होगा!`
+      : `Stop scrolling—what happens to ${cleanTopic} next is unreal!`;
+
+  const restSentences = sentences.slice(1);
+  const nextVoiceover =
+    restSentences.length > 0 ? `${upgradedHook} ${restSentences.join(' ')}` : upgradedHook;
+
+  const hookEnd = Number(Math.min(2.8, Math.max(1.8, targetDurationSec * 0.22)).toFixed(2));
+  const nextBeats: ScriptBeat[] =
+    params.beats.length > 0
+      ? params.beats.map((b, idx) => {
+          if (idx === 0) {
+            return {
+              startSec: 0,
+              endSec: Math.min(hookEnd, Math.max(1.2, b.endSec || hookEnd)),
+              text: upgradedHook,
+            };
+          }
+          if (idx === 1) {
+            const prevEnd = Math.min(hookEnd, Math.max(1.2, params.beats[0].endSec || hookEnd));
+            return {
+              ...b,
+              startSec: Number(Math.max(prevEnd, b.startSec).toFixed(2)),
+            };
+          }
+          return b;
+        })
+      : normalizeBeats(undefined, nextVoiceover, targetDurationSec);
+
+  return { voiceover: nextVoiceover, beats: nextBeats };
 }
 
 function ensurePopulatedField(
@@ -259,9 +333,9 @@ function customizeSeoWithNicheYouTubeTrends(params: {
 
 /**
  * STEP 3 (Real Vision-to-Action + Live Niche YouTube Trend Customization):
- * 1) Sends the 6-frame aspect-preserving JPEG contact sheet to the vision worker
+ * 1) Sends the 9-frame (3x3) edited vertical contact sheet to the vision worker
  *    (`gemini-4-hydrogen` / `nvidia/nemotron-3.5-super-vl-120b-a12b`) to identify the real
- *    objects and step-by-step physical actions on screen (never generic filler).
+ *    objects and step-by-step physical actions on screen (never generic or hallucinated filler).
  * 2) Passes the detected real topic into YouTube Data API v3 (`regionCode=US`,
  *    `videoDuration=short`, `order=viewCount`, 1 single API call) to fetch real trending
  *    US Shorts for that exact niche and customize Title, Description, Tags, Hashtags, and EST/IST Upload Time.
@@ -292,12 +366,14 @@ export async function translateClipAndBuildSeoStep3(params: {
   } = params;
 
   const targetDurSec = clip.lockedVisualDurationSec;
-  const maxSpeechSec = Math.max(2, targetDurSec - 0.35);
-  // Crisp high-retention pacing (~2.4 words/sec) scaled safely for short clips and 45-120s story arcs
-  const targetWordCount = Math.max(14, Math.min(260, Math.round(maxSpeechSec * 2.4)));
+  const maxSpeechSec = Math.max(2, targetDurSec - 0.3);
+  // Calibrate spoken word budget for brisk, confident viral creator delivery (~1.14x-1.20x tempo)
+  const wordsPerSec = language === 'hi' ? 2.45 : 2.75;
+  const targetWordCount = Math.max(14, Math.min(285, Math.round(maxSpeechSec * wordsPerSec)));
+  const frameCount = Math.max(6, clip.stampedTimestampsSec.length);
   const safeTopicHint =
     extractReadableTopicFromLabel(sourceLabel, customAngle) ||
-    'Identify directly from the 6 video frames (ignore numeric filename)';
+    `Identify strictly from the ${frameCount} sampled video frames (ignore numeric filename)`;
 
   const languageName =
     language === 'hi'
@@ -307,47 +383,49 @@ export async function translateClipAndBuildSeoStep3(params: {
     language === 'hi'
       ? 'Write voiceover, beats, title, description, tags, hashtags, and posting_time STRICTLY in Devanagari Hindi (keeping only EST/IST timezone abbreviations).'
       : 'Write voiceover, beats, title, description, tags, hashtags, and posting_time STRICTLY in natural American English (USA).';
-  const hookEndSec = Number(Math.min(2.0, Math.max(1.5, maxSpeechSec * 0.14)).toFixed(1));
-  const targetBeatCount = Math.max(3, Math.min(8, Math.round(maxSpeechSec / 4.0)));
+  const hookEndSec = Number(Math.min(2.6, Math.max(1.6, maxSpeechSec * 0.22)).toFixed(1));
+  const targetBeatCount = Math.max(3, Math.min(8, Math.round(maxSpeechSec / 3.2)));
   const beatSpanSec = Number(((maxSpeechSec - hookEndSec) / Math.max(1, targetBeatCount - 1)).toFixed(1));
   const beat2EndSec = Number(Math.min(maxSpeechSec - 0.8, hookEndSec + beatSpanSec).toFixed(1));
   const beat3EndSec = Number(Math.min(maxSpeechSec - 0.4, beat2EndSec + beatSpanSec).toFixed(1));
 
-  const systemPrompt = `You are a top on-camera YouTube Shorts & Reels creator and viral SEO strategist speaking directly to viewers to maximize 100%+ retention.
-You are inspecting a 3x2 contact sheet of 6 evenly spaced frames (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) taken directly from the user's real video.
+  const systemPrompt = `You are a top viral YouTube Shorts & Reels creator and SEO strategist known for bold, fast, suspenseful, scroll-stopping storytelling.
+You are inspecting a 3x3 contact sheet of ${frameCount} evenly spaced edited frames (timestamps T=0.0s to T=${targetDurSec.toFixed(1)}s) taken directly from the user's trimmed clip.
 
-TOP-CREATOR HIGH-RETENTION RULES:
-1. 1.5-SECOND PATTERN-INTERRUPT HOOK: Beat 1 (0.0s to ${hookEndSec}s) MUST hit immediately with a sharp curiosity trigger or pattern-interrupt directly tied to Frame 1—speak directly to the viewer so nobody scrolls past!
-2. MICRO-TWISTS EVERY 3–4 SECONDS: Break the narration into ${targetBeatCount} fast, punchy, crystal-clear beats spaced every ~3–4 seconds—each beat drops a fresh visual reveal, tension spike, or micro-twist strictly explaining what is happening on screen in Frames 1–6.
-3. ZERO FILLER OR CANNED TEXT: Strictly FORBIDDEN phrases include "opening frame", "turning point", "second mark", "core detail", "wasted motion", "contact sheet", "crayon", or raw filenames like "1000179945".
-4. EXACT DURATION FIT: Write ~${targetWordCount} energetic, crystal-clear spoken words so delivery finishes cleanly before ${maxSpeechSec.toFixed(1)}s with zero cutoffs.
-5. STRICT LANGUAGE LOCK: ${strictLanguageRule} Return non-empty values for ALL JSON fields. Return ONLY valid JSON.`;
+MANDATORY SCROLL-STOPPING HOOK & SCENE-GROUNDED RULES:
+1. STRICT VISUAL GROUNDING: Describe ONLY real people, animals, objects, locations, and physical actions unmistakably visible in the ${frameCount} frames. NEVER invent unseen props (never say "basket", "टोकरी", "box", "crayon", or random items unless clearly visible).
+2. EXPLOSIVE 0–3s SUSPENSE HOOK: Sentence 1 / Beat 1 (0.0s to ${hookEndSec}s) MUST make viewers stop scrolling immediately—a bold, urgent, high-tension curiosity hook tied directly to Frame 1. NEVER use slow intros like "In this video", "Watch this clip", "Here we see", or "इस वीडियो में".
+3. FAST PUNCHY SCENE-BY-SCENE LINES: Write short, high-impact, emotional sentences across ${targetBeatCount - 1} beats strictly matching the action changes in Frames 2–${frameCount}, escalating tension into a sharp final reveal/payoff.
+4. ZERO FILLER OR CANNED TEXT: Strictly FORBIDDEN phrases include "opening frame", "turning point", "second mark", "core detail", "wasted motion", "contact sheet", or raw filenames like "1000179945".
+5. BRISK DURATION FIT: Write ~${targetWordCount} crisp, energetic spoken words tailored for fast confident delivery so narration fills the clip tightly and finishes cleanly before ${maxSpeechSec.toFixed(1)}s.
+6. STRICT LANGUAGE LOCK: ${strictLanguageRule} Return complete, non-empty values for Title, Description, Tags, Hashtags, and Upload Time (EST/IST). Return ONLY valid JSON.`;
 
   const userPrompt = `CLIP HINT: ${safeTopicHint}
-CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (locked duration: ${targetDurSec.toFixed(1)}s, frame timestamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
+CLIP SEGMENT: Clip ${clip.clipIndex} of ${clip.totalClips} (edited duration: ${targetDurSec.toFixed(1)}s, ${frameCount} frame timestamps: ${clip.stampedTimestampsSec.map((t) => `${t.toFixed(1)}s`).join(', ')})
+DETECTED VISUAL PACING: ${clip.visualSummary}
 OUTPUT LANGUAGE: ${languageName}
-KEY POINTS TO KEEP: ${customAngle.trim() || 'Speak like a top creator: hit a sharp 1.5s curiosity pattern-interrupt, drop micro-twists every 3-4 seconds matching the exact real action across frames 1-6, and end on a punchy payoff.'}
+KEY POINTS TO KEEP: ${customAngle.trim() || `Open 0-${hookEndSec}s with a sharp suspense curiosity hook tied strictly to Frame 1, then explain the exact visible action across Frames 2-${frameCount} ending on a clear payoff.`}
 
 RETURN STRICT JSON ONLY:
 {
-  "detected_topic": "Exact real subject/action visible on screen (2-5 words)",
+  "detected_topic": "Exact real subject/action clearly visible on screen (2-5 words)",
   "youtube_search_query": "2-4 clean English YouTube Shorts search words for this exact niche",
-  "voiceover": "Top-creator direct-to-viewer narration starting with a 1.5s pattern-interrupt hook, micro-twists every 3-4s, and crystal-clear on-screen explanation (~${targetWordCount} words, finishes before ${maxSpeechSec.toFixed(1)}s) in ${languageName}",
+  "voiceover": "Direct-to-viewer narration strictly grounded in the ${frameCount} frames: punchy 0-${hookEndSec}s Frame-1 curiosity hook + action-matched progression across Frames 2-${frameCount} (~${targetWordCount} words, finishes before ${maxSpeechSec.toFixed(1)}s) in ${languageName}",
   "beats": [
-    { "start_sec": 0.0, "end_sec": ${hookEndSec}, "text": "Sharp 1.5s curiosity trigger / pattern-interrupt referencing frame 1 directly" },
-    { "start_sec": ${hookEndSec}, "end_sec": ${beat2EndSec}, "text": "Micro-twist 1 (~3-4s): crisp, energetic explanation of the action in frames 2-3" },
-    { "start_sec": ${beat2EndSec}, "end_sec": ${beat3EndSec}, "text": "Micro-twist 2 (~3-4s): rising tension & unexpected shift in frames 4-5" },
-    { "start_sec": ${beat3EndSec}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Final punchy payoff/reveal shown in frame 6" }
+    { "start_sec": 0.0, "end_sec": ${hookEndSec}, "text": "High-tension 0-${hookEndSec}s curiosity hook / pattern-interrupt tied strictly to Frame 1" },
+    { "start_sec": ${hookEndSec}, "end_sec": ${beat2EndSec}, "text": "Fast scene explanation (early frames): exact visible action and why it matters" },
+    { "start_sec": ${beat2EndSec}, "end_sec": ${beat3EndSec}, "text": "Rising tension & twist (middle frames): real visual shift happening on screen" },
+    { "start_sec": ${beat3EndSec}, "end_sec": ${maxSpeechSec.toFixed(1)}, "text": "Sharp final payoff/reveal shown in the closing frames" }
   ],
   "title": "Curiosity-gap high-CTR title (<= 75 chars) strictly in ${languageName}",
-  "description": "High-retention creator SEO description summarizing the hook/twist + CTA strictly in ${languageName}",
+  "description": "High-retention creator SEO description summarizing the real visual hook/twist + CTA strictly in ${languageName}",
   "tags": "8-12 comma-separated niche tags strictly in ${languageName}",
   "hashtags": "5-6 niche hashtags starting with # strictly in ${languageName}",
   "posting_time": "Best Upload Window with both USA EST and India IST peak hours strictly in ${languageName}"
 }`;
 
   onStatus?.(
-    `Analyzing 6 video frames for real objects & actions (Clip ${clip.clipIndex}/${clip.totalClips})...`
+    `Analyzing ${frameCount} edited video frames for real objects & action beats (Clip ${clip.clipIndex}/${clip.totalClips})...`
   );
 
   const aiResponse = await runSingleClipAiRequest({
@@ -393,7 +471,19 @@ RETURN STRICT JSON ONLY:
       trends: fallbackTrends,
       fallbackReason: aiResponse?.errorReason ?? 'Local mode',
     });
-    return { ...offlineOut, fetchedTrends: fallbackTrends };
+    const hookedOffline = enforcePunchyOpeningHook({
+      voiceover: offlineOut.voiceover,
+      beats: offlineOut.beats,
+      detectedTopic: extractReadableTopicFromLabel(sourceLabel, customAngle),
+      language,
+      targetDurationSec: targetDurSec,
+    });
+    return {
+      ...offlineOut,
+      voiceover: hookedOffline.voiceover,
+      beats: hookedOffline.beats,
+      fetchedTrends: fallbackTrends,
+    };
   }
 
   const parsed = extractJsonObject<AiTranslationSeoPayload>(aiResponse.rawText);
@@ -406,7 +496,19 @@ RETURN STRICT JSON ONLY:
       trends: preloadedTrends,
       fallbackReason: `${aiResponse.modelUsed} returned non-JSON`,
     });
-    return { ...offlineOut, fetchedTrends: preloadedTrends };
+    const hookedOffline = enforcePunchyOpeningHook({
+      voiceover: offlineOut.voiceover,
+      beats: offlineOut.beats,
+      detectedTopic: extractReadableTopicFromLabel(sourceLabel, customAngle),
+      language,
+      targetDurationSec: targetDurSec,
+    });
+    return {
+      ...offlineOut,
+      voiceover: hookedOffline.voiceover,
+      beats: hookedOffline.beats,
+      fetchedTrends: preloadedTrends,
+    };
   }
 
   if (aiResponse.provider === 'gemini') {
@@ -441,8 +543,15 @@ RETURN STRICT JSON ONLY:
     trends: activeTrends,
   });
 
-  const voiceover = parsed.voiceover.trim();
-  const beats = normalizeBeats(parsed.beats, voiceover, targetDurSec);
+  const rawVoiceover = parsed.voiceover.trim();
+  const rawBeats = normalizeBeats(parsed.beats, rawVoiceover, targetDurSec);
+  const { voiceover, beats } = enforcePunchyOpeningHook({
+    voiceover: rawVoiceover,
+    beats: rawBeats,
+    detectedTopic: detectedTopic || extractReadableTopicFromLabel(sourceLabel, customAngle),
+    language,
+    targetDurationSec: targetDurSec,
+  });
 
   const rawPostingTime = ensurePopulatedField(
     parsed.posting_time,
